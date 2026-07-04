@@ -140,21 +140,24 @@ fn walk_pane_ids(node: &LayoutNode, out: &mut Vec<String>) {
     }
 }
 
-/// Rebuild the layout tree as JSON with each pane running the wrapper command.
-fn map_node(node: &LayoutNode, cmd_for: &dyn Fn(&str) -> Vec<String>, cwd: &str) -> Value {
+/// Rebuild the layout tree as JSON of PLAIN shell panes (no `command`, so herdr
+/// does not set `launch_argv` / treat them as agent terminals). The streamer is
+/// started afterward with `exec` via `spawn_streamer_pane`. This keeps plain
+/// remote terminals out of the agents panel; only real remote agents (reported
+/// by `push_pane_status`) surface there.
+fn map_node(node: &LayoutNode, cwd: &str) -> Value {
     match node {
-        LayoutNode::Pane { pane_id, label } => json!({
+        LayoutNode::Pane { pane_id: _, label } => json!({
             "type": "pane",
             "label": label,
-            "command": cmd_for(pane_id.as_deref().unwrap_or("")),
             "cwd": cwd,
         }),
         LayoutNode::Split { direction, ratio, first, second } => json!({
             "type": "split",
             "direction": direction,
             "ratio": ratio,
-            "first": map_node(first, cmd_for, cwd),
-            "second": map_node(second, cmd_for, cwd),
+            "first": map_node(first, cwd),
+            "second": map_node(second, cwd),
         }),
     }
 }
@@ -222,6 +225,30 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
             ]);
         }
         argv
+    }
+}
+
+/// single-quote for a POSIX shell command line
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run the streamer in an already-created PLAIN mirror pane by `exec`-ing it from
+/// the pane's shell. We deliberately do NOT launch it via `agent.start`/layout
+/// `command`: those set the terminal's `launch_argv`, which makes herdr treat the
+/// pane as an agent terminal forever — so plain remote terminals would show as
+/// phantom "mirror" agent rows. Running it as a shell `exec` leaves the terminal
+/// non-agent until `push_pane_status` reports a real remote agent onto it.
+async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
+    let line = format!(
+        "exec {}\n",
+        argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
+    );
+    if let Err(e) = local
+        .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
+        .await
+    {
+        log.log(&format!("spawn streamer {local_pane_id}: {e}"));
     }
 }
 
@@ -407,7 +434,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
             if !tab_exists {
                 let cwd = deps.plugin_root.display().to_string();
-                let root = map_node(&exported.layout.root, &cmd_for, &cwd);
+                let root = map_node(&exported.layout.root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
                 let mut params = json!({ "tab_label": rtab.label, "root": root, "focus": false });
@@ -442,44 +469,57 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     if state.panes.get(rid).is_some_and(|e| e.is_tombstoned()) {
                         continue;
                     }
+                    let local_id = local_order[i].clone();
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_order[i].clone(), tombstone: None, seq, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
                     );
+                    // plain pane created above; exec the streamer into it
+                    spawn_streamer_pane(&deps.local, &local_id, &cmd_for(rid), &deps.log).await;
                 }
             } else {
-                // tab exists — only add mirrors for individual new remote panes
-                let tab_local = tab_entry.as_ref().unwrap().local_id.clone();
+                // tab exists — add mirrors for individual new remote panes as
+                // PLAIN split panes (not agent.start), then exec the streamer in.
+                // agent.start would set launch_argv and surface every plain
+                // terminal as a phantom "mirror" agent row.
+                let cwd = deps.plugin_root.display().to_string();
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
                     }
+                    // split off an already-mirrored pane in this tab (the root
+                    // pane always qualifies, since the tab already exists)
+                    let Some(target) = remote_panes_in_tab
+                        .iter()
+                        .find_map(|p| state.panes.get(&p.pane_id).map(|e| e.local_id.clone()))
+                    else {
+                        continue;
+                    };
                     #[derive(Deserialize)]
-                    struct Started {
-                        agent: StartedAgent,
+                    struct Split {
+                        pane: SplitPane,
                     }
                     #[derive(Deserialize)]
-                    struct StartedAgent {
+                    struct SplitPane {
                         pane_id: String,
                     }
-                    let started: Started = deps
+                    let split: Split = deps
                         .local
                         .request_t(
-                            "agent.start",
+                            "pane.split",
                             json!({
-                                "name": rp.label.clone().unwrap_or_else(|| "mirror".into()),
-                                "argv": cmd_for(&rp.pane_id),
-                                "workspace_id": ws_entry.local_id,
-                                "tab_id": tab_local,
-                                "cwd": deps.plugin_root.display().to_string(),
+                                "target_pane_id": target,
+                                "direction": "right",
+                                "cwd": cwd,
                                 "focus": false,
                             }),
                         )
                         .await?;
+                    spawn_streamer_pane(&deps.local, &split.pane.pane_id, &cmd_for(&rp.pane_id), &deps.log).await;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: started.agent.pane_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: split.pane.pane_id, tombstone: None, seq: 0, reported: None },
                     );
                 }
             }

@@ -96,42 +96,43 @@ type = "plugin_action"
 command = "mirror.start"       # start / resume the daemon
 
 [[keys.command]]
-key = "prefix+shift+p"
+key = "prefix+shift+s"
 type = "plugin_action"
 command = "mirror.pause"       # freeze syncing; start again to resume
 
 [[keys.command]]
-key = "prefix+shift+r"
+key = "prefix+shift+b"         # "bring back" (shift+r is native reload_config)
 type = "plugin_action"
-command = "mirror.restore"     # bring back mirrors you closed locally
+command = "mirror.restore"     # un-close mirrors you closed locally
 
-# remote-* actions run from inside a mirror pane and create objects on that
-# pane's remote host — the cross-ssh twins of herdr's native new/split keys.
-# Binding them to the native keys plus one extra modifier keeps the muscle memory.
+# Create objects on the REMOTE host — run these from inside a mirror pane, which
+# supplies the target host and cwd. Each is herdr's native local key + alt
+# (Option): same muscle memory, but it acts on the remote over ssh.
 [[keys.command]]
-key = "prefix+alt+n"
+key = "prefix+alt+n"           # native new_workspace = prefix+shift+n
 type = "plugin_action"
 command = "mirror.remote-new-workspace"
 
 [[keys.command]]
-key = "prefix+alt+t"
+key = "prefix+alt+c"           # native new_tab = prefix+c
 type = "plugin_action"
 command = "mirror.remote-new-tab"
 
 [[keys.command]]
-key = "prefix+alt+\\"
+key = "prefix+alt+v"           # native split_vertical = prefix+v
 type = "plugin_action"
 command = "mirror.remote-split-right"
 
 [[keys.command]]
-key = "prefix+alt+-"
+key = "prefix+alt+minus"       # native split_horizontal = prefix+minus
 type = "plugin_action"
 command = "mirror.remote-split-down"
 ```
 
-The remaining actions — `mirror.status`, `mirror.once`, `mirror.teardown`,
-`mirror.ensure` — are lifecycle/diagnostic and are usually run from the CLI
-rather than bound to keys.
+The `remote-*` actions need a focused mirror pane (except `remote-new-workspace`,
+which falls back to `default_host` when run outside one). The remaining
+actions — `mirror.status`, `mirror.once`, `mirror.teardown`, `mirror.ensure` —
+are lifecycle/diagnostic and are usually run from the CLI rather than bound.
 
 ## Configuration
 
