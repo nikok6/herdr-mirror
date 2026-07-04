@@ -1,0 +1,76 @@
+id = "mirror"
+name = "Herdr Mirror"
+version = "0.1.0"
+min_herdr_version = "0.7.1"
+description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
+platforms = ["macos", "linux"]
+
+# Fetch the prebuilt herdr-mirror binary for this platform into
+# ./target/release/herdr-mirror — everything below invokes that binary.
+# (Dev installs via `herdr plugin link` build with cargo themselves.)
+[[build]]
+command = ["bash", "scripts/install.sh"]
+
+[[actions]]
+id = "start"
+title = "Mirror: start / resume"
+description = "Start (or resume) the mirror daemon for all configured hosts"
+command = ["./target/release/herdr-mirror", "start"]
+
+[[actions]]
+id = "pause"
+title = "Mirror: pause"
+description = "Pause syncing — mirror workspaces stay put; resume with start"
+command = ["./target/release/herdr-mirror", "pause"]
+
+[[actions]]
+id = "status"
+title = "Mirror: status"
+description = "Log daemon, host, and mirror-object status"
+command = ["./target/release/herdr-mirror", "status"]
+
+[[actions]]
+id = "once"
+title = "Mirror: sync once"
+description = "One-shot mirror pass without starting the daemon"
+command = ["./target/release/herdr-mirror", "once"]
+
+[[actions]]
+id = "remote-new-workspace"
+title = "Mirror: new remote workspace"
+description = "Create a workspace on the remote host (host/cwd inherited from the invoking mirror)"
+command = ["./target/release/herdr-mirror", "remote-workspace"]
+
+[[actions]]
+id = "remote-new-tab"
+title = "Mirror: new remote tab"
+description = "Create a tab in the remote workspace this mirror reflects"
+command = ["./target/release/herdr-mirror", "remote-tab"]
+
+[[actions]]
+id = "remote-split-right"
+title = "Mirror: split remote pane right"
+description = "Split the mirrored remote pane to the right"
+command = ["./target/release/herdr-mirror", "remote-split", "right"]
+
+[[actions]]
+id = "remote-split-down"
+title = "Mirror: split remote pane down"
+description = "Split the mirrored remote pane downward"
+command = ["./target/release/herdr-mirror", "remote-split", "down"]
+
+[[actions]]
+id = "restore"
+title = "Mirror: restore closed mirrors"
+description = "Bring back mirror workspaces/panes you closed locally"
+command = ["./target/release/herdr-mirror", "restore"]
+
+[[actions]]
+id = "teardown"
+title = "Mirror: teardown"
+description = "Stop the daemon and close all mirror workspaces"
+command = ["./target/release/herdr-mirror", "teardown"]
+
+[[events]]
+on = "workspace.focused"
+command = ["./target/release/herdr-mirror", "ensure"]

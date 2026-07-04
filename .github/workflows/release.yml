@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # herdr's four targets; musl gives static linux binaries that cover
+          # both -gnu and -musl systems with one asset per arch
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            asset: herdr-mirror-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            asset: herdr-mirror-linux-aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            asset: herdr-mirror-darwin-x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: herdr-mirror-darwin-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/herdr-mirror ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: checksums
+        run: shasum -a 256 herdr-mirror-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            herdr-mirror-*
+            SHA256SUMS
