@@ -55,6 +55,9 @@ pub struct AgentInfo {
     pub pane_id: String,
     pub agent: Option<String>,
     pub display_agent: Option<String>,
+    // snapshot agents carry this as `name`; the pane_agent_status_changed event
+    // carries the same title as `title`, so accept either
+    #[serde(alias = "title")]
     pub name: Option<String>,
     #[serde(default)]
     pub agent_status: Option<String>,
@@ -358,9 +361,18 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         state.panes.remove(&rid);
     }
 
-    // 2. remote objects that disappeared → close their mirrors, drop map entries
+    // 2. remote objects that disappeared → close their mirrors. Explicit
+    //    `*.closed` events are the authoritative close path (see apply_remote_closes);
+    //    this snapshot-absence sweep is only a backstop for missed events, and it
+    //    acts only when the object was ALSO absent last pass — so a remote that
+    //    reconnected mid-restore (transiently empty/partial snapshot) can't
+    //    mass-close mirrors.
+    let prev_ids = std::mem::take(&mut state.prev_remote_ids);
+    let absent_twice = |rid: &str, present: &HashSet<&str>| {
+        !present.contains(rid) && !prev_ids.contains(rid)
+    };
     let gone_ws: Vec<String> =
-        state.workspaces.keys().filter(|rid| !remote_ws_ids.contains(rid.as_str())).cloned().collect();
+        state.workspaces.keys().filter(|rid| absent_twice(rid, &remote_ws_ids)).cloned().collect();
     for rid in gone_ws {
         let entry = state.workspaces.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
@@ -371,7 +383,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     let gone_tabs: Vec<String> =
-        state.tabs.keys().filter(|rid| !remote_tab_ids.contains(rid.as_str())).cloned().collect();
+        state.tabs.keys().filter(|rid| absent_twice(rid, &remote_tab_ids)).cloned().collect();
     for rid in gone_tabs {
         let entry = state.tabs.remove(&rid).unwrap();
         if local_tab_ids.contains(entry.local_id.as_str()) {
@@ -379,13 +391,20 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     let gone_panes: Vec<String> =
-        state.panes.keys().filter(|rid| !remote_pane_ids.contains(rid.as_str())).cloned().collect();
+        state.panes.keys().filter(|rid| absent_twice(rid, &remote_pane_ids)).cloned().collect();
     for rid in gone_panes {
         let entry = state.panes.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_pane_ids.contains(entry.local_id.as_str()) {
             let _ = deps.local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
         }
     }
+    // record this pass's remote ids for the next comparison
+    state.prev_remote_ids = remote_ws_ids
+        .iter()
+        .chain(remote_tab_ids.iter())
+        .chain(remote_pane_ids.iter())
+        .map(|s| s.to_string())
+        .collect();
 
     // skip remote workspaces that are entirely another herdr-mirror's streamer
     // panes (a machine mirroring us back), so mutual mirroring can't nest.
@@ -697,6 +716,47 @@ pub async fn push_pane_status(
     }
 }
 
+/// Authoritative close path: apply explicit remote `*.closed` events by closing
+/// the matching local mirror and pruning state. Ids are namespaced (ws `w1`, tab
+/// `w1:t1`, pane `w1:p1`), so each is looked up wherever it lives. Closing a
+/// workspace mirror cascades to its tabs/panes locally; stale child state entries
+/// are pruned by the next converge.
+pub async fn apply_remote_closes(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    closed: &[String],
+    log: &Logger,
+) {
+    if closed.is_empty() {
+        return;
+    }
+    let mut state = load_state(state_dir, host_name);
+    let mut changed = false;
+    for rid in closed {
+        if let Some(entry) = state.workspaces.remove(rid) {
+            changed = true;
+            if !entry.is_tombstoned() {
+                log.log(&format!("remote workspace {rid} closed — closing mirror {}", entry.local_id));
+                let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
+            }
+        } else if let Some(entry) = state.tabs.remove(rid) {
+            changed = true;
+            let _ = local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
+        } else if let Some(entry) = state.panes.remove(rid) {
+            changed = true;
+            if !entry.is_tombstoned() {
+                let _ = local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
+            }
+        }
+    }
+    if changed {
+        if let Err(e) = save_state(state_dir, host_name, &state) {
+            log.log(&format!("[{host_name}] state save failed: {e}"));
+        }
+    }
+}
+
 pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
     let agent_by_pane: HashMap<&str, &AgentInfo> =
         remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
@@ -744,4 +804,187 @@ pub async fn teardown(local: &ApiClient, state_dir: &std::path::Path, host_name:
         let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
     }
     save_state(state_dir, host_name, &HostState::default())
+}
+
+async fn move_ws(local: &ApiClient, ws: &str, insert_index: usize) -> bool {
+    local
+        .request("workspace.move", json!({ "workspace_id": ws, "insert_index": insert_index }))
+        .await
+        .is_ok()
+}
+
+/// rank a workspace by its label: local (no `<prefix>: `) sorts first (0), then
+/// each host's mirrors by config order (i+1). First matching prefix wins.
+fn ws_rank(label: &str, prefixes: &[String]) -> usize {
+    for (i, p) in prefixes.iter().enumerate() {
+        if label.starts_with(&format!("{p}: ")) {
+            return i + 1;
+        }
+    }
+    0
+}
+
+/// Pure planner: given the current `(workspace_id, rank)` order, return the
+/// `(workspace_id, insert_index)` workspace.move calls that group the sidebar
+/// (locals first, then mirror ranks ascending, preserving order within each
+/// group), moving ONLY mirror rows (rank > 0). Empty when already grouped.
+///
+/// `insert_index` is herdr's pre-removal gap index: pulling a row up lands it at
+/// `i`; pushing one to the end uses `insert_index == len`.
+fn plan_regroup(current: &[(String, usize)]) -> Vec<(String, usize)> {
+    let mut target = current.to_vec();
+    target.sort_by_key(|(_, r)| *r); // stable: preserves order within each group
+    if current == target.as_slice() {
+        return Vec::new();
+    }
+    let mut moves = Vec::new();
+    let mut working = current.to_vec();
+    let n = working.len();
+    let mut i = 0usize;
+    let mut guard = 0usize;
+    while i < target.len() {
+        guard += 1;
+        if guard > n * n + 8 {
+            break;
+        }
+        if working[i].0 == target[i].0 {
+            i += 1;
+            continue;
+        }
+        if target[i].1 > 0 {
+            // a mirror belongs at i and is currently later — pull it up to i
+            let want = target[i].0.clone();
+            let src = working.iter().position(|(id, _)| *id == want).unwrap();
+            moves.push((want.clone(), i));
+            let item = working.remove(src);
+            working.insert(i, item);
+            i += 1;
+        } else if i + 1 < working.len() {
+            // a local belongs at i but a mirror sits there — push that mirror to the end
+            let m = working[i].0.clone();
+            moves.push((m.clone(), working.len()));
+            let item = working.remove(i);
+            working.push(item);
+        } else {
+            i += 1;
+        }
+    }
+    moves
+}
+
+/// Keep the local sidebar grouped: local (non-mirror) workspaces first, then each
+/// host's mirror workspaces contiguous in config order. Classifies by the
+/// `<prefix>: ` label the mirror sets, and only ever moves mirror rows — local
+/// workspaces are never reordered (they group as a side effect of mirror rows
+/// being pushed below them). Idempotent: issues no moves when already grouped.
+pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logger) {
+    let Ok(snap) = fetch_snapshot(local).await else { return };
+    let current: Vec<(String, usize)> =
+        snap.workspaces.iter().map(|w| (w.workspace_id.clone(), ws_rank(&w.label, prefixes))).collect();
+    for (ws, insert_index) in plan_regroup(&current) {
+        if !move_ws(local, &ws, insert_index).await {
+            log.log(&format!("regroup: move {ws} failed"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize
+    /// into AgentInfo cleanly, or flush_status would fall back to a default (no
+    /// agent) and wrongly retract the mirror's agent. Note the event carries the
+    /// title as `title`; the snapshot uses `name` — the alias bridges them.
+    #[test]
+    fn agent_status_event_parses_and_keeps_title() {
+        let data = json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "agent_status": "working",
+            "agent": "claude",
+            "title": "fix the bug",
+            "display_agent": "Claude",
+            "custom_status": null,
+            "state_labels": { "branch": "main" }
+        });
+        let info: AgentInfo = serde_json::from_value(data).unwrap();
+        assert_eq!(info.agent.as_deref(), Some("claude"));
+        assert_eq!(info.agent_status.as_deref(), Some("working"));
+        assert_eq!(info.display_agent.as_deref(), Some("Claude"));
+        assert_eq!(info.name.as_deref(), Some("fix the bug")); // title -> name
+        assert!(info.has_agent());
+    }
+
+    // simulate herdr's move_workspace(source, insert_index) on an id list
+    fn apply_move(order: &mut Vec<String>, ws: &str, insert_index: usize) {
+        let src = order.iter().position(|w| w == ws).unwrap();
+        let target_idx = if src < insert_index { insert_index - 1 } else { insert_index };
+        let item = order.remove(src);
+        order.insert(target_idx, item);
+    }
+
+    fn ranked(items: &[(&str, usize)]) -> Vec<(String, usize)> {
+        items.iter().map(|(s, r)| (s.to_string(), *r)).collect()
+    }
+
+    #[test]
+    fn regroup_groups_and_only_moves_mirrors() {
+        // rank 0 = local, 1 = work, 2 = vps; interleaved current order
+        let current = ranked(&[("L1", 0), ("W1", 1), ("V1", 2), ("L2", 0), ("W2", 1)]);
+        let moves = plan_regroup(&current);
+        // never move a local
+        let rank_of = |id: &str| current.iter().find(|(i, _)| i == id).unwrap().1;
+        for (id, _) in &moves {
+            assert!(rank_of(id) > 0, "planner moved a local row: {id}");
+        }
+        // applying the plan yields the grouped order
+        let mut order: Vec<String> = current.iter().map(|(id, _)| id.clone()).collect();
+        for (ws, idx) in &moves {
+            apply_move(&mut order, ws, *idx);
+        }
+        assert_eq!(order, vec!["L1", "L2", "W1", "W2", "V1"]);
+    }
+
+    #[test]
+    fn regroup_is_noop_when_already_grouped() {
+        let current = ranked(&[("L1", 0), ("L2", 0), ("W1", 1), ("W2", 1), ("V1", 2)]);
+        assert!(plan_regroup(&current).is_empty());
+    }
+
+    #[test]
+    fn regroup_new_mirror_slots_into_its_block() {
+        // a new work workspace appended at the bottom (the reported bug)
+        let current = ranked(&[("L1", 0), ("W1", 1), ("V1", 2), ("W2", 1)]);
+        let mut order: Vec<String> = current.iter().map(|(id, _)| id.clone()).collect();
+        for (ws, idx) in plan_regroup(&current) {
+            apply_move(&mut order, &ws, idx);
+        }
+        assert_eq!(order, vec!["L1", "W1", "W2", "V1"]); // W2 rises above V1
+    }
+
+    #[test]
+    fn ws_rank_classifies_by_prefix() {
+        let prefixes = vec!["work".to_string(), "vps".to_string()];
+        assert_eq!(ws_rank("work: slice", &prefixes), 1);
+        assert_eq!(ws_rank("vps: ~", &prefixes), 2);
+        assert_eq!(ws_rank("utopia", &prefixes), 0); // local
+    }
+
+    /// An agent-exit event carries no agent + "unknown" status → has_agent()
+    /// false, so push_pane_status retracts (the intended release path).
+    #[test]
+    fn agent_exit_event_reads_as_no_agent() {
+        let data = json!({
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+            "agent_status": "unknown",
+            "agent": null,
+            "display_agent": null,
+            "custom_status": null,
+            "state_labels": null
+        });
+        let info: AgentInfo = serde_json::from_value(data).unwrap();
+        assert!(!info.has_agent());
+    }
 }

@@ -1,6 +1,6 @@
 id = "mirror"
 name = "Herdr Mirror"
-version = "0.1.2"
+version = "0.1.3"
 min_herdr_version = "0.7.1"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
 platforms = ["macos", "linux"]

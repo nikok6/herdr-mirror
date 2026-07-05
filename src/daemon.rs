@@ -25,7 +25,10 @@ use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
-use crate::mirror::{converge, mark_unknown, mirror_source, push_pane_status, teardown, AgentInfo, ConvergeDeps};
+use crate::mirror::{
+    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
+    teardown, AgentInfo, ConvergeDeps,
+};
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
 
@@ -179,21 +182,36 @@ async fn run_connected(
 
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
+    let mut closes_at: Option<Instant> = None;
     let mut pending_status: HashMap<String, Value> = HashMap::new();
+    let mut pending_closes: Vec<String> = Vec::new();
 
     loop {
-        let sleep = sleep_until_earliest([converge_at, status_at]);
+        let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
         tokio::select! {
             ev = stream.next() => {
                 match ev {
                     None => return Err(err("event stream closed")),
                     // status changes take the fast-path; structure changes
                     // need a full reconcile (debounced 500ms)
-                    Some(e) if e.event == "pane.agent_status_changed" => {
+                    Some(e) if e.event == "pane_agent_status_changed" => {
                         if let Some(pid) = e.data.get("pane_id").and_then(|v| v.as_str()) {
                             // coalesce: keep only the latest per pane
                             pending_status.insert(pid.to_string(), e.data.clone());
                             status_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                        }
+                    }
+                    // explicit remote closes are authoritative: remove the mirror
+                    // directly instead of inferring it from snapshot absence
+                    Some(e) if matches!(e.event.as_str(), "workspace_closed" | "tab_closed" | "pane_closed") => {
+                        let key = match e.event.as_str() {
+                            "workspace_closed" => "workspace_id",
+                            "tab_closed" => "tab_id",
+                            _ => "pane_id",
+                        };
+                        if let Some(rid) = e.data.get(key).and_then(|v| v.as_str()) {
+                            pending_closes.push(rid.to_string());
+                            closes_at.get_or_insert(Instant::now() + Duration::from_millis(150));
                         }
                     }
                     Some(_) => {
@@ -213,6 +231,13 @@ async fn run_connected(
                         // unknown pane → let a full pass create it
                         converge_at.get_or_insert(now);
                     }
+                }
+                if closes_at.is_some_and(|t| t <= now) {
+                    closes_at = None;
+                    let closed = std::mem::take(&mut pending_closes);
+                    apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
+                    // reconcile + refresh subscriptions after the removals
+                    converge_at.get_or_insert(now);
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
@@ -245,15 +270,28 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
 
 /// Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
-async fn local_events_task(local: ApiClient, pokers: Vec<mpsc::Sender<()>>, log: Logger) {
+async fn local_events_task(
+    local: ApiClient,
+    pokers: Vec<mpsc::Sender<()>>,
+    prefixes: Vec<String>,
+    log: Logger,
+) {
     loop {
-        let subs = vec![json!({ "type": "workspace.closed" }), json!({ "type": "pane.closed" })];
+        let subs = vec![
+            json!({ "type": "workspace.created" }),
+            json!({ "type": "workspace.closed" }),
+            json!({ "type": "pane.closed" }),
+        ];
         match local.subscribe(subs).await {
             Ok(mut stream) => {
+                // catch a sidebar left ungrouped from a previous run
+                regroup_sidebar(&local, &prefixes, &log).await;
                 while let Some(_e) = stream.next().await {
                     for p in &pokers {
                         let _ = p.try_send(());
                     }
+                    // a workspace appeared/left — keep hosts grouped (no-op if already)
+                    regroup_sidebar(&local, &prefixes, &log).await;
                 }
                 log.log("local event stream dropped — resubscribing");
             }
@@ -292,7 +330,8 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
-    tasks.push(tokio::spawn(local_events_task(local.clone(), pokers.clone(), log.clone())));
+    let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
+    tasks.push(tokio::spawn(local_events_task(local.clone(), pokers.clone(), prefixes, log.clone())));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;

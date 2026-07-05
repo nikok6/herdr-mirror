@@ -65,6 +65,11 @@ pub struct HostState {
     pub tabs: BTreeMap<String, TabEntry>,
     #[serde(default)]
     pub panes: BTreeMap<String, PaneEntry>,
+    /// remote object ids (ws/tab/pane) seen in the previous converge. A mirror is
+    /// only closed on snapshot-absence when the object was absent last pass too,
+    /// so a remote that reconnects mid-restore doesn't mass-close mirrors.
+    #[serde(default)]
+    pub prev_remote_ids: std::collections::BTreeSet<String>,
 }
 
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
