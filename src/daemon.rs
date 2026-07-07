@@ -268,12 +268,51 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     }
 }
 
+/// After a local herdr server restart, session-restore resurrects mirror panes
+/// as plain shells: their ids match the map, but no streamer processes exist —
+/// and converge can't tell (the snapshot has no process info), so the mirrors
+/// sit frozen forever. The tell is the conjunction: mapped panes present, zero
+/// wrapper processes for the host. Heal = teardown + poke; the next converge
+/// rebuilds every mirror with a live streamer. A transient socket blip leaves
+/// wrappers running, so the check stays quiet then.
+async fn heal_zombie_mirrors(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    hosts: &[HostConfig],
+    pokers: &[mpsc::Sender<()>],
+    log: &Logger,
+) {
+    for (i, h) in hosts.iter().enumerate() {
+        let state = load_state(state_dir, &h.name);
+        let mapped = state.panes.values().filter(|e| !e.is_tombstoned()).count();
+        if mapped == 0 {
+            continue;
+        }
+        let streamers = std::process::Command::new("pgrep")
+            .args(["-f", &format!("herdr-mirror pane {}", h.target)])
+            .output()
+            .map(|o| o.stdout.iter().filter(|&&b| b == b'\n').count())
+            .unwrap_or(0);
+        if streamers > 0 {
+            continue;
+        }
+        log.log(&format!(
+            "[{}] {mapped} mirror pane(s) mapped but no streamers running (server restart?) — rebuilding",
+            h.name
+        ));
+        let _ = teardown(local, state_dir, &h.name, log).await;
+        let _ = pokers[i].try_send(());
+    }
+}
+
 /// Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
     prefixes: Vec<String>,
+    hosts: Vec<HostConfig>,
+    state_dir: PathBuf,
     log: Logger,
 ) {
     loop {
@@ -286,6 +325,10 @@ async fn local_events_task(
             Ok(mut stream) => {
                 // catch a sidebar left ungrouped from a previous run
                 regroup_sidebar(&local, &prefixes, &log).await;
+                // subscribe succeeding after a drop = the server is back up;
+                // give session-restore a beat, then sweep for zombie mirrors
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
                 while let Some(_e) = stream.next().await {
                     for p in &pokers {
                         let _ = p.try_send(());
@@ -331,7 +374,14 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
-    tasks.push(tokio::spawn(local_events_task(local.clone(), pokers.clone(), prefixes, log.clone())));
+    tasks.push(tokio::spawn(local_events_task(
+        local.clone(),
+        pokers.clone(),
+        prefixes,
+        config.hosts.clone(),
+        env.state_dir.clone(),
+        log.clone(),
+    )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
