@@ -133,6 +133,43 @@ pub enum LayoutNode {
     },
 }
 
+/// Fetch a tab's split tree. `None` on any failure — callers fall back to
+/// heuristics rather than blocking on layout availability.
+pub async fn export_layout_root(api: &ApiClient, tab_id: &str) -> Option<LayoutNode> {
+    #[derive(Deserialize)]
+    struct Exported {
+        layout: ExportedLayout,
+    }
+    #[derive(Deserialize)]
+    struct ExportedLayout {
+        root: LayoutNode,
+    }
+    let exported: Exported = api.request_t("layout.export", json!({ "tab_id": tab_id })).await.ok()?;
+    Some(exported.layout.root)
+}
+
+/// Locate `pane_id` in a split tree: the parent split's direction (already
+/// "right"/"down", pane.split's vocabulary) plus the sibling subtree's pane
+/// ids ordered nearest-to-the-split-point first. This is exact — the tree
+/// records how the panes were actually split, so no geometry heuristics.
+pub fn locate_in_layout(node: &LayoutNode, pane_id: &str) -> Option<(String, Vec<String>)> {
+    let LayoutNode::Split { direction, first, second, .. } = node else { return None };
+    let is_the_pane =
+        |n: &LayoutNode| matches!(n, LayoutNode::Pane { pane_id: Some(p), .. } if p == pane_id);
+    if is_the_pane(first) {
+        let mut sibs = Vec::new();
+        walk_pane_ids(second, &mut sibs);
+        return Some((direction.clone(), sibs));
+    }
+    if is_the_pane(second) {
+        let mut sibs = Vec::new();
+        walk_pane_ids(first, &mut sibs);
+        sibs.reverse();
+        return Some((direction.clone(), sibs));
+    }
+    locate_in_layout(first, pane_id).or_else(|| locate_in_layout(second, pane_id))
+}
+
 fn walk_pane_ids(node: &LayoutNode, out: &mut Vec<String>) {
     match node {
         LayoutNode::Pane { pane_id, .. } => out.push(pane_id.clone().unwrap_or_default()),
@@ -658,12 +695,23 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
                     }
-                    // split off an already-mirrored pane in this tab (the root
-                    // pane always qualifies, since the tab already exists)
-                    let Some(target) = remote_panes_in_tab
-                        .iter()
-                        .find_map(|p| state.panes.get(&p.pane_id).map(|e| e.local_id.clone()))
-                    else {
+                    // place the mirror where the REMOTE layout says the pane
+                    // lives: split its nearest already-mirrored layout sibling
+                    // in the tree's recorded direction. Falls back to the old
+                    // first-pane/right when the layout doesn't resolve.
+                    let placed = locate_in_layout(&exported.layout.root, &rp.pane_id).and_then(
+                        |(dir, sibs)| {
+                            sibs.iter()
+                                .find_map(|rid| state.panes.get(rid).map(|e| e.local_id.clone()))
+                                .map(|t| (t, dir))
+                        },
+                    );
+                    let Some((target, direction)) = placed.or_else(|| {
+                        remote_panes_in_tab
+                            .iter()
+                            .find_map(|p| state.panes.get(&p.pane_id).map(|e| e.local_id.clone()))
+                            .map(|t| (t, "right".to_string()))
+                    }) else {
                         continue;
                     };
                     #[derive(Deserialize)]
@@ -680,7 +728,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             "pane.split",
                             json!({
                                 "target_pane_id": target,
-                                "direction": "right",
+                                "direction": direction,
                                 "cwd": cwd,
                                 "focus": false,
                             }),
