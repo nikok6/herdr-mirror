@@ -929,11 +929,20 @@ pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_n
 /// Graceful teardown: close every mirror workspace this host created.
 pub async fn teardown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, log: &Logger) -> Result<()> {
     let state = load_state(state_dir, host_name);
+    // Wipe the id map BEFORE closing the local windows. teardown (and the
+    // restart / zombie-heal that call it) means "stop mirroring here" — never
+    // "close the remote sessions". But close_remote_on_local_close fires when a
+    // converge sees a still-mapped mirror vanish locally, and it can't tell our
+    // bulk close from the user pressing prefix-x. Clearing the map first leaves
+    // nothing to attribute these closes to, so they cannot propagate to the
+    // remote. Manual close is unaffected: there the entry is still mapped when
+    // the user closes it, so the intent still reaches the remote.
+    save_state(state_dir, host_name, &HostState::default())?;
     for entry in state.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
     }
-    save_state(state_dir, host_name, &HostState::default())
+    Ok(())
 }
 
 async fn move_ws(local: &ApiClient, ws: &str, insert_index: usize) -> bool {
