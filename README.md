@@ -64,6 +64,12 @@ writable and sized to your local pane, so the headless remote fills it instead
 of showing a tiny default-sized window. Type and your keystrokes go to the
 remote, tmux-style; the mouse wheel scrolls remote scrollback.
 
+Ordinary mouse packets are discarded by default so clicks at a plain remote
+shell never become text such as `0;53;51M`. If the remote pane runs a
+mouse-aware TUI, set `mouse_click_passthrough = true` globally or for that host
+to forward clicks, releases, drags, and motion. Wheel events remain semantic
+remote scrolling in either mode.
+
 **Watch-only** — for a machine with its own display or a human sitting at it,
 set `always_control = false` (globally or per host). Its mirrors become
 read-only: a live view with zero effect on the remote that escalates to control
@@ -165,6 +171,10 @@ are lifecycle/diagnostic and are usually run from the CLI rather than bound.
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+# mouse_click_passthrough = false
+                         # default. Discard non-wheel SGR mouse packets before
+                         # remote input. Set true to drive mouse-aware TUIs;
+                         # may type escape-sequence text at plain shells.
 
 [hosts.work]
 target = "work"
@@ -172,6 +182,7 @@ target = "work"
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on ssh's PATH
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
+# mouse_click_passthrough = true     # per-host override for mouse-aware TUIs
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 
@@ -189,6 +200,10 @@ target = "ssh://niko@203.0.113.7:2222"
 - **Layout geometry is copied, not linked**: pane content and typing are
   always live — only sizes are a snapshot. Remote pane adds/removes reconcile,
   but a split-ratio change at the remote doesn't resize an existing mirror.
+- **Mouse mode is not exposed by Herdr's terminal-session API**: the mirror
+  cannot detect whether the remote pane is a plain shell or a mouse-aware TUI.
+  Non-wheel mouse packets are discarded safely by default; enable
+  `mouse_click_passthrough` for hosts where remote TUI mouse control matters.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real

@@ -15,6 +15,8 @@
 //   --control-idle N    auto-release control after N seconds idle (default 3600)
 //   --always-control    start and stay in control: writable, no idle release,
 //                       and sized to the local pane so it fills
+//   --mouse-click-passthrough
+//                       forward ordinary click/release packets to remote PTY
 //
 // Every stream gets its own direct ssh connection (no shared ControlMaster):
 // isolated, and nothing persists to go stale on a flaky network.
@@ -60,6 +62,9 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// forward ordinary SGR click/release packets to the remote PTY. Default
+    /// false until the terminal-session API exposes remote mouse-mode state.
+    pub mouse_click_passthrough: bool,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -74,6 +79,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         size_fixed: false,
         always_control: false,
+        mouse_click_passthrough: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -97,6 +103,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--mouse-click-passthrough" => args.mouse_click_passthrough = true,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -280,14 +287,40 @@ fn write_stdout(s: &str) {
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
 /// press, total len) for a sequence starting at `bytes[at]`.
+#[cfg(test)]
 fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> {
-    let rest = &bytes[at..];
-    if rest.len() < 6 || rest[0] != 0x1b || rest[1] != b'[' || rest[2] != b'<' {
-        return None;
+    match parse_mouse_at(bytes, at) {
+        MouseParse::Complete { btn, col, row, press, len } => Some((btn, col, row, press, len)),
+        MouseParse::Incomplete | MouseParse::Invalid => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseParse {
+    Complete {
+        btn: u32,
+        col: u32,
+        row: u32,
+        press: bool,
+        len: usize,
+    },
+    Incomplete,
+    Invalid,
+}
+
+fn parse_mouse_at(bytes: &[u8], at: usize) -> MouseParse {
+    const PREFIX: &[u8; 3] = b"\x1b[<";
+    let rest = &bytes[at..];
+    if rest.len() < PREFIX.len() {
+        return if PREFIX.starts_with(rest) { MouseParse::Incomplete } else { MouseParse::Invalid };
+    }
+    if &rest[..PREFIX.len()] != PREFIX {
+        return MouseParse::Invalid;
+    }
+
     let mut nums = [0u32; 3];
     let mut n = 0usize;
-    let mut i = 3usize;
+    let mut i = PREFIX.len();
     let mut have_digit = false;
     while i < rest.len() && n < 3 {
         match rest[i] {
@@ -303,14 +336,202 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
                 i += 1;
             }
             b'M' | b'm' if n == 2 && have_digit => {
-                return Some((nums[0], nums[1], nums[2], rest[i] == b'M', i + 1));
+                return MouseParse::Complete {
+                    btn: nums[0],
+                    col: nums[1],
+                    row: nums[2],
+                    press: rest[i] == b'M',
+                    len: i + 1,
+                };
             }
-            _ => return None,
+            _ => return MouseParse::Invalid,
         }
     }
-    None
+    MouseParse::Incomplete
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseScroll {
+    direction: &'static str,
+    col: u32,
+    row: u32,
+    modifiers: u8,
+}
+
+const MOUSE_PREFIX_TIMEOUT: Duration = Duration::from_millis(50);
+const MOUSE_PACKET_TIMEOUT: Duration = Duration::from_millis(250);
+const MAX_MOUSE_PENDING: usize = 64;
+
+fn vertical_wheel(btn: u32) -> Option<(&'static str, u8)> {
+    const SGR_SHIFT: u32 = 4;
+    const SGR_ALT: u32 = 8;
+    const SGR_CONTROL: u32 = 16;
+    const SGR_MODIFIERS: u32 = SGR_SHIFT | SGR_ALT | SGR_CONTROL;
+
+    let direction = match btn & !SGR_MODIFIERS {
+        64 => "up",
+        65 => "down",
+        _ => return None,
+    };
+    // Herdr expects crossterm KeyModifiers bits: shift=1, control=2, alt=4.
+    let modifiers = u8::from(btn & SGR_SHIFT != 0)
+        | (u8::from(btn & SGR_CONTROL != 0) << 1)
+        | (u8::from(btn & SGR_ALT != 0) << 2);
+    Some((direction, modifiers))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilteredEvent {
+    Keyboard { bytes: Vec<u8>, predict: bool },
+    Scroll(MouseScroll),
+}
+
+#[derive(Default)]
+struct FilteredInput {
+    // Aggregate views keep observe/reconnect handling simple. `events` is the
+    // authoritative ordering used by an active control session.
+    keyboard: Vec<u8>,
+    scrolls: Vec<MouseScroll>,
+    saw_mouse: bool,
+    events: Vec<FilteredEvent>,
+}
+
+impl FilteredInput {
+    fn unpredicted_keyboard(bytes: Vec<u8>) -> Self {
+        let mut input = Self {
+            // The bytes came from an ambiguous/incomplete mouse prefix. They
+            // must reach the PTY exactly, but should never enter local echo.
+            saw_mouse: true,
+            ..Self::default()
+        };
+        input.push_keyboard(&bytes, false);
+        input
+    }
+
+    fn push_keyboard(&mut self, bytes: &[u8], predict: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.keyboard.extend_from_slice(bytes);
+        match self.events.last_mut() {
+            Some(FilteredEvent::Keyboard {
+                bytes: pending,
+                predict: pending_predict,
+            }) if *pending_predict == predict => pending.extend_from_slice(bytes),
+            _ => self.events.push(FilteredEvent::Keyboard {
+                bytes: bytes.to_vec(),
+                predict,
+            }),
+        }
+    }
+
+    fn push_scroll(&mut self, scroll: MouseScroll) {
+        self.scrolls.push(scroll);
+        self.events.push(FilteredEvent::Scroll(scroll));
+    }
+}
+
+#[derive(Default)]
+struct MouseInput {
+    pending: Vec<u8>,
+    pending_at: Option<Instant>,
+}
+
+impl MouseInput {
+    fn filter(&mut self, input: &[u8], click_passthrough: bool) -> FilteredInput {
+        self.filter_at(input, click_passthrough, Instant::now())
+    }
+
+    fn filter_at(&mut self, input: &[u8], click_passthrough: bool, now: Instant) -> FilteredInput {
+        let combined;
+        let pending_len = self.pending.len();
+        let pending_at = self.pending_at.take();
+        let bytes = if self.pending.is_empty() {
+            input
+        } else {
+            combined = {
+                let mut v = Vec::with_capacity(self.pending.len() + input.len());
+                v.extend_from_slice(&self.pending);
+                v.extend_from_slice(input);
+                v
+            };
+            self.pending.clear();
+            &combined
+        };
+
+        let mut out = FilteredInput::default();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match parse_mouse_at(bytes, i) {
+                MouseParse::Complete { btn, col, row, press, len } => {
+                    out.saw_mouse = true;
+                    let wheel = vertical_wheel(btn);
+                    if press {
+                        if let Some((direction, modifiers)) = wheel {
+                            out.push_scroll(MouseScroll {
+                                direction,
+                                col: col.saturating_sub(1),
+                                row: row.saturating_sub(1),
+                                modifiers,
+                            });
+                        } else if click_passthrough {
+                            out.push_keyboard(&bytes[i..i + len], false);
+                        }
+                    } else if wheel.is_none() && click_passthrough {
+                        out.push_keyboard(&bytes[i..i + len], false);
+                    }
+                    i += len;
+                }
+                MouseParse::Incomplete => {
+                    self.pending.extend_from_slice(&bytes[i..]);
+                    self.pending_at = pending_at.or(Some(now));
+                    self.cap_pending(&mut out);
+                    break;
+                }
+                MouseParse::Invalid if i == 0 && pending_len > 0 => {
+                    out.saw_mouse = true;
+                    out.push_keyboard(&bytes[..pending_len], false);
+                    i = pending_len;
+                }
+                MouseParse::Invalid => {
+                    out.push_keyboard(&bytes[i..i + 1], true);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn pending_deadline(&self) -> Option<Instant> {
+        let pending_at = self.pending_at?;
+        let timeout = if self.pending.len() < b"\x1b[<".len() {
+            MOUSE_PREFIX_TIMEOUT
+        } else {
+            MOUSE_PACKET_TIMEOUT
+        };
+        Some(pending_at + timeout)
+    }
+
+    fn flush_expired(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if self.pending_deadline().is_some_and(|deadline| deadline <= now) {
+            self.pending_at = None;
+            Some(std::mem::take(&mut self.pending))
+        } else {
+            None
+        }
+    }
+
+    fn cap_pending(&mut self, out: &mut FilteredInput) {
+        if self.pending.len() > MAX_MOUSE_PENDING {
+            out.saw_mouse = true;
+            out.push_keyboard(&self.pending, false);
+            self.pending.clear();
+            self.pending_at = None;
+        }
+    }
+}
+
+#[cfg(test)]
 fn contains_wheel_press(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
@@ -326,6 +547,7 @@ fn contains_wheel_press(bytes: &[u8]) -> bool {
     false
 }
 
+#[cfg(test)]
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
@@ -362,6 +584,7 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
+    mouse_input: MouseInput,
 }
 
 impl App {
@@ -554,32 +777,45 @@ impl App {
         }
     }
 
+    async fn flush_mouse_pending(&mut self) {
+        if let Some(bytes) = self.mouse_input.flush_expired(Instant::now()) {
+            self.handle_filtered_input(FilteredInput::unpredicted_keyboard(bytes))
+                .await;
+        }
+    }
+
     async fn handle_stdin(&mut self, buf: Vec<u8>) {
+        self.flush_mouse_pending().await;
+        let input = self.mouse_input.filter(&buf, self.args.mouse_click_passthrough);
+        self.handle_filtered_input(input).await;
+    }
+
+    async fn handle_filtered_input(&mut self, input: FilteredInput) {
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
-            if has_mouse_seq(&buf) {
+            if !input.scrolls.is_empty() {
                 // wheel escalates only after a soft release; a stray wheel
                 // while glancing shouldn't grab the remote's lock
-                if contains_wheel_press(&buf) {
-                    if self.control_sticky {
-                        self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
-                    } else {
-                        self.hint("read-only — type to take control");
-                    }
+                if self.control_sticky {
+                    self.control_sticky = false;
+                    self.switch_mode(Mode::Control);
+                } else {
+                    self.hint("read-only — type to take control");
                 }
+            }
+            if input.keyboard.is_empty() {
                 return;
             }
             // any keystroke takes control and is delivered once the session is up
             self.control_sticky = false;
-            self.pending_input.push(buf);
+            self.pending_input.push(input.keyboard);
             self.switch_mode(Mode::Control);
             return;
         }
 
         // control mode
         self.last_input = Instant::now();
-        if buf.len() == 1 && buf[0] == 0x1c {
+        if input.keyboard.len() == 1 && input.keyboard[0] == 0x1c && input.scrolls.is_empty() && !input.saw_mouse {
             // ctrl+\ — manual release. In always-control there's nothing to
             // release to, so swallow it (never forward it: ctrl+\ is SIGQUIT).
             if !self.args.always_control {
@@ -589,49 +825,40 @@ impl App {
             return;
         }
         if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            // spinning up or awaiting reconnect: queue the keystroke (flushed
-            // on connect) and, if in backoff, reconnect now
-            self.pending_input.push(buf);
+            // spinning up or awaiting reconnect: queue keystrokes (flushed on
+            // connect) and, if in backoff, reconnect now. Mouse events are
+            // never queued as raw bytes: wheel is session-local scroll, and
+            // ordinary clicks are gated by the filter.
+            if !input.keyboard.is_empty() {
+                self.pending_input.push(input.keyboard);
+            }
             if let Some((_, m)) = self.reconnect_at {
                 self.reconnect_at = Some((Instant::now(), m));
             }
             return;
         }
-        // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // clicks/drags pass through to the remote pty as raw input
-        let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
-        let mut i = 0usize;
-        let mut scrolls: Vec<serde_json::Value> = Vec::new();
-        while i < buf.len() {
-            if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                if press && (btn == 64 || btn == 65) {
-                    scrolls.push(json!({
+
+        for event in input.events {
+            match event {
+                FilteredEvent::Scroll(scroll) => {
+                    self.send(json!({
                         "type": "terminal.scroll",
-                        "direction": if btn == 64 { "up" } else { "down" },
+                        "direction": scroll.direction,
                         "lines": 3,
                         "source": "wheel",
-                        "column": x.saturating_sub(1),
-                        "row": y.saturating_sub(1),
-                        "modifiers": 0,
-                    }));
-                } else {
-                    rest.extend_from_slice(&buf[i..i + len]);
+                        "column": scroll.col,
+                        "row": scroll.row,
+                        "modifiers": scroll.modifiers,
+                    }))
+                    .await;
                 }
-                i += len;
-            } else {
-                rest.push(buf[i]);
-                i += 1;
-            }
-        }
-        for s in scrolls {
-            self.send(s).await;
-        }
-        if !rest.is_empty() {
-            let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
-            self.send(msg).await;
-            // optimistic local echo: draw the keystroke now, verify on frame
-            if self.predict.on_input(&rest, &self.grid) {
-                self.paint();
+                FilteredEvent::Keyboard { bytes, predict } => {
+                    let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&bytes) });
+                    self.send(msg).await;
+                    if predict && self.predict.on_input(&bytes, &self.grid) {
+                        self.paint();
+                    }
+                }
             }
         }
     }
@@ -691,6 +918,7 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
+        mouse_input: MouseInput::default(),
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -713,6 +941,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
+            app.mouse_input.pending_deadline(),
         ]);
 
         tokio::select! {
@@ -763,6 +992,7 @@ pub async fn run(args: Args) -> Result<()> {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
                 }
+                app.flush_mouse_pending().await;
             }
         }
     }
@@ -800,6 +1030,209 @@ mod tests {
         assert!(!has_mouse_seq(b"plain text"));
     }
 
+    #[test]
+    fn ordinary_mouse_clicks_are_swallowed_by_default() {
+        let mut mouse = MouseInput::default();
+        let input = b"\x1b[<0;53;51M\x1b[<0;53;51m";
+
+        let out = mouse.filter(input, false);
+
+        assert!(out.saw_mouse);
+        assert!(out.keyboard.is_empty());
+        assert!(out.scrolls.is_empty());
+        assert!(mouse.pending.is_empty());
+    }
+
+    #[test]
+    fn fragmented_mouse_clicks_are_buffered_and_swallowed() {
+        let mut mouse = MouseInput::default();
+
+        let first = mouse.filter(b"a\x1b[<0;", false);
+        assert_eq!(first.keyboard, b"a");
+        assert!(first.scrolls.is_empty());
+        assert_eq!(mouse.pending, b"\x1b[<0;");
+
+        let second = mouse.filter(b"53;51", false);
+        assert!(second.keyboard.is_empty());
+        assert!(second.scrolls.is_empty());
+        assert_eq!(mouse.pending, b"\x1b[<0;53;51");
+
+        let third = mouse.filter(b"Mb", false);
+        assert!(third.saw_mouse);
+        assert_eq!(third.keyboard, b"b");
+        assert!(third.scrolls.is_empty());
+        assert!(mouse.pending.is_empty());
+    }
+
+    #[test]
+    fn every_mouse_packet_split_preserves_surrounding_keyboard() {
+        let input = b"a\x1b[<0;53;51Mb";
+
+        for split in 1..input.len() {
+            let mut mouse = MouseInput::default();
+            let first = mouse.filter(&input[..split], false);
+            let second = mouse.filter(&input[split..], false);
+            let keyboard = first
+                .keyboard
+                .into_iter()
+                .chain(second.keyboard)
+                .collect::<Vec<_>>();
+
+            assert_eq!(keyboard, b"ab", "split at byte {split}");
+            assert!(first.scrolls.is_empty(), "split at byte {split}");
+            assert!(second.scrolls.is_empty(), "split at byte {split}");
+            assert!(mouse.pending.is_empty(), "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn incomplete_mouse_prefix_times_out_as_keyboard_input() {
+        let mut mouse = MouseInput::default();
+        let now = Instant::now();
+
+        let out = mouse.filter_at(b"\x1b", false, now);
+        assert!(out.keyboard.is_empty());
+        assert_eq!(mouse.pending_deadline(), Some(now + MOUSE_PREFIX_TIMEOUT));
+        assert!(mouse
+            .flush_expired(now + MOUSE_PREFIX_TIMEOUT - Duration::from_millis(1))
+            .is_none());
+        assert_eq!(
+            mouse.flush_expired(now + MOUSE_PREFIX_TIMEOUT),
+            Some(b"\x1b".to_vec())
+        );
+    }
+
+    #[test]
+    fn confirmed_mouse_prefix_has_a_bounded_timeout() {
+        let mut mouse = MouseInput::default();
+        let now = Instant::now();
+        let pending = b"\x1b[<0;";
+
+        let out = mouse.filter_at(pending, false, now);
+        assert!(out.keyboard.is_empty());
+        assert_eq!(mouse.pending, pending);
+        assert_eq!(mouse.pending_deadline(), Some(now + MOUSE_PACKET_TIMEOUT));
+        assert!(mouse
+            .flush_expired(now + MOUSE_PACKET_TIMEOUT - Duration::from_millis(1))
+            .is_none());
+        assert_eq!(
+            mouse.flush_expired(now + MOUSE_PACKET_TIMEOUT),
+            Some(pending.to_vec())
+        );
+    }
+
+    #[test]
+    fn click_passthrough_forwards_ordinary_click_bytes() {
+        let mut mouse = MouseInput::default();
+        let input = b"\x1b[<0;53;51M\x1b[<0;53;51m";
+
+        let out = mouse.filter(input, true);
+
+        assert!(out.saw_mouse);
+        assert_eq!(out.keyboard, input);
+        assert!(out.scrolls.is_empty());
+    }
+
+    #[test]
+    fn wheel_press_becomes_semantic_scroll() {
+        let mut mouse = MouseInput::default();
+
+        let out = mouse.filter(b"\x1b[<64;10;5M\x1b[<65;11;6M\x1b[<64;10;5m", true);
+
+        assert!(out.saw_mouse);
+        assert!(out.keyboard.is_empty());
+        assert_eq!(
+            out.scrolls,
+            vec![
+                MouseScroll {
+                    direction: "up",
+                    col: 9,
+                    row: 4,
+                    modifiers: 0,
+                },
+                MouseScroll {
+                    direction: "down",
+                    col: 10,
+                    row: 5,
+                    modifiers: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_and_wheel_events_preserve_source_order() {
+        let mut mouse = MouseInput::default();
+        let out = mouse.filter(b"a\x1b[<64;10;5Mb", false);
+
+        assert_eq!(
+            out.events,
+            vec![
+                FilteredEvent::Keyboard {
+                    bytes: b"a".to_vec(),
+                    predict: true,
+                },
+                FilteredEvent::Scroll(MouseScroll {
+                    direction: "up",
+                    col: 9,
+                    row: 4,
+                    modifiers: 0,
+                }),
+                FilteredEvent::Keyboard {
+                    bytes: b"b".to_vec(),
+                    predict: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_fragmented_passthrough_split_reassembles_exact_bytes() {
+        let input = b"a\x1b[<0;53;51Mb";
+
+        for split in 1..input.len() {
+            let mut mouse = MouseInput::default();
+            let first = mouse.filter(&input[..split], true);
+            let second = mouse.filter(&input[split..], true);
+            let forwarded = first
+                .keyboard
+                .into_iter()
+                .chain(second.keyboard)
+                .collect::<Vec<_>>();
+
+            assert_eq!(forwarded, input, "split at byte {split}");
+            assert!(mouse.pending.is_empty(), "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn modified_wheel_packets_remain_semantic_scrolls() {
+        let mut mouse = MouseInput::default();
+        let out = mouse.filter(
+            b"\x1b[<68;10;5M\x1b[<73;11;6M\x1b[<80;12;7M\x1b[<68;10;5m",
+            true,
+        );
+
+        assert!(out.keyboard.is_empty());
+        assert_eq!(
+            out.scrolls
+                .iter()
+                .map(|scroll| (scroll.direction, scroll.modifiers))
+                .collect::<Vec<_>>(),
+            vec![("up", 1), ("down", 4), ("up", 2)]
+        );
+    }
+
+    #[test]
+    fn mixed_keyboard_and_mouse_preserves_keyboard_order() {
+        let mut mouse = MouseInput::default();
+
+        let out = mouse.filter(b"ab\x1b[<0;53;51Mcd\x1b[<0;53;51me", false);
+
+        assert!(out.saw_mouse);
+        assert_eq!(out.keyboard, b"abcde");
+        assert!(out.scrolls.is_empty());
+    }
 
     #[test]
     fn sh_quote_escapes_single_quotes() {
@@ -812,17 +1245,31 @@ mod tests {
 
     #[test]
     fn arg_parsing() {
-        let argv: Vec<String> =
-            ["work", "w9:p1", "--remote-bin", "/opt/herdr", "--cols", "176", "--rows", "66"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let argv: Vec<String> = [
+            "work",
+            "w9:p1",
+            "--remote-bin",
+            "/opt/herdr",
+            "--cols",
+            "176",
+            "--rows",
+            "66",
+            "--mouse-click-passthrough",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let a = parse_args(&argv).unwrap();
         assert_eq!(a.ssh_target, "work");
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin, "/opt/herdr");
         assert_eq!((a.cols, a.rows), (176, 66));
         assert!(a.size_fixed);
+        assert!(a.mouse_click_passthrough);
+
+        let defaulted = parse_args(&["work".to_string(), "w9:p1".to_string()]).unwrap();
+        assert!(!defaulted.mouse_click_passthrough);
+
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
     }
