@@ -281,32 +281,40 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
-    let target = deps.host.target.clone();
-    let remote_bin = deps.host.remote_bin.clone();
-    let always_control = deps.host.always_control;
+    let host = deps.host.clone();
     let sizes = sizes.clone();
-    move |pane_id: &str| {
-        let mut argv = vec![
-            exe.clone(),
-            "pane".into(),
-            target.clone(),
-            pane_id.to_string(),
-            "--remote-bin".into(),
-            remote_bin.clone(),
-        ];
-        if always_control {
-            argv.push("--always-control".into());
-        }
-        if let Some(rect) = sizes.get(pane_id) {
-            argv.extend([
-                "--cols".into(),
-                (rect.width + OBSERVE_MARGIN_COLS).to_string(),
-                "--rows".into(),
-                (rect.height + OBSERVE_MARGIN_ROWS).to_string(),
-            ]);
-        }
-        argv
+    move |pane_id: &str| argv_for_pane(&exe, &host, &sizes, pane_id)
+}
+
+fn argv_for_pane(
+    exe: &str,
+    host: &HostConfig,
+    sizes: &HashMap<String, LayoutRect>,
+    pane_id: &str,
+) -> Vec<String> {
+    let mut argv = vec![
+        exe.to_string(),
+        "pane".into(),
+        host.target.clone(),
+        pane_id.to_string(),
+        "--remote-bin".into(),
+        host.remote_bin.clone(),
+    ];
+    if host.always_control {
+        argv.push("--always-control".into());
     }
+    if host.mouse_click_passthrough {
+        argv.push("--mouse-click-passthrough".into());
+    }
+    if let Some(rect) = sizes.get(pane_id) {
+        argv.extend([
+            "--cols".into(),
+            (rect.width + OBSERVE_MARGIN_COLS).to_string(),
+            "--rows".into(),
+            (rect.height + OBSERVE_MARGIN_ROWS).to_string(),
+        ]);
+    }
+    argv
 }
 
 /// single-quote for a POSIX shell command line
@@ -1034,6 +1042,33 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_host(mouse_click_passthrough: bool) -> HostConfig {
+        HostConfig {
+            name: "work".into(),
+            target: "user@work".into(),
+            prefix: "work".into(),
+            remote_bin: "/opt/herdr".into(),
+            always_control: true,
+            mouse_click_passthrough,
+        }
+    }
+
+    #[test]
+    fn pane_argv_enables_configured_mouse_click_passthrough() {
+        let sizes = HashMap::new();
+        let enabled =
+            argv_for_pane("/opt/herdr-mirror", &test_host(true), &sizes, "w9:p1");
+        let disabled =
+            argv_for_pane("/opt/herdr-mirror", &test_host(false), &sizes, "w9:p1");
+
+        assert!(enabled
+            .iter()
+            .any(|arg| arg == "--mouse-click-passthrough"));
+        assert!(!disabled
+            .iter()
+            .any(|arg| arg == "--mouse-click-passthrough"));
+    }
 
     #[test]
     fn ws_label_two_way_rename() {
