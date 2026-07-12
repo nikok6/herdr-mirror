@@ -146,6 +146,9 @@ enum Msg {
     Frame { gen: u64, frame: Frame },
     SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
     Stdin(Vec<u8>),
+    /// result of a background foreground-process poll: Some(true)=shell,
+    /// Some(false)=TUI, None=poll failed (keep last value)
+    Foreground(Option<bool>),
 }
 
 struct Session {
@@ -156,7 +159,7 @@ struct Session {
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -362,7 +365,21 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
+    /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
+    /// Some(false)=TUI (forward clicks), None=unknown (fail safe to local).
+    /// Refreshed lazily on mouse activity via `herdr pane process-info`.
+    remote_is_shell: Option<bool>,
+    /// last time a foreground poll was kicked off (throttles the ssh handshakes)
+    fg_poll_at: Option<Instant>,
+    /// whether the local mouse grab (?1002h) is currently on. Released at a shell
+    /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
+    /// be forwarded.
+    mouse_grabbed: bool,
 }
+
+/// minimum spacing between foreground polls — each is an ssh handshake, so we
+/// poll lazily (only around mouse activity) and no faster than this
+const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
 impl App {
     fn paint(&mut self) {
@@ -392,6 +409,41 @@ impl App {
         self.renderer.status(text);
         self.paint();
         self.hint_clear_at = Some(Instant::now() + Duration::from_millis(1500));
+    }
+
+    /// Kick a background poll of the remote pane's foreground process, throttled
+    /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
+    /// Msg::Foreground and updates `remote_is_shell`.
+    fn spawn_foreground_poll(&mut self) {
+        let now = Instant::now();
+        if self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
+            return;
+        }
+        self.fg_poll_at = Some(now);
+        let tx = self.tx.clone();
+        let ssh = self.args.ssh_target.clone();
+        let bin = self.args.remote_bin.clone();
+        let pane = self.args.pane_target.clone();
+        tokio::spawn(async move {
+            let v = crate::foreground::poll(&ssh, &bin, &pane).await;
+            let _ = tx.send(Msg::Foreground(v)).await;
+        });
+    }
+
+    /// Match the local mouse grab to the classification: release it at a shell so
+    /// herdr does native selection/scroll, keep it grabbed for a TUI (or while
+    /// unknown) so clicks can be forwarded. Only writes on a change.
+    fn sync_mouse_grab(&mut self) {
+        if !self.tty {
+            return;
+        }
+        // grab unless we've confirmed the foreground is a shell
+        let want = self.remote_is_shell != Some(true);
+        if want == self.mouse_grabbed {
+            return;
+        }
+        self.mouse_grabbed = want;
+        write_stdout(if want { "\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1002l" });
     }
 
     fn observe_size(&self) -> (usize, usize) {
@@ -443,6 +495,8 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
+                // warm the foreground classification before the user mouses
+                self.spawn_foreground_poll();
                 // always-control has no release, so no "ctrl+\ to release" hint
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
@@ -597,14 +651,24 @@ impl App {
             }
             return;
         }
+        // refresh the foreground classification on any input while active.
+        // keyboard reaches us even when the grab is released at a shell, so this
+        // is what catches a shell→TUI switch — a released grab means mouse events
+        // stop arriving here, so mouse alone can never trigger the re-poll.
+        self.spawn_foreground_poll();
         // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // clicks/drags pass through to the remote pty as raw input
+        // clicks/drags forward to the remote pty only when the foreground is a
+        // TUI — at a shell they're dropped so they don't garbage the prompt
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                if press && (btn == 64 || btn == 65) {
+                if self.remote_is_shell == Some(false) {
+                    // remote foreground is a TUI → forward wheel and clicks raw
+                    rest.extend_from_slice(&buf[i..i + len]);
+                } else if press && (btn == 64 || btn == 65) {
+                    // shell / not-yet-classified: wheel becomes a semantic scroll
                     scrolls.push(json!({
                         "type": "terminal.scroll",
                         "direction": if btn == 64 { "up" } else { "down" },
@@ -614,9 +678,8 @@ impl App {
                         "row": y.saturating_sub(1),
                         "modifiers": 0,
                     }));
-                } else {
-                    rest.extend_from_slice(&buf[i..i + len]);
                 }
+                // else: shell/unknown click → drop (keep mouse local)
                 i += len;
             } else {
                 rest.push(buf[i]);
@@ -691,6 +754,9 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
+        remote_is_shell: None,
+        fg_poll_at: None,
+        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -722,6 +788,11 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
+                    // keep the last good classification if a poll failed (None)
+                    Some(Msg::Foreground(v)) => if v.is_some() {
+                        app.remote_is_shell = v;
+                        app.sync_mouse_grab();
+                    },
                 }
             }
             _ = sigwinch.recv() => {

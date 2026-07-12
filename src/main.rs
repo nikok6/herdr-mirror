@@ -9,6 +9,7 @@
 mod api;
 mod config;
 mod daemon;
+mod foreground;
 mod grid;
 mod mirror;
 mod pane;
