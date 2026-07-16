@@ -27,6 +27,10 @@ pub struct WsInfo {
     pub tab_count: Option<u64>,
     pub pane_count: Option<u64>,
     pub active_tab_id: Option<String>,
+    /// custom metadata tokens the remote publishes. `default` on purpose: a
+    /// pre-0.7.4 remote never sends this.
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +67,10 @@ pub struct AgentInfo {
     pub agent_status: Option<String>,
     pub custom_status: Option<String>,
     pub state_labels: Option<BTreeMap<String, String>>,
+    /// custom metadata tokens the remote publishes ($model, $summary, …).
+    /// `default` on purpose: a pre-0.7.4 remote never sends this.
+    #[serde(default)]
+    pub tokens: HashMap<String, String>,
 }
 
 impl AgentInfo {
@@ -650,6 +658,27 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
+    // 3b. forward the remote's workspace tokens onto the mirror rows, so a mirror
+    //     carries the same values a native workspace does under whatever layout is
+    //     configured locally. Ignored by a pre-0.7.4 local server.
+    let source = mirror_source(&host.name);
+    for rws in &remote_snap.workspaces {
+        if rws.tokens.is_empty() {
+            continue; // nothing to forward (also the pre-0.7.4 remote case)
+        }
+        let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
+        if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
+            continue;
+        }
+        let _ = deps
+            .local
+            .request(
+                "workspace.report_metadata",
+                json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
+            )
+            .await;
+    }
+
     // 4. remote tabs → replicate layout with wrapper commands
     for rtab in &remote_snap.tabs {
         let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else { continue };
@@ -819,7 +848,17 @@ pub async fn push_pane_status(
         Some(agent) => {
             entry.seq += 1;
             let display = agent.display_agent.clone().or_else(|| agent.agent.clone());
-            let label = display.clone().unwrap_or_else(|| "agent".into());
+            // Identity is the remote's CANONICAL id ("claude"), not the pretty
+            // name: herdr canonicalizes a reported label, so this resolves the
+            // real agent and the mirror row inherits its rows_by_agent layout and
+            // icon instead of rendering as a nameless custom agent. The pretty
+            // name still goes out below as display_agent, which is what the
+            // sidebar actually shows.
+            let label = agent
+                .agent
+                .clone()
+                .or_else(|| display.clone())
+                .unwrap_or_else(|| "agent".into());
             // pass through only a custom status the remote actually reports;
             // no synthetic "@host" marker (clear any stale one)
             let custom: Option<String> = agent.custom_status.as_deref().map(clamp_status);
@@ -837,12 +876,16 @@ pub async fn push_pane_status(
             if let Err(e) = local.request("pane.report_agent", report).await {
                 log.log(&format!("report_agent {}: {e}", entry.local_id));
             }
+            // forward the remote's own tokens so a mirrored agent row carries the
+            // same values a native one does, under whatever layout is configured
+            // locally. Ignored by a pre-0.7.4 local server (no deny_unknown_fields).
             let mut meta = json!({
                 "pane_id": entry.local_id,
                 "source": source,
                 "display_agent": display,
                 "title": agent.name,
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
+                "tokens": agent.tokens.clone(),
                 "seq": entry.seq,
             });
             if custom.is_none() {
