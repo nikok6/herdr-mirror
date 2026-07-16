@@ -51,6 +51,7 @@ jobs:
         run: shasum -a 256 herdr-mirror-* > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
+          generate_release_notes: true
           files: |
             herdr-mirror-*
             SHA256SUMS
