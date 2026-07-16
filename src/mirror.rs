@@ -289,16 +289,20 @@ pub struct ConvergeDeps {
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
 /// known size get no --cols/--rows (the wrapper falls back to a default).
-fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> impl Fn(&str) -> Vec<String> {
+pub(crate) fn cmd_for_pane(
+    host: &HostConfig,
+    state_dir: &std::path::Path,
+    sizes: &HashMap<String, LayoutRect>,
+) -> impl Fn(&str) -> Vec<String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
-    let target = deps.host.target.clone();
-    let remote_bin = deps.host.remote_bin.clone();
-    let always_control = deps.host.always_control;
+    let target = host.target.clone();
+    let remote_bin = host.remote_bin.clone();
+    let always_control = host.always_control;
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
-    let ctl_path = deps.state_dir.join(format!("{}.ctl", deps.host.name)).display().to_string();
+    let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -334,7 +338,7 @@ fn sh_quote(s: &str) -> String {
 /// layout `command`), which set `launch_argv` and would surface every mirror pane
 /// as an agent row; a shell `exec` keeps it non-agent until a real agent is
 /// reported onto it.
-async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
+pub(crate) async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
@@ -398,7 +402,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             sizes.insert(p.pane_id.clone(), p.rect.clone());
         }
     }
-    let cmd_for = cmd_for_pane(deps, &sizes);
+    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
     // 1. detect mirrors that are gone locally. Always tombstone (never remove)

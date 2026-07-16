@@ -283,12 +283,16 @@ async fn heal_zombie_mirrors(
     hosts: &[HostConfig],
     pokers: &[mpsc::Sender<()>],
     log: &Logger,
-    closes: &crate::closes::Closes,
 ) {
     for (i, h) in hosts.iter().enumerate() {
         let state = load_state(state_dir, &h.name);
-        let mapped = state.panes.values().filter(|e| !e.is_tombstoned()).count();
-        if mapped == 0 {
+        let panes: Vec<(String, String)> = state
+            .panes
+            .iter()
+            .filter(|(_, e)| !e.is_tombstoned())
+            .map(|(rid, e)| (rid.clone(), e.local_id.clone()))
+            .collect();
+        if panes.is_empty() {
             continue;
         }
         let streamers = std::process::Command::new("pgrep")
@@ -300,15 +304,29 @@ async fn heal_zombie_mirrors(
             continue;
         }
         log.log(&format!(
-            "[{}] {mapped} mirror pane(s) mapped but no streamers running (server restart?) — rebuilding",
-            h.name
+            "[{}] {} mirror pane(s) mapped but no streamers running (server restart?) — re-exec'ing streamers",
+            h.name,
+            panes.len()
         ));
-        let _ = teardown(local, state_dir, &h.name, log, Some(closes)).await;
+        // Surgical on purpose: session-restore brought the workspace, tabs, panes
+        // and layout back intact — only the streamer processes died. Exec the
+        // streamer back into each existing pane rather than closing the workspace
+        // and rebuilding it: that rebuild raced its own close (the fresh snapshot
+        // still listed the dying workspace, so the adopt path reused it and
+        // layout.apply then failed on its dead tab).
+        //
+        // Sizes live in the remote layout, which we don't have here; the wrapper
+        // falls back to its default and the next converge reconciles.
+        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
+        for (remote_pane_id, local_pane_id) in panes {
+            let argv = cmd_for(&remote_pane_id);
+            crate::mirror::spawn_streamer_pane(local, &local_pane_id, &argv, log).await;
+        }
         let _ = pokers[i].try_send(());
     }
 }
 
-/// Local events: mirror closes drive tombstoning — poke every host so the
+// Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
 async fn local_events_task(
     local: ApiClient,
@@ -332,7 +350,7 @@ async fn local_events_task(
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log, &closes).await;
+                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
                 while let Some(e) = stream.next().await {
                     // A close EVENT is the authoritative "the user closed this";
                     // snapshot absence is not (rebuild/restart/failed converge).
