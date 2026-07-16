@@ -199,6 +199,14 @@ fn map_node(node: &LayoutNode, cwd: &str) -> Value {
     }
 }
 
+/// Mark a local id the plugin itself is about to close, so the close event it
+/// raises isn't read back as the user closing the mirror (see closes.rs).
+fn mark_self_close(deps: &ConvergeDeps, local_id: &str) {
+    if let Ok(mut t) = deps.closes.lock() {
+        t.mark_self_close(local_id);
+    }
+}
+
 fn map_status(remote: &str) -> &'static str {
     match remote {
         "working" => "working",
@@ -273,6 +281,10 @@ pub struct ConvergeDeps {
     pub log: Logger,
     /// mirror closing a workspace/pane locally onto the remote (see MirrorConfig)
     pub close_remote_on_local_close: bool,
+    /// event-confirmed local closes. Absence from the local snapshot is
+    /// ambiguous (rebuild in flight, failed converge, server restart), so only a
+    /// close event that wasn't our own may close the remote.
+    pub closes: crate::closes::Closes,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -389,16 +401,30 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     let cmd_for = cmd_for_pane(deps, &sizes);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
-    // 1. detect mirrors the user closed locally. Always tombstone (never remove)
-    //    so this pass can't recreate them (the snapshot still lists the object).
-    //    With close_remote_on_local_close, also close the remote object; section
-    //    2 reaps the tombstoned entry once the remote is gone.
+    // 1. detect mirrors that are gone locally. Always tombstone (never remove)
+    //    so this pass can't recreate them (the snapshot still lists the object);
+    //    section 2 reaps the tombstoned entry once the remote is gone.
+    //
+    //    Closing the REMOTE is destructive, so it is driven only by an
+    //    event-confirmed user close (see closes.rs) — never by absence alone,
+    //    which also happens mid-rebuild, after a failed converge, or while the
+    //    local server is restarting.
     let close_remote = deps.close_remote_on_local_close;
+    let mine: HashSet<String> = state
+        .workspaces
+        .values()
+        .map(|e| e.local_id.clone())
+        .chain(state.panes.values().map(|e| e.local_id.clone()))
+        .collect();
+    let user_closed = match deps.closes.lock() {
+        Ok(mut t) => t.take_user_closed(&mine),
+        Err(_) => HashSet::new(),
+    };
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
             entry.tombstone = Some(true);
-            if close_remote {
+            if close_remote && user_closed.contains(&entry.local_id) {
                 ws_close_remote.push(rid.clone());
             } else {
                 log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
@@ -424,7 +450,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
                     entry.tombstone = Some(true);
-                    if close_remote {
+                    if close_remote && user_closed.contains(&entry.local_id) {
                         pane_close_remote.push(rid.clone());
                     } else {
                         log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
@@ -460,6 +486,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         let entry = state.workspaces.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
             log.log(&format!("remote workspace {rid} gone — closing mirror {}", entry.local_id));
+            mark_self_close(deps, &entry.local_id);
             if let Err(e) = deps.local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await {
                 log.log(&format!("close failed: {e}"));
             }
@@ -478,6 +505,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     for rid in gone_panes {
         let entry = state.panes.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_pane_ids.contains(entry.local_id.as_str()) {
+            mark_self_close(deps, &entry.local_id);
             let _ = deps.local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
         }
     }
@@ -935,7 +963,13 @@ pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_n
 }
 
 /// Graceful teardown: close every mirror workspace this host created.
-pub async fn teardown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, log: &Logger) -> Result<()> {
+pub async fn teardown(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    log: &Logger,
+    closes: Option<&crate::closes::Closes>,
+) -> Result<()> {
     let state = load_state(state_dir, host_name);
     // Wipe the id map BEFORE closing the local windows. teardown (and the
     // restart / zombie-heal that call it) means "stop mirroring here" — never
@@ -948,6 +982,13 @@ pub async fn teardown(local: &ApiClient, state_dir: &std::path::Path, host_name:
     save_state(state_dir, host_name, &HostState::default())?;
     for entry in state.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
+        // ours, not the user's: the heal re-adopts these ids, so without the mark
+        // the echoing close event would later read as "user closed the mirror"
+        if let Some(c) = closes {
+            if let Ok(mut t) = c.lock() {
+                t.mark_self_close(&entry.local_id);
+            }
+        }
         let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
     }
     Ok(())

@@ -70,6 +70,7 @@ struct HostCtx {
     local: ApiClient,
     log: Logger,
     close_remote_on_local_close: bool,
+    closes: crate::closes::Closes,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -171,6 +172,7 @@ async fn run_connected(
         plugin_root: ctx.plugin_root.clone(),
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
+        closes: ctx.closes.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -281,6 +283,7 @@ async fn heal_zombie_mirrors(
     hosts: &[HostConfig],
     pokers: &[mpsc::Sender<()>],
     log: &Logger,
+    closes: &crate::closes::Closes,
 ) {
     for (i, h) in hosts.iter().enumerate() {
         let state = load_state(state_dir, &h.name);
@@ -300,7 +303,7 @@ async fn heal_zombie_mirrors(
             "[{}] {mapped} mirror pane(s) mapped but no streamers running (server restart?) — rebuilding",
             h.name
         ));
-        let _ = teardown(local, state_dir, &h.name, log).await;
+        let _ = teardown(local, state_dir, &h.name, log, Some(closes)).await;
         let _ = pokers[i].try_send(());
     }
 }
@@ -314,6 +317,7 @@ async fn local_events_task(
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
     log: Logger,
+    closes: crate::closes::Closes,
 ) {
     loop {
         let subs = vec![
@@ -328,8 +332,23 @@ async fn local_events_task(
                 // subscribe succeeding after a drop = the server is back up;
                 // give session-restore a beat, then sweep for zombie mirrors
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
-                while let Some(_e) = stream.next().await {
+                heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log, &closes).await;
+                while let Some(e) = stream.next().await {
+                    // A close EVENT is the authoritative "the user closed this";
+                    // snapshot absence is not (rebuild/restart/failed converge).
+                    // Our own closes are marked beforehand and swallowed here.
+                    let key = match e.event.as_str() {
+                        "workspace_closed" => Some("workspace_id"),
+                        "pane_closed" => Some("pane_id"),
+                        _ => None,
+                    };
+                    if let Some(k) = key {
+                        if let Some(lid) = e.data.get(k).and_then(|v| v.as_str()) {
+                            if let Ok(mut t) = closes.lock() {
+                                t.note_close_event(lid);
+                            }
+                        }
+                    }
                     for p in &pokers {
                         let _ = p.try_send(());
                     }
@@ -358,6 +377,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     ));
 
     let local = ApiClient::connect(&env.local_socket).await?;
+    let closes = crate::closes::new_closes();
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
@@ -370,6 +390,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             local: local.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            closes: closes.clone(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -381,6 +402,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         config.hosts.clone(),
         env.state_dir.clone(),
         log.clone(),
+        closes.clone(),
     )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -542,6 +564,10 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             plugin_root: env.plugin_root.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            // one-shot: no local event stream, so there is no authoritative
+            // close signal — an empty tracker means this pass syncs but never
+            // closes a remote object, which is the correct conservative default
+            closes: crate::closes::new_closes(),
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
@@ -604,7 +630,7 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     let config = load_config(&env.config_dir)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
-        teardown(&local, &env.state_dir, &h.name, &log).await?;
+        teardown(&local, &env.state_dir, &h.name, &log, None).await?;
     }
     log.log("teardown complete (autostart paused until next start)");
     Ok(())

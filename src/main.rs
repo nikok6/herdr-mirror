@@ -7,6 +7,7 @@
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 
 mod api;
+mod closes;
 mod config;
 mod daemon;
 mod foreground;
