@@ -275,6 +275,29 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
 /// wrapper processes for the host. Heal = teardown + poke; the next converge
 /// rebuilds every mirror with a live streamer. A transient socket blip leaves
 /// wrappers running, so the check stays quiet then.
+/// Count one host's streamer processes in `ps -axo command=` output.
+///
+/// Keyed on the `--ctl-path <state>/<name>.ctl` argument, which is unique per
+/// host (`name` is the hosts.toml table key) and always present in the pane
+/// argv. The obvious alternative, matching the ssh target, is wrong twice
+/// over: `pgrep -f <target>` treats the pattern as an *unanchored regex*, so
+/// host `work` counted host `work-staging`'s streamers and therefore skipped
+/// its own healing forever; and targets with regex metacharacters
+/// (`ssh://host:2222`) match more than they look like they should.
+fn count_streamers(ps_output: &str, ctl_path: &str) -> usize {
+    let needle = format!("--ctl-path {ctl_path}");
+    ps_output
+        .lines()
+        .filter(|line| {
+            line.match_indices(&needle).any(|(at, _)| {
+                // the path must END the argument: a host named `a` must not
+                // match a host named `a.ctl`, whose path it prefixes
+                matches!(line.as_bytes().get(at + needle.len()), None | Some(b' '))
+            })
+        })
+        .count()
+}
+
 async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
@@ -293,10 +316,11 @@ async fn heal_zombie_mirrors(
         if panes.is_empty() {
             continue;
         }
-        let streamers = std::process::Command::new("pgrep")
-            .args(["-f", &format!("herdr-mirror pane {}", h.target)])
+        let ctl = state_dir.join(format!("{}.ctl", h.name)).display().to_string();
+        let streamers = std::process::Command::new("ps")
+            .args(["-axo", "command="])
             .output()
-            .map(|o| o.stdout.iter().filter(|&&b| b == b'\n').count())
+            .map(|o| count_streamers(&String::from_utf8_lossy(&o.stdout), &ctl))
             .unwrap_or(0);
         if streamers > 0 {
             continue;
@@ -659,4 +683,59 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     }
     log.log("teardown complete (autostart paused until next start)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// argv as it actually appears in `ps`, taken from a live streamer
+    fn ps_line(target: &str, host_name: &str) -> String {
+        format!(
+            "/Users/x/.config/herdr/plugins/github/mirror-0015/target/release/herdr-mirror \
+             pane {target} w1:p1 --remote-bin /root/.local/bin/herdr --always-control \
+             --ctl-path /Users/x/.local/state/herdr-mirror/{host_name}.ctl"
+        )
+    }
+
+    fn ctl(host_name: &str) -> String {
+        format!("/Users/x/.local/state/herdr-mirror/{host_name}.ctl")
+    }
+
+    #[test]
+    fn counts_only_this_hosts_streamers() {
+        let ps = format!("{}\n{}\n", ps_line("vps", "vps"), ps_line("home", "home"));
+        assert_eq!(count_streamers(&ps, &ctl("vps")), 1);
+        assert_eq!(count_streamers(&ps, &ctl("home")), 1);
+        assert_eq!(count_streamers(&ps, &ctl("absent")), 0);
+    }
+
+    /// The regression: hosts whose *targets* share a prefix must not be
+    /// conflated. Under `pgrep -f "herdr-mirror pane work"` the `work` host
+    /// counted `work-staging`'s streamer, saw a live process, and skipped
+    /// healing its own dead mirrors permanently.
+    #[test]
+    fn prefix_sharing_hosts_do_not_collide() {
+        let only_staging = format!("{}\n", ps_line("work-staging", "staging"));
+        assert_eq!(count_streamers(&only_staging, &ctl("staging")), 1);
+        assert_eq!(count_streamers(&only_staging, &ctl("work")), 0, "work must see zero");
+    }
+
+    /// Same hazard one level down: a host name that prefixes another host's
+    /// ctl path must not match it.
+    #[test]
+    fn ctl_path_prefix_does_not_collide() {
+        let ps = format!("{}\n", ps_line("t", "a.ctl"));
+        assert_eq!(count_streamers(&ps, &ctl("a.ctl")), 1);
+        assert_eq!(count_streamers(&ps, &ctl("a")), 0, "`a` must not match `a.ctl`");
+    }
+
+    /// Two hosts pointed at the same remote are distinguishable by name,
+    /// which the old target-keyed match could not do.
+    #[test]
+    fn same_target_different_hosts_are_distinct() {
+        let ps = format!("{}\n{}\n", ps_line("vps", "vps-ro"), ps_line("vps", "vps-rw"));
+        assert_eq!(count_streamers(&ps, &ctl("vps-ro")), 1);
+        assert_eq!(count_streamers(&ps, &ctl("vps-rw")), 1);
+    }
 }
