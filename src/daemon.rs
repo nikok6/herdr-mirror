@@ -250,18 +250,47 @@ async fn run_connected(
     }
 }
 
+/// Retry pacing after a lost connection.
+///
+/// ssh keeps its original ladder: an unreachable machine is a fault, and you
+/// want it back fast. A stopped container is not a fault, it is the resting
+/// state, so retrying every 30s forever would burn a `docker ps` per host per
+/// half-minute and fill the log with non-events.
+const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
+const DORMANT_DELAY: u64 = 300;
+
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
+    let mut was_dormant = false;
     loop {
         let e = match run_connected(&ctx, &mut poke, &mut backoff_idx).await {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
-        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: ssh lost").await;
-        let delays = [5u64, 10, 30];
-        let delay = delays[backoff_idx.min(delays.len() - 1)];
-        backoff_idx += 1;
-        ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
+            .await;
+        // starts_with, not contains: the marker is always emitted as a prefix,
+        // while the error text can embed user strings (target, remote_bin). A
+        // substring test would make an ssh host named `dormant-box` back off
+        // for 5 minutes and stop logging on every genuine failure.
+        let dormant = e.to_string().starts_with(crate::remote::DORMANT);
+        let delay = if dormant {
+            DORMANT_DELAY
+        } else {
+            RECONNECT_DELAYS[backoff_idx.min(RECONNECT_DELAYS.len() - 1)]
+        };
+        // dormant cycles must not advance the ladder they do not use: a
+        // container stopped overnight would otherwise leave backoff_idx pinned
+        // at the 30s rung, so the first real failure while it boots waits 30s
+        // instead of the 5s the ladder exists to give.
+        if !dormant {
+            backoff_idx += 1;
+        }
+        // log dormancy once on entry, not on every poll of a stopped container
+        if !dormant || !was_dormant {
+            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        }
+        was_dormant = dormant;
         tokio::time::sleep(Duration::from_secs(delay)).await;
         // drain stale pokes accumulated while down (reconnect converges anyway)
         while poke.try_recv().is_ok() {}
@@ -284,18 +313,43 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
 /// host `work` counted host `work-staging`'s streamers and therefore skipped
 /// its own healing forever; and targets with regex metacharacters
 /// (`ssh://host:2222`) match more than they look like they should.
-fn count_streamers(ps_output: &str, ctl_path: &str) -> usize {
-    let needle = format!("--ctl-path {ctl_path}");
+fn count_streamers(ps_output: &str, host_name: &str, ctl_path: &str) -> usize {
+    // ssh panes are identified by --ctl-path (load-bearing there, and unchanged
+    // since v0.1.7); docker panes by --host-name, since they have no
+    // ControlMaster and a ctl path would name a file nothing ever creates.
+    let needles =
+        [format!("--ctl-path {ctl_path}"), format!("--host-name {host_name}")];
     ps_output
         .lines()
         .filter(|line| {
-            line.match_indices(&needle).any(|(at, _)| {
-                // the path must END the argument: a host named `a` must not
-                // match a host named `a.ctl`, whose path it prefixes
-                matches!(line.as_bytes().get(at + needle.len()), None | Some(b' '))
+            needles.iter().any(|needle| {
+                line.match_indices(needle.as_str()).any(|(at, _)| {
+                    // the value must END the argument: a host named `a` must not
+                    // match a host named `a.ctl`, whose path it prefixes
+                    matches!(line.as_bytes().get(at + needle.len()), None | Some(b' '))
+                })
             })
         })
         .count()
+}
+
+/// Streamers spawned by a herdr-mirror older than v0.1.7, which predates
+/// `--ctl-path` entirely.
+///
+/// Without this, upgrading from <=v0.1.6 is destructive rather than merely
+/// wrong: the pre-upgrade streamers are children of the *herdr server*, so they
+/// survive the daemon restart, but `count_streamers` cannot see them. Healing
+/// then fires on the first subscribe (which happens at daemon startup, not only
+/// after a drop) and `spawn_streamer_pane` writes `exec herdr-mirror pane ...`
+/// as TEXT into a pane whose live streamer owns stdin — i.e. types garbage into
+/// the user's running remote session.
+///
+/// Matches the old argv shape (`herdr-mirror pane <target> `) with the trailing
+/// space anchoring it, so `work` cannot match `work-staging`. Can be dropped
+/// once upgrades from <=v0.1.6 are no longer plausible.
+fn count_legacy_streamers(ps_output: &str, target: &str) -> usize {
+    let needle = format!("herdr-mirror pane {target} ");
+    ps_output.lines().filter(|line| line.contains(&needle)).count()
 }
 
 async fn heal_zombie_mirrors(
@@ -317,11 +371,15 @@ async fn heal_zombie_mirrors(
             continue;
         }
         let ctl = state_dir.join(format!("{}.ctl", h.name)).display().to_string();
-        let streamers = std::process::Command::new("ps")
+        let ps = std::process::Command::new("ps")
             .args(["-axo", "command="])
             .output()
-            .map(|o| count_streamers(&String::from_utf8_lossy(&o.stdout), &ctl))
-            .unwrap_or(0);
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        // legacy shape checked too, so an upgrade from <=v0.1.7 does not mistake
+        // live pre-upgrade streamers for dead ones
+        let streamers =
+            count_streamers(&ps, &h.name, &ctl) + count_legacy_streamers(&ps, &h.target);
         if streamers > 0 {
             continue;
         }
@@ -419,6 +477,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     // two configs on disk is a silent trap: the loser is ignored with no sign
     for ignored in &config.shadowed {
         log.log(&format!("warning: ignoring shadowed config at {}", ignored.display()));
+    }
+    // a skipped host would otherwise just be quietly absent from the sidebar
+    for w in &config.warnings {
+        log.log(&format!("warning: {w}"));
     }
 
     let local = ApiClient::connect(&env.local_socket).await?;
@@ -573,6 +635,9 @@ pub fn cmd_status(env: &Env) -> Result<()> {
     for ignored in &config.shadowed {
         println!("warning: ignoring shadowed config at {}", ignored.display());
     }
+    for w in &config.warnings {
+        println!("warning: {w}");
+    }
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
         let ws = state.workspaces.values().filter(|w| !w.is_tombstoned()).count();
@@ -689,25 +754,43 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// argv as it actually appears in `ps`, taken from a live streamer
-    fn ps_line(target: &str, host_name: &str) -> String {
-        format!(
-            "/Users/x/.config/herdr/plugins/github/mirror-0015/target/release/herdr-mirror \
-             pane {target} w1:p1 --remote-bin /root/.local/bin/herdr --always-control \
-             --ctl-path /Users/x/.local/state/herdr-mirror/{host_name}.ctl"
-        )
+    /// Build the ps line from the REAL emitter, so this fixture cannot drift
+    /// away from what the daemon actually spawns. A hand-copied string would
+    /// keep passing while production argv changed underneath it — which is the
+    /// exact failure mode these tests exist to prevent.
+    fn ps_line(host: &crate::config::HostConfig) -> String {
+        let cmd = crate::mirror::cmd_for_pane(host, std::path::Path::new("/state"), &HashMap::new());
+        cmd("w1:p1").join(" ")
+    }
+
+    fn ssh_host(name: &str, target: &str) -> crate::config::HostConfig {
+        crate::config::HostConfig {
+            name: name.into(),
+            target: target.into(),
+            kind: crate::config::HostKind::Ssh,
+            docker_bin: "docker".into(),
+            prefix: name.into(),
+            remote_bin: "~/.local/bin/herdr".into(),
+            always_control: true,
+        }
+    }
+
+    fn docker_host(name: &str, folder: &str) -> crate::config::HostConfig {
+        let mut h = ssh_host(name, folder);
+        h.kind = crate::config::HostKind::DockerFolder(folder.into());
+        h
     }
 
     fn ctl(host_name: &str) -> String {
-        format!("/Users/x/.local/state/herdr-mirror/{host_name}.ctl")
+        format!("/state/{host_name}.ctl")
     }
 
     #[test]
     fn counts_only_this_hosts_streamers() {
-        let ps = format!("{}\n{}\n", ps_line("vps", "vps"), ps_line("home", "home"));
-        assert_eq!(count_streamers(&ps, &ctl("vps")), 1);
-        assert_eq!(count_streamers(&ps, &ctl("home")), 1);
-        assert_eq!(count_streamers(&ps, &ctl("absent")), 0);
+        let ps = format!("{}\n{}\n", ps_line(&ssh_host("vps", "vps")), ps_line(&ssh_host("home", "home")));
+        assert_eq!(count_streamers(&ps, "vps", &ctl("vps")), 1);
+        assert_eq!(count_streamers(&ps, "home", &ctl("home")), 1);
+        assert_eq!(count_streamers(&ps, "absent", &ctl("absent")), 0);
     }
 
     /// The regression: hosts whose *targets* share a prefix must not be
@@ -716,26 +799,86 @@ mod tests {
     /// healing its own dead mirrors permanently.
     #[test]
     fn prefix_sharing_hosts_do_not_collide() {
-        let only_staging = format!("{}\n", ps_line("work-staging", "staging"));
-        assert_eq!(count_streamers(&only_staging, &ctl("staging")), 1);
-        assert_eq!(count_streamers(&only_staging, &ctl("work")), 0, "work must see zero");
+        let only_staging = ps_line(&ssh_host("staging", "work-staging"));
+        assert_eq!(count_streamers(&only_staging, "staging", &ctl("staging")), 1);
+        assert_eq!(count_streamers(&only_staging, "work", &ctl("work")), 0, "work must see zero");
     }
 
     /// Same hazard one level down: a host name that prefixes another host's
     /// ctl path must not match it.
     #[test]
     fn ctl_path_prefix_does_not_collide() {
-        let ps = format!("{}\n", ps_line("t", "a.ctl"));
-        assert_eq!(count_streamers(&ps, &ctl("a.ctl")), 1);
-        assert_eq!(count_streamers(&ps, &ctl("a")), 0, "`a` must not match `a.ctl`");
+        let ps = ps_line(&ssh_host("a.ctl", "t"));
+        assert_eq!(count_streamers(&ps, "a.ctl", &ctl("a.ctl")), 1);
+        assert_eq!(count_streamers(&ps, "a", &ctl("a")), 0, "`a` must not match `a.ctl`");
     }
 
     /// Two hosts pointed at the same remote are distinguishable by name,
     /// which the old target-keyed match could not do.
     #[test]
     fn same_target_different_hosts_are_distinct() {
-        let ps = format!("{}\n{}\n", ps_line("vps", "vps-ro"), ps_line("vps", "vps-rw"));
-        assert_eq!(count_streamers(&ps, &ctl("vps-ro")), 1);
-        assert_eq!(count_streamers(&ps, &ctl("vps-rw")), 1);
+        let ps = format!("{}\n{}\n", ps_line(&ssh_host("vps-ro", "vps")), ps_line(&ssh_host("vps-rw", "vps")));
+        assert_eq!(count_streamers(&ps, "vps-ro", &ctl("vps-ro")), 1);
+        assert_eq!(count_streamers(&ps, "vps-rw", &ctl("vps-rw")), 1);
+    }
+
+    /// Docker streamers carry --ctl-path purely as an identity token, and it is
+    /// followed by more flags rather than ending the line — the case the
+    /// end-of-argument check's `Some(b' ')` arm exists for.
+    #[test]
+    fn docker_streamers_are_counted_by_ctl_path() {
+        let ps = ps_line(&docker_host("tok", "/Users/n/proj"));
+        assert!(ps.contains("--container-folder"), "fixture should be a docker argv: {ps}");
+        assert!(!ps.trim_end().ends_with("tok.ctl"), "ctl-path must be mid-line here");
+        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 1);
+        assert_eq!(count_streamers(&ps, "other", &ctl("other")), 0);
+    }
+
+    /// Docker panes are identified by --host-name, ssh panes by --ctl-path.
+    /// Neither may be confused for the other, and both must work side by side.
+    #[test]
+    fn ssh_and_docker_identities_coexist() {
+        let ps = format!(
+            "{}\n{}\n",
+            ps_line(&ssh_host("vps", "vps")),
+            ps_line(&docker_host("tok", "/Users/n/proj"))
+        );
+        assert!(ps.contains("--ctl-path"), "ssh pane should carry a ctl path");
+        assert!(ps.contains("--host-name tok"), "docker pane should carry a host name");
+        assert!(
+            !ps.contains("--ctl-path /state/tok.ctl"),
+            "docker pane must NOT carry a ctl path to a file nothing creates"
+        );
+        assert_eq!(count_streamers(&ps, "vps", &ctl("vps")), 1);
+        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 1);
+        assert_eq!(count_streamers(&ps, "absent", &ctl("absent")), 0);
+    }
+
+    /// --host-name must be end-anchored like --ctl-path: `tok` must not match
+    /// a host called `tok2`.
+    #[test]
+    fn host_name_match_is_prefix_safe() {
+        let ps = ps_line(&docker_host("tok2", "/p"));
+        assert_eq!(count_streamers(&ps, "tok2", &ctl("tok2")), 1);
+        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 0, "`tok` must not match `tok2`");
+    }
+
+    /// Streamers from <=v0.1.6 predate --ctl-path. Missing them makes healing
+    /// fire against live panes on upgrade, injecting the exec line as text into
+    /// the user's running session.
+    #[test]
+    fn legacy_streamers_are_still_recognised() {
+        let legacy = "/usr/local/bin/herdr-mirror pane vps w1:p1 --remote-bin ~/.local/bin/herdr --always-control";
+        assert_eq!(count_streamers(legacy, "vps", &ctl("vps")), 0, "no --ctl-path to match");
+        assert_eq!(count_legacy_streamers(legacy, "vps"), 1, "must be seen by the legacy check");
+    }
+
+    /// The legacy fallback must not reintroduce the prefix collision it is
+    /// bridging away from.
+    #[test]
+    fn legacy_match_is_still_prefix_safe() {
+        let legacy = "/usr/local/bin/herdr-mirror pane work-staging w1:p1 --remote-bin x";
+        assert_eq!(count_legacy_streamers(legacy, "work-staging"), 1);
+        assert_eq!(count_legacy_streamers(legacy, "work"), 0, "`work` must not match `work-staging`");
     }
 }

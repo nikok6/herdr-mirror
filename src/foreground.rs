@@ -49,21 +49,40 @@ pub async fn poll(
     remote_bin: &str,
     pane: &str,
     ctl_path: Option<&str>,
+    container: Option<&crate::pane::ContainerArg>,
 ) -> Option<bool> {
     // remote_bin stays unquoted for remote-shell ~ expansion, matching the
     // observe session's command construction
     let cmd = format!("exec {} pane process-info --pane {}", remote_bin, sh_quote(pane));
-    let mut sc = Command::new("ssh");
-    // reuse the daemon's ControlMaster when given so the poll skips the
-    // handshake; `-S` without `-M` uses an existing master or, if the socket
-    // isn't there, connects directly — so this degrades gracefully
-    if let Some(path) = ctl_path {
-        sc.arg("-S").arg(path);
-    }
+    let mut sc = match container {
+        Some(ct) => {
+            // async resolve, not the blocking one: this runs on the pane's
+            // single-threaded runtime and fires on every keystroke burst, so a
+            // blocking `docker ps` would stall input and rendering (and hang
+            // the pane outright if the Docker daemon wedges).
+            //
+            // No ControlMaster equivalent is needed — docker exec is local, so
+            // there is no handshake to amortize.
+            let ids = crate::docker::resolve(&ct.docker_bin, &ct.kind).await.ok()?;
+            let id = ids.into_iter().next()?;
+            let mut c = Command::new(&ct.docker_bin);
+            // `sh -c` not `-lc`: match ssh's non-login remote shell
+            c.args(["exec", &id, "sh", "-c", &cmd]);
+            c
+        }
+        None => {
+            let mut c = Command::new("ssh");
+            // reuse the daemon's ControlMaster when given so the poll skips the
+            // handshake; `-S` without `-M` uses an existing master or, if the socket
+            // isn't there, connects directly — so this degrades gracefully
+            if let Some(path) = ctl_path {
+                c.arg("-S").arg(path);
+            }
+            c.args(SSH_COMMON_OPTS).arg(ssh_target).arg(cmd);
+            c
+        }
+    };
     let out = sc
-        .args(SSH_COMMON_OPTS)
-        .arg(ssh_target)
-        .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

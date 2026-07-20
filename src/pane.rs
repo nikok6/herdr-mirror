@@ -62,7 +62,25 @@ pub struct Args {
     pub always_control: bool,
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
+    ///
+    /// Also serves as the host identity token that `daemon::count_streamers`
+    /// matches, so it is emitted for docker hosts too even though they have no
+    /// ControlMaster.
     pub ctl_path: Option<String>,
+    /// host identity for docker panes, which have no ControlMaster and so no
+    /// `--ctl-path`. Matched by `daemon::count_streamers`; unused in here.
+    pub host_name: Option<String>,
+    /// container to exec into instead of ssh. `None` = ssh host.
+    pub container: Option<ContainerArg>,
+}
+
+/// How the pane process should reach its container. The daemon passes a *ref*,
+/// not a resolved id: the pane may outlive a rebuild, and ids change while the
+/// folder label does not.
+#[derive(Debug, Clone)]
+pub struct ContainerArg {
+    pub kind: crate::config::HostKind,
+    pub docker_bin: String,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -78,7 +96,12 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         size_fixed: false,
         always_control: false,
         ctl_path: None,
+        host_name: None,
+        container: None,
     };
+    let mut container_name: Option<String> = None;
+    let mut container_folder: Option<String> = None;
+    let mut docker_bin = "docker".to_string();
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
     while let Some(a) = it.next() {
@@ -102,6 +125,13 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--always-control" => args.always_control = true,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
+            // identity only: the daemon matches this out of `ps` to attribute
+            // streamers to a host. The pane itself never uses it, but it must
+            // be accepted rather than rejected as an unknown option.
+            "--host-name" => args.host_name = Some(next("--host-name")?),
+            "--container" => container_name = Some(next("--container")?),
+            "--container-folder" => container_folder = Some(next("--container-folder")?),
+            "--docker-bin" => docker_bin = next("--docker-bin")?,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -112,6 +142,16 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--dump]",
         ));
     }
+    args.container = match (container_name, container_folder) {
+        (Some(_), Some(_)) => return Err(err("--container and --container-folder are exclusive")),
+        (Some(n), None) => {
+            Some(ContainerArg { kind: crate::config::HostKind::DockerContainer(n), docker_bin })
+        }
+        (None, Some(f)) => {
+            Some(ContainerArg { kind: crate::config::HostKind::DockerFolder(f), docker_bin })
+        }
+        (None, None) => None,
+    };
     args.ssh_target = positional.remove(0);
     args.pane_target = positional.remove(0);
     Ok(args)
@@ -185,10 +225,31 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         cols,
         rows
     );
-    let mut child = tokio::process::Command::new("ssh")
-        .args(crate::remote::SSH_COMMON_OPTS)
-        .arg(&args.ssh_target)
-        .arg(cmd)
+    // ssh and docker differ only in how the command is carried; the streaming
+    // contract (piped stdio, herdr's frames on stdout) is identical
+    let mut builder = match &args.container {
+        None => {
+            let mut c = tokio::process::Command::new("ssh");
+            c.args(crate::remote::SSH_COMMON_OPTS).arg(&args.ssh_target).arg(cmd);
+            c
+        }
+        Some(ct) => {
+            // resolve per spawn so a rebuilt container is picked up on
+            // reconnect. Bounded: this runs on the pane's single-threaded
+            // runtime, so a wedged Docker daemon must not be able to freeze
+            // input, rendering or signal handling.
+            let id = crate::docker::resolve_blocking(
+                &ct.docker_bin,
+                &ct.kind,
+                Duration::from_secs(5),
+            )?;
+            let mut c = tokio::process::Command::new(&ct.docker_bin);
+            // `sh -c` not `-lc`: match ssh's non-login remote shell
+            c.args(["exec", "-i", &id, "sh", "-c", &cmd]);
+            c
+        }
+    };
+    let mut child = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -437,8 +498,10 @@ impl App {
         let bin = self.args.remote_bin.clone();
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
+        let container = self.args.container.clone();
         tokio::spawn(async move {
-            let v = crate::foreground::poll(&ssh, &bin, &pane, ctl.as_deref()).await;
+            let v =
+                crate::foreground::poll(&ssh, &bin, &pane, ctl.as_deref(), container.as_ref()).await;
             let _ = tx.send(Msg::Foreground(v)).await;
         });
     }

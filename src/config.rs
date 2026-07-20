@@ -7,10 +7,33 @@ use serde::Deserialize;
 
 use crate::util::{err, Result};
 
+/// How to reach a host. `Ssh` is the default and the only kind that existed
+/// before container support; every existing hosts.toml parses to it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostKind {
+    Ssh,
+    /// container named explicitly (brittle: docker regenerates devcontainer
+    /// names on rebuild)
+    DockerContainer(String),
+    /// container resolved by `devcontainer.local_folder` label, which survives
+    /// rebuilds where the name does not
+    DockerFolder(String),
+}
+
+impl HostKind {
+    pub fn is_docker(&self) -> bool {
+        !matches!(self, HostKind::Ssh)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub name: String,
+    /// ssh target for ssh hosts; for docker hosts a display-only ref (the
+    /// container name or folder) — the connection details live in `kind`
     pub target: String,
+    pub kind: HostKind,
+    pub docker_bin: String,
     pub prefix: String,
     pub remote_bin: String,
     /// keep each mirror pane in control (writable, no idle release, and sized to
@@ -38,6 +61,10 @@ pub struct MirrorConfig {
     /// other candidate dirs that also hold a hosts.toml and are therefore
     /// being ignored — a silent-shadowing trap worth warning about.
     pub shadowed: Vec<PathBuf>,
+    /// hosts that failed validation and were skipped. Surfaced at startup and
+    /// in `status` rather than aborting the load: one malformed entry must not
+    /// stop every *other* host from mirroring.
+    pub warnings: Vec<String>,
 }
 
 impl MirrorConfig {
@@ -64,11 +91,63 @@ struct RawConfig {
 
 #[derive(Deserialize)]
 struct RawHost {
-    target: String,
+    /// required for ssh hosts, meaningless for docker ones
+    target: Option<String>,
+    kind: Option<String>,
+    container: Option<String>,
+    folder: Option<String>,
+    docker_bin: Option<String>,
     prefix: Option<String>,
     remote_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+}
+
+/// Resolve `kind` + its ref fields, rejecting combinations that would silently
+/// do the wrong thing. Returns the kind and the display target.
+fn resolve_kind(name: &str, h: &RawHost) -> Result<(HostKind, String)> {
+    let bad = |m: String| err(format!("[hosts.{name}]: {m}"));
+    // An empty ref is worse than a missing one: `name=^$` and an empty label
+    // value match nothing, so the host reports dormant forever and a typo (or a
+    // template variable that never expanded) is indistinguishable from a
+    // stopped container.
+    let nonempty = |field: &str, v: &str| -> Result<String> {
+        match v.trim() {
+            "" => Err(bad(format!("{field} is empty"))),
+            s => Ok(s.to_string()),
+        }
+    };
+    match h.kind.as_deref().unwrap_or("ssh") {
+        "ssh" => {
+            if h.container.is_some() || h.folder.is_some() {
+                return Err(bad("container/folder need kind = \"docker\"".into()));
+            }
+            let target = h.target.clone().ok_or_else(|| bad("missing target".into()))?;
+            Ok((HostKind::Ssh, nonempty("target", &target)?))
+        }
+        "docker" => {
+            // the ssh arm rejects the mirror-image mistake, so silently
+            // discarding target here would be an inconsistent trap
+            if h.target.is_some() {
+                return Err(bad("target has no meaning with kind = \"docker\" \
+                                (use container or folder)"
+                    .into()));
+            }
+            match (&h.container, &h.folder) {
+                (Some(_), Some(_)) => Err(bad("set container or folder, not both".into())),
+                (None, None) => Err(bad("kind = \"docker\" needs container or folder".into())),
+                (Some(c), None) => {
+                    let c = nonempty("container", c)?;
+                    Ok((HostKind::DockerContainer(c.clone()), c))
+                }
+                (None, Some(f)) => {
+                    let f = nonempty("folder", f)?;
+                    Ok((HostKind::DockerFolder(f.clone()), f))
+                }
+            }
+        }
+        other => Err(bad(format!("unknown kind \"{other}\" (expected ssh or docker)"))),
+    }
 }
 
 /// Load the first `hosts.toml` found across `candidates`, in order.
@@ -102,16 +181,30 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
     let mut hosts: Vec<HostConfig> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
         if h.enabled == Some(false) {
             continue;
         }
+        // Skip-with-warning, not abort. Aborting would let one typo'd entry
+        // stop the daemon entirely and take every *other* host's mirrors down
+        // with it — strictly worse than the behaviour this validation replaced,
+        // where a bad host was simply a broken host. Matches `enabled = false`.
+        let (kind, target) = match resolve_kind(&name, &h) {
+            Ok(v) => v,
+            Err(e) => {
+                warnings.push(format!("skipping host: {e}"));
+                continue;
+            }
+        };
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
             always_control: h.always_control.unwrap_or(global_always_control),
-            target: h.target,
+            docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
+            kind,
+            target,
             name,
         });
     }
@@ -131,6 +224,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         hosts,
         source: None,
         shadowed: Vec::new(),
+        warnings,
     })
 }
 
@@ -204,6 +298,93 @@ mod tests {
         let c = parse_config("[hosts.zeta]\ntarget = \"z\"\n[hosts.alpha]\ntarget = \"a\"\n").unwrap();
         assert_eq!(c.hosts[0].name, "zeta");
         assert_eq!(c.hosts[1].name, "alpha");
+    }
+
+    /// Every pre-container hosts.toml must parse exactly as before.
+    #[test]
+    fn existing_ssh_configs_are_unchanged() {
+        let c = parse_config("[hosts.work]\ntarget = \"work\"\n").unwrap();
+        assert_eq!(c.hosts[0].kind, HostKind::Ssh);
+        assert_eq!(c.hosts[0].target, "work");
+        assert_eq!(c.hosts[0].remote_bin, "~/.local/bin/herdr");
+    }
+
+    #[test]
+    fn parses_docker_by_folder_and_container() {
+        let c = parse_config(
+            "[hosts.tok]\nkind = \"docker\"\nfolder = \"/Users/n/proj\"\n\
+             [hosts.named]\nkind = \"docker\"\ncontainer = \"crazy_ride\"\n",
+        )
+        .unwrap();
+        let tok = c.hosts.iter().find(|h| h.name == "tok").unwrap();
+        assert_eq!(tok.kind, HostKind::DockerFolder("/Users/n/proj".into()));
+        assert_eq!(tok.target, "/Users/n/proj", "display target falls back to the ref");
+        assert!(tok.kind.is_docker());
+        let named = c.hosts.iter().find(|h| h.name == "named").unwrap();
+        assert_eq!(named.kind, HostKind::DockerContainer("crazy_ride".into()));
+    }
+
+    /// Combinations that would silently do the wrong thing must be rejected
+    /// at parse time, not discovered at connect time.
+    #[test]
+    fn rejects_incoherent_kinds() {
+        let cases = [
+            // docker with neither ref
+            "[hosts.a]\nkind = \"docker\"\n",
+            // docker with both refs
+            "[hosts.a]\nkind = \"docker\"\ncontainer = \"c\"\nfolder = \"/f\"\n",
+            // container/folder on an ssh host
+            "[hosts.a]\ntarget = \"t\"\ncontainer = \"c\"\n",
+            // ssh without a target
+            "[hosts.a]\nprefix = \"p\"\n",
+            // unknown kind
+            "[hosts.a]\nkind = \"podman\"\ntarget = \"t\"\n",
+            // empty refs: these match nothing, so the host would report
+            // dormant forever and a typo would look like a stopped container
+            "[hosts.a]\nkind = \"docker\"\ncontainer = \"\"\n",
+            "[hosts.a]\nkind = \"docker\"\nfolder = \"   \"\n",
+            "[hosts.a]\ntarget = \"\"\n",
+            // target is meaningless for docker; the mirror-image mistake is
+            // rejected, so silently discarding this would be a trap
+            "[hosts.a]\nkind = \"docker\"\ncontainer = \"c\"\ntarget = \"1.2.3.4\"\n",
+        ];
+        for case in cases {
+            assert!(parse_config(case).is_err(), "should reject: {case}");
+        }
+    }
+
+    #[test]
+    fn docker_bin_defaults_and_overrides() {
+        let c = parse_config("[hosts.a]\nkind = \"docker\"\ncontainer = \"c\"\n").unwrap();
+        assert_eq!(c.hosts[0].docker_bin, "docker");
+        let c = parse_config(
+            "[hosts.a]\nkind = \"docker\"\ncontainer = \"c\"\ndocker_bin = \"/usr/local/bin/docker\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].docker_bin, "/usr/local/bin/docker");
+    }
+
+    /// One malformed host must not take the whole config down with it. The
+    /// stricter validation added alongside container support originally
+    /// aborted the load, which was worse than the behaviour it replaced: a
+    /// single typo stopped every *other* host from mirroring.
+    #[test]
+    fn a_bad_host_is_skipped_not_fatal() {
+        let c = parse_config(
+            "[hosts.good]\ntarget = \"vps\"\n[hosts.bad]\ntarget = \"\"\n",
+        )
+        .expect("one bad host must not abort the load");
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "good");
+        assert_eq!(c.warnings.len(), 1, "the skip must be reported, not silent");
+        assert!(c.warnings[0].contains("bad"), "{:?}", c.warnings);
+    }
+
+    /// ...but a config where *every* host is invalid is still an error, so a
+    /// wholly broken file cannot look like a working empty one.
+    #[test]
+    fn all_hosts_invalid_is_still_an_error() {
+        assert!(parse_config("[hosts.a]\ntarget = \"\"\n").is_err());
     }
 
     fn tmpdir(tag: &str) -> PathBuf {

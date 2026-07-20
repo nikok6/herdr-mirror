@@ -12,7 +12,12 @@ use tokio::time::timeout;
 
 use crate::api::ApiClient;
 use crate::config::HostConfig;
-use crate::util::{err, Result};
+use crate::util::{err, Logger, Result};
+
+/// Marker in the error text for "the container isn't running". A stopped
+/// devcontainer is its resting state, unlike an unreachable ssh host, so the
+/// daemon backs off gently instead of treating it as a fault.
+pub const DORMANT: &str = "dormant";
 
 /// first build with terminal session observe/control
 const MIN_PREVIEW_BUILD: &str = "2026-06-30";
@@ -63,6 +68,12 @@ pub struct RemoteHost {
     ctl_path: PathBuf,
     pub fwd_sock: PathBuf,
     forwarded: bool,
+    /// docker hosts only: resolved container + chosen stdio bridge
+    container: Option<crate::docker::Container>,
+    /// docker hosts only: owns the relay listener. Dropping it stops serving
+    /// and unlinks the socket, so a reconnect never inherits a dead one.
+    relay: Option<crate::docker::RelayHandle>,
+    log: Logger,
 }
 
 impl RemoteHost {
@@ -72,7 +83,40 @@ impl RemoteHost {
             fwd_sock: state_dir.join(format!("{}-api.sock", cfg.name)),
             cfg: cfg.clone(),
             forwarded: false,
+            container: None,
+            relay: None,
+            log: Logger::new(state_dir, false),
         }
+    }
+
+    /// Bring the transport up: an ssh ControlMaster, or a resolved container.
+    ///
+    /// ssh hosts take the identical path they always did; the docker branch is
+    /// additive.
+    pub async fn ensure_ready(&mut self) -> Result<()> {
+        if !self.cfg.kind.is_docker() {
+            return self.ensure_master().await;
+        }
+        let bin = self.cfg.docker_bin.clone();
+        let ids = crate::docker::resolve(&bin, &self.cfg.kind).await?;
+        let Some(id) = ids.first().cloned() else {
+            // a stopped devcontainer is the resting state, not a fault; the
+            // daemon matches this marker to back off gently
+            return Err(err(format!("{DORMANT}: no running container for {}", self.cfg.target)));
+        };
+        if ids.len() > 1 {
+            // reachable without an attacker: a compose devcontainer can put the
+            // same local_folder label on several services
+            self.log.log(&format!(
+                "[{}] {} containers match; using {id} — narrow the config if that is wrong",
+                self.cfg.name,
+                ids.len()
+            ));
+        }
+        // re-probe on every (re)connect: a rebuilt container may differ
+        crate::docker::probe_socat(&bin, &id).await?;
+        self.container = Some(crate::docker::Container { id, docker_bin: bin });
+        Ok(())
     }
 
     fn base_args(&self) -> Vec<String> {
@@ -113,6 +157,9 @@ impl RemoteHost {
     }
 
     pub async fn exec(&self, command: &str, timeout_ms: u64) -> Result<String> {
+        if let Some(c) = &self.container {
+            return c.exec(command, timeout_ms).await;
+        }
         let mut args = self.base_args();
         args.extend([self.cfg.target.clone(), command.to_string()]);
         let res = ssh(&args, timeout_ms).await;
@@ -195,7 +242,7 @@ impl RemoteHost {
     }
 
     pub async fn connect_api(&mut self) -> Result<(ApiClient, RemoteStatus)> {
-        self.ensure_master().await?;
+        self.ensure_ready().await?;
         let status = match self.status().await {
             Ok(s) => s,
             Err(_) => {
@@ -207,7 +254,32 @@ impl RemoteHost {
         if !status.supported {
             return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
         }
-        let sock = self.forward_api(&status.socket).await?;
+        let sock = match &self.container {
+            None => self.forward_api(&status.socket).await?,
+            Some(c) => {
+                // NEVER steal a healthy relay — the socket path is per-HOST but
+                // shared across processes (daemon, `remote-*` actions, `once`),
+                // and state_dir is deliberately a single fixed path. Binding on
+                // top of a live one orphans the owner's listener and then
+                // unlinks the path from under it, bouncing the daemon's whole
+                // host connection on every remote action. Same reasoning as the
+                // ssh forward guard above.
+                if self.relay.is_none() && ApiClient::connect(&self.fwd_sock).await.is_ok() {
+                    self.fwd_sock.clone()
+                } else {
+                    self.relay = None;
+                    let handle = crate::docker::serve_relay(
+                        c.clone(),
+                        status.socket.clone(),
+                        self.fwd_sock.clone(),
+                        self.log.clone(),
+                    )?;
+                    let path = handle.path.clone();
+                    self.relay = Some(handle);
+                    path
+                }
+            }
+        };
         let api = ApiClient::connect(&sock).await?;
         Ok((api, status))
     }

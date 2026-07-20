@@ -295,6 +295,9 @@ pub(crate) fn cmd_for_pane(
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let always_control = host.always_control;
+    let kind = host.kind.clone();
+    let docker_bin = host.docker_bin.clone();
+    let host_name = host.name.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
@@ -311,7 +314,31 @@ pub(crate) fn cmd_for_pane(
         if always_control {
             argv.push("--always-control".into());
         }
-        argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+        // Host identity, which `daemon::count_streamers` matches out of `ps` to
+        // tell one host's streamers from another's.
+        //
+        // ssh uses --ctl-path, which is load-bearing there anyway (the pane
+        // reuses the daemon's ControlMaster for cheap foreground polls) and is
+        // left exactly as it has shipped since v0.1.7 — changing it would strand
+        // streamers spawned by an older binary across an upgrade.
+        //
+        // docker has no ControlMaster, so it carries an honestly-named flag
+        // instead of a path to a file nothing will ever create.
+        match &kind {
+            crate::config::HostKind::Ssh => {
+                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+            }
+            crate::config::HostKind::DockerContainer(name) => {
+                argv.extend(["--host-name".into(), host_name.clone()]);
+                argv.extend(["--container".into(), name.clone()]);
+                argv.extend(["--docker-bin".into(), docker_bin.clone()]);
+            }
+            crate::config::HostKind::DockerFolder(folder) => {
+                argv.extend(["--host-name".into(), host_name.clone()]);
+                argv.extend(["--container-folder".into(), folder.clone()]);
+                argv.extend(["--docker-bin".into(), docker_bin.clone()]);
+            }
+        }
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
                 "--cols".into(),
@@ -1113,6 +1140,121 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ssh_host() -> HostConfig {
+        HostConfig {
+            name: "vps".into(),
+            target: "vps".into(),
+            kind: crate::config::HostKind::Ssh,
+            docker_bin: "docker".into(),
+            prefix: "vps".into(),
+            remote_bin: "~/.local/bin/herdr".into(),
+            always_control: true,
+        }
+    }
+
+    /// Characterization test: the ssh pane argv is a cross-process contract.
+    ///
+    /// The daemon spawns `herdr-mirror pane ...` as a separate process, and
+    /// `count_streamers` (daemon.rs) identifies a host's live streamers by
+    /// string-matching `--ctl-path` in that argv. Nothing else pins the shape,
+    /// so a change here silently breaks mirror healing on upgrade: streamers
+    /// started by the old binary carry the old argv, the new daemon fails to
+    /// match them, concludes they died, and re-execs over live panes.
+    ///
+    /// If this test fails, that is the question to answer — not a prompt to
+    /// update the expected value.
+    #[test]
+    fn ssh_pane_argv_is_stable() {
+        let state_dir = std::path::Path::new("/state");
+        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--remote-bin",
+                "~/.local/bin/herdr",
+                "--always-control",
+                "--ctl-path",
+                "/state/vps.ctl",
+            ]
+        );
+        // argv[0] is the resolved exe path, which varies by install
+        assert!(argv[0].ends_with("herdr-mirror") || argv[0].contains("herdr_mirror"), "{}", argv[0]);
+    }
+
+    /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
+    /// two argv layouts share a stable head and only diverge at the tail.
+    #[test]
+    fn docker_pane_argv_carries_container_and_host_name() {
+        let mut host = ssh_host();
+        host.name = "token".into();
+        host.target = "/Users/n/proj".into();
+        host.kind = crate::config::HostKind::DockerFolder("/Users/n/proj".into());
+        host.docker_bin = "/usr/local/bin/docker".into();
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "/Users/n/proj",
+                "w1:p1",
+                "--remote-bin",
+                "~/.local/bin/herdr",
+                "--always-control",
+                // identity token for count_streamers. NOT --ctl-path: docker has
+                // no ControlMaster, so that flag would name a file nothing ever
+                // creates and its name would misdescribe its only purpose.
+                "--host-name",
+                "token",
+                "--container-folder",
+                "/Users/n/proj",
+                "--docker-bin",
+                "/usr/local/bin/docker",
+            ]
+        );
+    }
+
+    /// The argv the daemon emits must round-trip through the pane process's
+    /// own parser — they are separate processes, so nothing else checks this.
+    #[test]
+    fn docker_argv_round_trips_through_pane_parser() {
+        let mut host = ssh_host();
+        host.kind = crate::config::HostKind::DockerContainer("crazy_ride".into());
+        // deliberately NOT the default "docker": parse_args defaults to the
+        // same value, so a fixture using the default would still pass if
+        // cmd_for_pane stopped emitting --docker-bin. Users who need an
+        // absolute path (GUI-launched daemons without /usr/local/bin on PATH)
+        // would then silently get "cannot run docker".
+        host.docker_bin = "/usr/local/bin/docker".into();
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.pane_target, "w1:p1");
+        assert_eq!(parsed.host_name.as_deref(), Some("vps"), "identity must round-trip");
+        assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
+        let ct = parsed.container.expect("container must survive the argv round trip");
+        assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));
+        assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
+    }
+
+    /// always_control is the only conditional flag; its absence must not
+    /// disturb the position of --ctl-path.
+    #[test]
+    fn ssh_pane_argv_without_always_control() {
+        let mut host = ssh_host();
+        host.always_control = false;
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            ["pane", "vps", "w1:p1", "--remote-bin", "~/.local/bin/herdr", "--ctl-path", "/state/vps.ctl"]
+        );
+    }
 
     #[test]
     fn ws_label_two_way_rename() {

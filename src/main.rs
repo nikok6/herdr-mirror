@@ -10,6 +10,7 @@ mod api;
 mod closes;
 mod config;
 mod daemon;
+mod docker;
 mod foreground;
 mod grid;
 mod mirror;

@@ -80,7 +80,13 @@ pub fn config_candidates() -> Vec<PathBuf> {
     }
     dirs.push(home_dir().join(".config/herdr/plugins/config/mirror"));
     dirs.push(default_config_dir());
-    dirs.dedup();
+    // NOT Vec::dedup, which only collapses *consecutive* duplicates: with
+    // HERDR_PLUGIN_CONFIG_DIR set to the canonical dir the list is
+    // [canonical, plugin, canonical], so the duplicates are not adjacent and
+    // both survive — making the daemon warn that it is "ignoring" the very file
+    // it is reading.
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
     dirs
 }
 
