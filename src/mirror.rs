@@ -297,7 +297,6 @@ pub(crate) fn cmd_for_pane(
     let always_control = host.always_control;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
-    let host_name = host.name.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
@@ -314,27 +313,19 @@ pub(crate) fn cmd_for_pane(
         if always_control {
             argv.push("--always-control".into());
         }
-        // Host identity, which `daemon::count_streamers` matches out of `ps` to
-        // tell one host's streamers from another's.
-        //
-        // ssh uses --ctl-path, which is load-bearing there anyway (the pane
-        // reuses the daemon's ControlMaster for cheap foreground polls) and is
-        // left exactly as it has shipped since v0.1.7 — changing it would strand
-        // streamers spawned by an older binary across an upgrade.
-        //
-        // docker has no ControlMaster, so it carries an honestly-named flag
-        // instead of a path to a file nothing will ever create.
+        // ssh only: the pane reuses the daemon's ControlMaster for cheap
+        // foreground polls. Docker has no ControlMaster, and healing no longer
+        // needs a host-identity token in the argv at all — it asks herdr what
+        // is running in each pane instead (see daemon::has_live_streamer).
         match &kind {
             crate::config::HostKind::Ssh => {
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
             }
             crate::config::HostKind::DockerContainer(name) => {
-                argv.extend(["--host-name".into(), host_name.clone()]);
                 argv.extend(["--container".into(), name.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
             }
             crate::config::HostKind::DockerFolder(folder) => {
-                argv.extend(["--host-name".into(), host_name.clone()]);
                 argv.extend(["--container-folder".into(), folder.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
             }
@@ -1189,7 +1180,7 @@ mod tests {
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
     /// two argv layouts share a stable head and only diverge at the tail.
     #[test]
-    fn docker_pane_argv_carries_container_and_host_name() {
+    fn docker_pane_argv_carries_container_and_no_identity_token() {
         let mut host = ssh_host();
         host.name = "token".into();
         host.target = "/Users/n/proj".into();
@@ -1206,11 +1197,7 @@ mod tests {
                 "--remote-bin",
                 "~/.local/bin/herdr",
                 "--always-control",
-                // identity token for count_streamers. NOT --ctl-path: docker has
-                // no ControlMaster, so that flag would name a file nothing ever
-                // creates and its name would misdescribe its only purpose.
-                "--host-name",
-                "token",
+                // no identity token at all: healing asks herdr per pane
                 "--container-folder",
                 "/Users/n/proj",
                 "--docker-bin",
@@ -1235,7 +1222,6 @@ mod tests {
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
-        assert_eq!(parsed.host_name.as_deref(), Some("vps"), "identity must round-trip");
         assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
         let ct = parsed.container.expect("container must survive the argv round trip");
         assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));

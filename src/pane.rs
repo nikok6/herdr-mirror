@@ -63,13 +63,7 @@ pub struct Args {
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
-    /// Also serves as the host identity token that `daemon::count_streamers`
-    /// matches, so it is emitted for docker hosts too even though they have no
-    /// ControlMaster.
     pub ctl_path: Option<String>,
-    /// host identity for docker panes, which have no ControlMaster and so no
-    /// `--ctl-path`. Matched by `daemon::count_streamers`; unused in here.
-    pub host_name: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
 }
@@ -96,7 +90,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         size_fixed: false,
         always_control: false,
         ctl_path: None,
-        host_name: None,
         container: None,
     };
     let mut container_name: Option<String> = None;
@@ -125,10 +118,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--always-control" => args.always_control = true,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
-            // identity only: the daemon matches this out of `ps` to attribute
-            // streamers to a host. The pane itself never uses it, but it must
-            // be accepted rather than rejected as an unknown option.
-            "--host-name" => args.host_name = Some(next("--host-name")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,

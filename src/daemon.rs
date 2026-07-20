@@ -297,61 +297,42 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     }
 }
 
+/// Does this local pane already have a live streamer?
+///
+/// Asks herdr what is actually running in the pane, rather than inferring it
+/// from a global `ps` scan and string-matching argv. That inference is what
+/// previously required a host-identity token in the argv, end-of-argument
+/// anchoring so `work` could not match `work-staging`, and a compatibility
+/// shim for streamers predating that token. None of it is needed to answer the
+/// only question that matters: is something already running in THIS pane.
+///
+/// Generation-agnostic by construction — every streamer ever shipped is
+/// `herdr-mirror pane …`, whatever flags follow.
+async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
+    let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
+    let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
+    Some(procs.iter().any(|p| {
+        p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
+    }))
+}
+
+/// Is this foreground process one of our pane wrappers?
+///
+/// argv[0] is the resolved exe path, which varies by install (release build,
+/// plugin checkout, `cargo run`), so it is matched by suffix. argv[1] pins the
+/// subcommand so an unrelated `herdr-mirror status` in the pane is not mistaken
+/// for a live stream.
+fn is_streamer_argv(argv: &[Value]) -> bool {
+    argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
+        && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
+}
+
 /// After a local herdr server restart, session-restore resurrects mirror panes
 /// as plain shells: their ids match the map, but no streamer processes exist —
 /// and converge can't tell (the snapshot has no process info), so the mirrors
-/// sit frozen forever. The tell is the conjunction: mapped panes present, zero
-/// wrapper processes for the host. Heal = teardown + poke; the next converge
-/// rebuilds every mirror with a live streamer. A transient socket blip leaves
-/// wrappers running, so the check stays quiet then.
-/// Count one host's streamer processes in `ps -axo command=` output.
-///
-/// Keyed on the `--ctl-path <state>/<name>.ctl` argument, which is unique per
-/// host (`name` is the hosts.toml table key) and always present in the pane
-/// argv. The obvious alternative, matching the ssh target, is wrong twice
-/// over: `pgrep -f <target>` treats the pattern as an *unanchored regex*, so
-/// host `work` counted host `work-staging`'s streamers and therefore skipped
-/// its own healing forever; and targets with regex metacharacters
-/// (`ssh://host:2222`) match more than they look like they should.
-fn count_streamers(ps_output: &str, host_name: &str, ctl_path: &str) -> usize {
-    // ssh panes are identified by --ctl-path (load-bearing there, and unchanged
-    // since v0.1.7); docker panes by --host-name, since they have no
-    // ControlMaster and a ctl path would name a file nothing ever creates.
-    let needles =
-        [format!("--ctl-path {ctl_path}"), format!("--host-name {host_name}")];
-    ps_output
-        .lines()
-        .filter(|line| {
-            needles.iter().any(|needle| {
-                line.match_indices(needle.as_str()).any(|(at, _)| {
-                    // the value must END the argument: a host named `a` must not
-                    // match a host named `a.ctl`, whose path it prefixes
-                    matches!(line.as_bytes().get(at + needle.len()), None | Some(b' '))
-                })
-            })
-        })
-        .count()
-}
-
-/// Streamers spawned by a herdr-mirror older than v0.1.7, which predates
-/// `--ctl-path` entirely.
-///
-/// Without this, upgrading from <=v0.1.6 is destructive rather than merely
-/// wrong: the pre-upgrade streamers are children of the *herdr server*, so they
-/// survive the daemon restart, but `count_streamers` cannot see them. Healing
-/// then fires on the first subscribe (which happens at daemon startup, not only
-/// after a drop) and `spawn_streamer_pane` writes `exec herdr-mirror pane ...`
-/// as TEXT into a pane whose live streamer owns stdin — i.e. types garbage into
-/// the user's running remote session.
-///
-/// Matches the old argv shape (`herdr-mirror pane <target> `) with the trailing
-/// space anchoring it, so `work` cannot match `work-staging`. Can be dropped
-/// once upgrades from <=v0.1.6 are no longer plausible.
-fn count_legacy_streamers(ps_output: &str, target: &str) -> usize {
-    let needle = format!("herdr-mirror pane {target} ");
-    ps_output.lines().filter(|line| line.contains(&needle)).count()
-}
-
+/// sit frozen forever. Heal = re-exec the streamer into each pane that is not
+/// already running one. A transient socket blip leaves wrappers running, so
+/// the check stays quiet then.
 async fn heal_zombie_mirrors(
     local: &ApiClient,
     state_dir: &std::path::Path,
@@ -370,23 +351,26 @@ async fn heal_zombie_mirrors(
         if panes.is_empty() {
             continue;
         }
-        let ctl = state_dir.join(format!("{}.ctl", h.name)).display().to_string();
-        let ps = std::process::Command::new("ps")
-            .args(["-axo", "command="])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        // legacy shape checked too, so an upgrade from <=v0.1.7 does not mistake
-        // live pre-upgrade streamers for dead ones
-        let streamers =
-            count_streamers(&ps, &h.name, &ctl) + count_legacy_streamers(&ps, &h.target);
-        if streamers > 0 {
+        // Ask per pane, so one live streamer no longer blocks healing every
+        // other dead pane on the same host.
+        //
+        // Fail SAFE: anything other than a definite "nothing running there" is
+        // treated as alive. Leaving a frozen mirror is recoverable and visible;
+        // exec'ing into a pane whose streamer owns stdin writes the command
+        // line into the user's live remote session instead.
+        let mut dead: Vec<(String, String)> = Vec::new();
+        for (remote_pane_id, local_pane_id) in panes {
+            if has_live_streamer(local, &local_pane_id).await == Some(false) {
+                dead.push((remote_pane_id, local_pane_id));
+            }
+        }
+        if dead.is_empty() {
             continue;
         }
         log.log(&format!(
-            "[{}] {} mirror pane(s) mapped but no streamers running (server restart?) — re-exec'ing streamers",
+            "[{}] {} mirror pane(s) mapped but not streaming (server restart?) — re-exec'ing streamers",
             h.name,
-            panes.len()
+            dead.len()
         ));
         // Surgical on purpose: session-restore brought the workspace, tabs, panes
         // and layout back intact — only the streamer processes died. Exec the
@@ -398,7 +382,7 @@ async fn heal_zombie_mirrors(
         // Sizes live in the remote layout, which we don't have here; the wrapper
         // falls back to its default and the next converge reconciles.
         let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
-        for (remote_pane_id, local_pane_id) in panes {
+        for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, &local_pane_id, &argv, log).await;
         }
@@ -754,131 +738,56 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Build the ps line from the REAL emitter, so this fixture cannot drift
-    /// away from what the daemon actually spawns. A hand-copied string would
-    /// keep passing while production argv changed underneath it — which is the
-    /// exact failure mode these tests exist to prevent.
-    fn ps_line(host: &crate::config::HostConfig) -> String {
-        let cmd = crate::mirror::cmd_for_pane(host, std::path::Path::new("/state"), &HashMap::new());
-        cmd("w1:p1").join(" ")
+    fn argv(parts: &[&str]) -> Vec<Value> {
+        parts.iter().map(|s| json!(s)).collect()
     }
 
-    fn ssh_host(name: &str, target: &str) -> crate::config::HostConfig {
-        crate::config::HostConfig {
-            name: name.into(),
-            target: target.into(),
-            kind: crate::config::HostKind::Ssh,
-            docker_bin: "docker".into(),
-            prefix: name.into(),
-            remote_bin: "~/.local/bin/herdr".into(),
-            always_control: true,
-        }
-    }
-
-    fn docker_host(name: &str, folder: &str) -> crate::config::HostConfig {
-        let mut h = ssh_host(name, folder);
-        h.kind = crate::config::HostKind::DockerFolder(folder.into());
-        h
-    }
-
-    fn ctl(host_name: &str) -> String {
-        format!("/state/{host_name}.ctl")
-    }
-
+    /// Real argv, captured from `pane.process_info` on a live ssh mirror pane.
     #[test]
-    fn counts_only_this_hosts_streamers() {
-        let ps = format!("{}\n{}\n", ps_line(&ssh_host("vps", "vps")), ps_line(&ssh_host("home", "home")));
-        assert_eq!(count_streamers(&ps, "vps", &ctl("vps")), 1);
-        assert_eq!(count_streamers(&ps, "home", &ctl("home")), 1);
-        assert_eq!(count_streamers(&ps, "absent", &ctl("absent")), 0);
+    fn recognises_a_live_streamer() {
+        let streamer = argv(&[
+            "/Users/niko/Documents/coding/herdr-mirror/target/release/herdr-mirror",
+            "pane",
+            "vps",
+            "wC:p1",
+            "--remote-bin",
+            "~/.local/bin/herdr",
+        ]);
+        assert!(is_streamer_argv(&streamer));
+
+        // the ssh child sharing the same pane is not itself a streamer
+        let ssh_child = argv(&["ssh", "-o", "BatchMode=yes", "vps", "exec ~/.local/bin/herdr ..."]);
+        assert!(!is_streamer_argv(&ssh_child));
     }
 
-    /// The regression: hosts whose *targets* share a prefix must not be
-    /// conflated. Under `pgrep -f "herdr-mirror pane work"` the `work` host
-    /// counted `work-staging`'s streamer, saw a live process, and skipped
-    /// healing its own dead mirrors permanently.
+    /// A docker pane's wrapper looks the same to this check — the whole point
+    /// of asking herdr per pane instead of matching transport-specific flags.
     #[test]
-    fn prefix_sharing_hosts_do_not_collide() {
-        let only_staging = ps_line(&ssh_host("staging", "work-staging"));
-        assert_eq!(count_streamers(&only_staging, "staging", &ctl("staging")), 1);
-        assert_eq!(count_streamers(&only_staging, "work", &ctl("work")), 0, "work must see zero");
+    fn transport_and_flags_are_irrelevant() {
+        assert!(is_streamer_argv(&argv(&[
+            "/plugins/github/mirror-0015/target/release/herdr-mirror",
+            "pane",
+            "/Users/n/proj",
+            "w1:p1",
+            "--container-folder",
+            "/Users/n/proj",
+        ])));
+        // and a pre-v0.1.7 streamer, which carried no identity flag at all
+        assert!(is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"])));
     }
 
-    /// Same hazard one level down: a host name that prefixes another host's
-    /// ctl path must not match it.
+    /// A shell left behind by session-restore is what healing must act on.
     #[test]
-    fn ctl_path_prefix_does_not_collide() {
-        let ps = ps_line(&ssh_host("a.ctl", "t"));
-        assert_eq!(count_streamers(&ps, "a.ctl", &ctl("a.ctl")), 1);
-        assert_eq!(count_streamers(&ps, "a", &ctl("a")), 0, "`a` must not match `a.ctl`");
+    fn plain_shell_is_not_a_streamer() {
+        assert!(!is_streamer_argv(&argv(&["-zsh"])));
+        assert!(!is_streamer_argv(&argv(&["/bin/bash"])));
+        assert!(!is_streamer_argv(&argv(&[])));
     }
 
-    /// Two hosts pointed at the same remote are distinguishable by name,
-    /// which the old target-keyed match could not do.
+    /// Another subcommand in the pane must not read as a live stream.
     #[test]
-    fn same_target_different_hosts_are_distinct() {
-        let ps = format!("{}\n{}\n", ps_line(&ssh_host("vps-ro", "vps")), ps_line(&ssh_host("vps-rw", "vps")));
-        assert_eq!(count_streamers(&ps, "vps-ro", &ctl("vps-ro")), 1);
-        assert_eq!(count_streamers(&ps, "vps-rw", &ctl("vps-rw")), 1);
-    }
-
-    /// Docker streamers carry --ctl-path purely as an identity token, and it is
-    /// followed by more flags rather than ending the line — the case the
-    /// end-of-argument check's `Some(b' ')` arm exists for.
-    #[test]
-    fn docker_streamers_are_counted_by_ctl_path() {
-        let ps = ps_line(&docker_host("tok", "/Users/n/proj"));
-        assert!(ps.contains("--container-folder"), "fixture should be a docker argv: {ps}");
-        assert!(!ps.trim_end().ends_with("tok.ctl"), "ctl-path must be mid-line here");
-        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 1);
-        assert_eq!(count_streamers(&ps, "other", &ctl("other")), 0);
-    }
-
-    /// Docker panes are identified by --host-name, ssh panes by --ctl-path.
-    /// Neither may be confused for the other, and both must work side by side.
-    #[test]
-    fn ssh_and_docker_identities_coexist() {
-        let ps = format!(
-            "{}\n{}\n",
-            ps_line(&ssh_host("vps", "vps")),
-            ps_line(&docker_host("tok", "/Users/n/proj"))
-        );
-        assert!(ps.contains("--ctl-path"), "ssh pane should carry a ctl path");
-        assert!(ps.contains("--host-name tok"), "docker pane should carry a host name");
-        assert!(
-            !ps.contains("--ctl-path /state/tok.ctl"),
-            "docker pane must NOT carry a ctl path to a file nothing creates"
-        );
-        assert_eq!(count_streamers(&ps, "vps", &ctl("vps")), 1);
-        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 1);
-        assert_eq!(count_streamers(&ps, "absent", &ctl("absent")), 0);
-    }
-
-    /// --host-name must be end-anchored like --ctl-path: `tok` must not match
-    /// a host called `tok2`.
-    #[test]
-    fn host_name_match_is_prefix_safe() {
-        let ps = ps_line(&docker_host("tok2", "/p"));
-        assert_eq!(count_streamers(&ps, "tok2", &ctl("tok2")), 1);
-        assert_eq!(count_streamers(&ps, "tok", &ctl("tok")), 0, "`tok` must not match `tok2`");
-    }
-
-    /// Streamers from <=v0.1.6 predate --ctl-path. Missing them makes healing
-    /// fire against live panes on upgrade, injecting the exec line as text into
-    /// the user's running session.
-    #[test]
-    fn legacy_streamers_are_still_recognised() {
-        let legacy = "/usr/local/bin/herdr-mirror pane vps w1:p1 --remote-bin ~/.local/bin/herdr --always-control";
-        assert_eq!(count_streamers(legacy, "vps", &ctl("vps")), 0, "no --ctl-path to match");
-        assert_eq!(count_legacy_streamers(legacy, "vps"), 1, "must be seen by the legacy check");
-    }
-
-    /// The legacy fallback must not reintroduce the prefix collision it is
-    /// bridging away from.
-    #[test]
-    fn legacy_match_is_still_prefix_safe() {
-        let legacy = "/usr/local/bin/herdr-mirror pane work-staging w1:p1 --remote-bin x";
-        assert_eq!(count_legacy_streamers(legacy, "work-staging"), 1);
-        assert_eq!(count_legacy_streamers(legacy, "work"), 0, "`work` must not match `work-staging`");
+    fn other_subcommands_are_not_streamers() {
+        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
+        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
     }
 }
