@@ -3,7 +3,7 @@
 A [herdr](https://herdr.dev) plugin that mirrors a remote herdr server's
 workspaces and agents into your local sidebar. One window shows the agents on
 every machine — blocked, working, done — with live pane content you can watch
-and drive over ssh.
+and drive.
 
 <p align="center">
   <img src="assets/hero.png" width="720" alt="herdr-mirror: local and remote herdr sessions unified in one window">
@@ -15,20 +15,25 @@ Mirroring is one-way (the remote needs no plugin — just herdr), but you can
 type into any mirror pane to drive the remote session, and create remote
 workspaces/tabs/panes from your side.
 
+A remote can be another machine over **ssh**, or a **container** on this one
+(see [Devcontainer](#devcontainer)) — same mirrors either way.
+
 > **How it works.** One Rust binary (`herdr-mirror`) with subcommand modes: a
 > `daemon` (control plane — reconciles remote workspaces into local mirrors
 > and pushes agent status) and one `pane` process per mirror pane (data plane
-> — streams the remote terminal over ssh).
+> — streams the remote terminal).
 
 ## Requirements
 
-- **Both machines**: herdr with the `terminal session` streams — preview build
+- **Both ends**: herdr with the `terminal session` streams — preview build
   `2026-06-30` or newer (`herdr channel set preview`), until the next stable.
 - **Local machine**: macOS or Linux on x86_64/aarch64 — install fetches the
   prebuilt binary from Releases (dev installs via `herdr plugin link` build
   from source with `cargo build --release`).
-- **ssh**: non-interactive key auth to each remote
+- **ssh hosts**: non-interactive key auth to each remote
   (`ssh -o BatchMode=yes <host> true` must succeed without a prompt).
+- **Container hosts**: a working `docker` CLI, plus `socat` and herdr inside
+  the image. No sshd, no keys, no published ports.
 
 ## Installation
 
@@ -86,12 +91,12 @@ and resume with **start**. `teardown` closes all mirrors and clears state.
 
 **Create on the remote** — four actions create objects on the remote host,
 inheriting the target host and cwd from the mirror you invoke them from (the
-same rule as native `prefix+shift+n`, across ssh): `remote-new-workspace`,
+same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
 
 **Continuous streaming** — every mirror pane streams its remote pane live for
-its whole lifetime, each over its own direct ssh connection, so panes are never
+its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
@@ -124,7 +129,7 @@ command = "mirror.teardown"    # stop mirroring everything (start to resume)
 
 # Create objects on the REMOTE host — run these from inside a mirror pane, which
 # supplies the target host and cwd. Each is herdr's native local key + alt
-# (Option): same muscle memory, but it acts on the remote over ssh.
+# (Option): same muscle memory, but it acts on the remote host.
 [[keys.command]]
 key = "prefix+alt+n"           # native new_workspace = prefix+shift+n
 type = "plugin_action"
@@ -188,7 +193,7 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 [hosts.work]
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
-# remote_bin = "~/.local/bin/herdr"  # remote path if it's not on ssh's PATH
+# remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
@@ -198,10 +203,49 @@ target = "work"
 target = "ssh://niko@203.0.113.7:2222"
 ```
 
+## Devcontainer
+
+A herdr server running inside a container mirrors like any other host, reached
+over `docker exec` instead of ssh. Nothing is installed into the container and
+no port is published:
+
+```toml
+[hosts.dev]
+kind = "docker"
+folder = "/Users/you/code/my-project"   # devcontainer.local_folder label
+
+# container = "my-container"            # ...or pin an explicit name instead
+# docker_bin = "/usr/local/bin/docker"  # if docker isn't on the daemon's PATH
+# remote_bin = "~/.local/bin/herdr"     # default; resolves inside the container,
+                                        # so only set it if herdr lives elsewhere
+# prefix = "dev"                        # sidebar prefix (default: the host key)
+```
+
+**Resolve by `folder`, not `container`.** Docker assigns a devcontainer a new
+random name on every rebuild, so a pinned name breaks as soon as you rebuild.
+The `devcontainer.local_folder` label is stable, and the mirror follows the
+container across rebuilds.
+
+**What the image needs:**
+
+- **herdr**, running (`herdr status` inside the container should report a live
+  server). This is the same requirement an ssh host has.
+- **`socat`**, which bridges herdr's unix socket to `docker exec`'s stdio.
+  Docker has no equivalent of ssh's `-L` socket forward, so one small relay
+  process per API connection does that job. Missing socat is a clear error, not
+  a silent degrade.
+
+**A stopped container is not an error.** It reports as dormant and is retried
+every 5 minutes rather than on the fast reconnect ladder, because "not running"
+is a container's resting state — unlike an unreachable ssh host.
+
+**Multiple containers** each get their own `[hosts.*]` entry and run
+independently, exactly like multiple ssh hosts.
+
 ## Limitations
 
 - **Version-locked to preview** until the `terminal session` streams reach
-  stable; keep both machines on the same build.
+  stable; keep both ends on the same build.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.

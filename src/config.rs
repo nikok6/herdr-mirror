@@ -209,7 +209,15 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         });
     }
     if hosts.is_empty() {
-        return Err(err("hosts.toml: no enabled [hosts.*] entries"));
+        // Carry the skip reasons into the error. Otherwise a config whose only
+        // host is malformed reports "no enabled entries", which reads as "you
+        // configured nothing" when the truth is "the one you configured was
+        // rejected, and here is why".
+        return Err(err(if warnings.is_empty() {
+            "hosts.toml: no enabled [hosts.*] entries".to_string()
+        } else {
+            format!("hosts.toml: no usable [hosts.*] entries\n{}", warnings.join("\n"))
+        }));
     }
     if let Some(d) = &raw.default_host {
         if !hosts.iter().any(|h| &h.name == d) {
@@ -381,10 +389,17 @@ mod tests {
     }
 
     /// ...but a config where *every* host is invalid is still an error, so a
-    /// wholly broken file cannot look like a working empty one.
+    /// wholly broken file cannot look like a working empty one — and the error
+    /// must say WHY, not just "no entries", which reads as "you configured
+    /// nothing" when the user plainly did.
     #[test]
     fn all_hosts_invalid_is_still_an_error() {
-        assert!(parse_config("[hosts.a]\ntarget = \"\"\n").is_err());
+        let e = parse_config("[hosts.a]\ntarget = \"\"\n").unwrap_err().to_string();
+        assert!(e.contains("no usable"), "{e}");
+        assert!(e.contains("target is empty"), "must name the actual reason: {e}");
+        // an empty file has no reasons to give, so it keeps the plain message
+        let e = parse_config("").unwrap_err().to_string();
+        assert!(!e.contains("no usable"), "{e}");
     }
 
     fn tmpdir(tag: &str) -> PathBuf {
