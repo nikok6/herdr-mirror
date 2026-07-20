@@ -116,8 +116,7 @@ impl Predictor {
     /// contradiction or timeout.
     pub fn on_frame(&mut self, grid: &Grid) {
         let now = Instant::now();
-        loop {
-            let Some(p) = self.pending.first() else { break };
+        while let Some(p) = self.pending.first() {
             let cell =
                 grid.rows.get(p.row).and_then(|r| r.get(p.col)).and_then(|c| c.as_ref());
             if cell.map(|c| c.ch) == Some(p.ch) {

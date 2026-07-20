@@ -66,7 +66,7 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
     let resolved = resolve_context(&env, &config.hosts, &ctx);
 
     if resolved.is_none() && kind != "workspace" {

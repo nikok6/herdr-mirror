@@ -1,7 +1,7 @@
 // hosts.toml loader. Real TOML via the `toml` crate (the TS version hand-rolled
 // a subset only because it had to stay dependency-free).
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -32,6 +32,12 @@ pub struct MirrorConfig {
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
     pub hosts: Vec<HostConfig>,
+    /// which hosts.toml this came from. `None` when parsed from a string
+    /// (tests). Logged at startup so "which config won?" is never a guess.
+    pub source: Option<PathBuf>,
+    /// other candidate dirs that also hold a hosts.toml and are therefore
+    /// being ignored — a silent-shadowing trap worth warning about.
+    pub shadowed: Vec<PathBuf>,
 }
 
 impl MirrorConfig {
@@ -65,15 +71,31 @@ struct RawHost {
     always_control: Option<bool>,
 }
 
-pub fn load_config(config_dir: &Path) -> Result<MirrorConfig> {
-    let file = config_dir.join("hosts.toml");
-    let text = std::fs::read_to_string(&file).map_err(|_| {
-        err(format!(
-            "no config at {} — create it with:\n\n[hosts.<name>]\ntarget = \"<ssh target>\"\n",
-            file.display()
-        ))
-    })?;
-    parse_config(&text).map_err(|e| err(format!("{}: {e}", file.display())))
+/// Load the first `hosts.toml` found across `candidates`, in order.
+///
+/// The search is deliberately env-independent. Plugin actions run with
+/// `HERDR_PLUGIN_CONFIG_DIR` injected and shell invocations run without it, so
+/// resolution that *branches* on that variable makes the same config file
+/// visible to `herdr-mirror` as a plugin action and invisible to the identical
+/// command typed in a terminal. Searching every candidate either way keeps the
+/// two modes in agreement (see `util::config_candidates`).
+pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
+    let found: Vec<PathBuf> =
+        candidates.iter().map(|d| d.join("hosts.toml")).filter(|f| f.is_file()).collect();
+    let Some(file) = found.first() else {
+        let searched =
+            candidates.iter().map(|d| format!("  {}", d.join("hosts.toml").display()));
+        return Err(err(format!(
+            "no hosts.toml found — searched:\n{}\n\ncreate one with:\n\n[hosts.<name>]\ntarget = \"<ssh target>\"\n",
+            searched.collect::<Vec<_>>().join("\n")
+        )));
+    };
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| err(format!("{}: {e}", file.display())))?;
+    let mut config = parse_config(&text).map_err(|e| err(format!("{}: {e}", file.display())))?;
+    config.source = Some(file.clone());
+    config.shadowed = found[1..].to_vec();
+    Ok(config)
 }
 
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
@@ -107,11 +129,15 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
         hosts,
+        source: None,
+        shadowed: Vec::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -178,5 +204,53 @@ mod tests {
         let c = parse_config("[hosts.zeta]\ntarget = \"z\"\n[hosts.alpha]\ntarget = \"a\"\n").unwrap();
         assert_eq!(c.hosts[0].name, "zeta");
         assert_eq!(c.hosts[1].name, "alpha");
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("herdr-mirror-cfgtest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_hosts(dir: &Path, name: &str) {
+        std::fs::write(dir.join("hosts.toml"), format!("[hosts.{name}]\ntarget = \"t\"\n")).unwrap();
+    }
+
+    /// A config in a *later* candidate must still be found. This is the
+    /// README-follower case: config lives in the plugin dir, but the command
+    /// was typed in a shell so HERDR_PLUGIN_CONFIG_DIR is absent.
+    #[test]
+    fn finds_config_in_any_candidate() {
+        let a = tmpdir("late-a");
+        let b = tmpdir("late-b");
+        write_hosts(&b, "found");
+        let c = load_config(&[a, b.clone()]).unwrap();
+        assert_eq!(c.hosts[0].name, "found");
+        assert_eq!(c.source.as_deref(), Some(b.join("hosts.toml").as_path()));
+    }
+
+    /// Earlier candidates win, and the losers are reported rather than
+    /// silently dropped.
+    #[test]
+    fn earlier_candidate_wins_and_reports_shadowed() {
+        let a = tmpdir("shadow-a");
+        let b = tmpdir("shadow-b");
+        write_hosts(&a, "winner");
+        write_hosts(&b, "loser");
+        let c = load_config(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(c.hosts[0].name, "winner");
+        assert_eq!(c.shadowed, vec![b.join("hosts.toml")]);
+    }
+
+    /// The not-found error must name every path searched: naming only one
+    /// told users to create a config they had already created elsewhere.
+    #[test]
+    fn missing_config_error_lists_every_candidate() {
+        let a = tmpdir("miss-a");
+        let b = tmpdir("miss-b");
+        let e = load_config(&[a.clone(), b.clone()]).unwrap_err().to_string();
+        assert!(e.contains(&a.join("hosts.toml").display().to_string()), "{e}");
+        assert!(e.contains(&b.join("hosts.toml").display().to_string()), "{e}");
     }
 }

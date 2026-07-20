@@ -37,8 +37,7 @@ herdr plugin install nikok6/herdr-mirror     # or: herdr plugin link <path>
 herdr server reload-config                   # load the plugin (actions + autostart hook)
 ```
 
-Then create the config at `herdr plugin config-dir mirror`/`hosts.toml`
-(usually `~/.config/herdr/plugins/config/mirror/hosts.toml`):
+Then create the config at `~/.config/herdr-mirror/hosts.toml`:
 
 ```toml
 [hosts.work]
@@ -47,7 +46,14 @@ target = "work"        # anything ssh accepts: alias, user@host, ssh://host:2222
 
 That's it — the daemon autostarts when you focus a workspace, so within a few
 seconds `work: *` workspaces appear in your sidebar. Check state any time with
-`herdr-mirror status`.
+`herdr-mirror status`, which prints the config file it loaded.
+
+> **Config location.** `~/.config/herdr-mirror/hosts.toml` is the canonical
+> path: it's the only one reachable from *both* plugin actions and a plain
+> shell. The plugin config dir (`herdr plugin config-dir mirror`) is also
+> searched and takes precedence if a `hosts.toml` lives there, but prefer the
+> canonical path unless you have a reason not to. If both exist, the ignored
+> one is reported rather than silently dropped.
 
 If you've disabled autostart, start the daemon yourself by keybinding the
 "Mirror: start" action or running:

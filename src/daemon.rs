@@ -65,7 +65,6 @@ pub fn set_paused(env: &Env, paused: bool) {
 
 struct HostCtx {
     env_state_dir: PathBuf,
-    plugin_root: PathBuf,
     host: HostConfig,
     local: ApiClient,
     log: Logger,
@@ -169,7 +168,6 @@ async fn run_connected(
         remote: remote.clone(),
         host: ctx.host.clone(),
         state_dir: ctx.env_state_dir.clone(),
-        plugin_root: ctx.plugin_root.clone(),
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
@@ -386,13 +384,18 @@ async fn local_events_task(
 pub async fn cmd_run(env: Env) -> Result<()> {
     let detached = std::env::var("HERDR_MIRROR_DETACHED").is_ok();
     let log = Logger::new(&env.state_dir, !detached);
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
     fs::write(pid_path(&env), std::process::id().to_string())?;
     log.log(&format!(
-        "daemon starting (pid {}, hosts: {})",
+        "daemon starting (pid {}, hosts: {}, config: {})",
         std::process::id(),
-        config.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", ")
+        config.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", "),
+        config.source.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into())
     ));
+    // two configs on disk is a silent trap: the loser is ignored with no sign
+    for ignored in &config.shadowed {
+        log.log(&format!("warning: ignoring shadowed config at {}", ignored.display()));
+    }
 
     let local = ApiClient::connect(&env.local_socket).await?;
     let closes = crate::closes::new_closes();
@@ -403,7 +406,6 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         pokers.push(tx);
         let ctx = HostCtx {
             env_state_dir: env.state_dir.clone(),
-            plugin_root: env.plugin_root.clone(),
             host: h.clone(),
             local: local.clone(),
             log: log.clone(),
@@ -524,7 +526,7 @@ pub fn cmd_ensure(env: &Env) {
     if running_pid(env).is_some() || is_paused(env) {
         return;
     }
-    match load_config(&env.config_dir) {
+    match load_config(&env.config_search) {
         Ok(c) if c.autostart => {
             let _ = cmd_start(env);
         }
@@ -540,7 +542,13 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             if is_paused(env) { " (paused — resume with start)" } else { "" }
         ),
     }
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
+    if let Some(src) = &config.source {
+        println!("config: {}", src.display());
+    }
+    for ignored in &config.shadowed {
+        println!("warning: ignoring shadowed config at {}", ignored.display());
+    }
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
         let ws = state.workspaces.values().filter(|w| !w.is_tombstoned()).count();
@@ -569,7 +577,7 @@ pub fn cmd_status(env: &Env) -> Result<()> {
 
 pub async fn cmd_once(env: Env) -> Result<()> {
     let log = Logger::new(&env.state_dir, true);
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
@@ -579,7 +587,6 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             remote,
             host: h.clone(),
             state_dir: env.state_dir.clone(),
-            plugin_root: env.plugin_root.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
             // one-shot: no local event stream, so there is no authoritative
@@ -596,7 +603,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
 /// Un-tombstone mirrors the user closed: deleting the entries makes converge
 /// recreate them through the normal paths. Pokes the daemon; never converges.
 pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>) -> Result<()> {
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
     let mut cleared = 0usize;
     for h in &config.hosts {
         if filter_host.is_some_and(|f| f != h.name) {
@@ -645,7 +652,7 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     set_paused(&env, true); // torn down stays down until an explicit start
-    let config = load_config(&env.config_dir)?;
+    let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         teardown(&local, &env.state_dir, &h.name, &log, None).await?;

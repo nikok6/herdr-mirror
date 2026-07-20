@@ -46,6 +46,9 @@ pub struct PaneInfo {
     pub pane_id: String,
     pub tab_id: String,
     pub workspace_id: String,
+    /// unread today, but part of the pane wire shape — kept so the struct
+    /// documents what the API actually returns
+    #[allow(dead_code)]
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
@@ -139,21 +142,6 @@ pub enum LayoutNode {
         first: Box<LayoutNode>,
         second: Box<LayoutNode>,
     },
-}
-
-/// Fetch a tab's split tree. `None` on any failure — callers fall back to
-/// heuristics rather than blocking on layout availability.
-pub async fn export_layout_root(api: &ApiClient, tab_id: &str) -> Option<LayoutNode> {
-    #[derive(Deserialize)]
-    struct Exported {
-        layout: ExportedLayout,
-    }
-    #[derive(Deserialize)]
-    struct ExportedLayout {
-        root: LayoutNode,
-    }
-    let exported: Exported = api.request_t("layout.export", json!({ "tab_id": tab_id })).await.ok()?;
-    Some(exported.layout.root)
 }
 
 /// Locate `pane_id` in a split tree: the parent split's direction (already
@@ -285,7 +273,6 @@ pub struct ConvergeDeps {
     pub remote: ApiClient,
     pub host: HostConfig,
     pub state_dir: PathBuf,
-    pub plugin_root: PathBuf,
     pub log: Logger,
     /// mirror closing a workspace/pane locally onto the remote (see MirrorConfig)
     pub close_remote_on_local_close: bool,

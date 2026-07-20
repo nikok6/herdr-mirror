@@ -15,43 +15,22 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
-/// Resolved runtime environment. Config prefers the plugin dir if hosts.toml
-/// lives there; state is ALWAYS the fixed path so shell and plugin-action
-/// invocations share one id map and pidfile.
+/// Resolved runtime environment. Config is searched across candidate dirs so
+/// shell and plugin-action invocations agree (see `config_candidates`); state
+/// is ALWAYS the fixed path so both share one id map and pidfile.
 pub struct Env {
-    pub config_dir: PathBuf,
+    /// config dirs to search, in order (see `config_candidates`)
+    pub config_search: Vec<PathBuf>,
     pub state_dir: PathBuf,
     pub local_socket: PathBuf,
-    pub plugin_root: PathBuf,
-}
-
-/// HERDR_PLUGIN_ROOT, else walk up from the binary to the manifest. Only used
-/// as the mirror panes' cwd.
-fn resolve_plugin_root() -> PathBuf {
-    if let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") {
-        if !root.is_empty() {
-            return PathBuf::from(root);
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        for dir in exe.ancestors().skip(1) {
-            if dir.join("herdr-plugin.toml").exists() {
-                return dir.to_path_buf();
-            }
-        }
-    }
-    home_dir()
 }
 
 impl Env {
     pub fn resolve() -> Result<Env> {
-        let fallback_config = home_dir().join(".config").join("herdr-mirror");
-        let config_dir = match std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
-            Ok(dir) if Path::new(&dir).join("hosts.toml").exists() => PathBuf::from(dir),
-            _ => fallback_config,
-        };
+        let config_search = config_candidates();
         let state_dir = home_dir().join(".local").join("state").join("herdr-mirror");
-        fs::create_dir_all(&config_dir)?;
+        // create only the canonical dir; the others are probed, not owned
+        fs::create_dir_all(default_config_dir())?;
         fs::create_dir_all(&state_dir)?;
         let local_socket = match std::env::var("HERDR_SOCKET_PATH") {
             Ok(s) if !s.is_empty() => PathBuf::from(s),
@@ -73,8 +52,36 @@ impl Env {
                 PathBuf::from(sock)
             }
         };
-        Ok(Env { config_dir, state_dir, local_socket, plugin_root: resolve_plugin_root() })
+        Ok(Env { config_search, state_dir, local_socket })
     }
+}
+
+/// Canonical config dir: the one path both plugin actions and shell
+/// invocations can always reach, so it's what we create and what docs name.
+pub fn default_config_dir() -> PathBuf {
+    home_dir().join(".config").join("herdr-mirror")
+}
+
+/// Config dirs to search, most specific first.
+///
+/// Order matters more than it looks. herdr injects `HERDR_PLUGIN_CONFIG_DIR`
+/// into plugin actions but not into a shell, so resolution must not *branch*
+/// on it: a config only reachable when that variable happens to be set is
+/// visible to the autostart hook and invisible to the same command typed in a
+/// terminal. Probing the conventional plugin dir unconditionally means a
+/// README-following user (who is told to use `herdr plugin config-dir mirror`)
+/// gets the same answer in both modes.
+pub fn config_candidates() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
+        if !dir.is_empty() {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs.push(home_dir().join(".config/herdr/plugins/config/mirror"));
+    dirs.push(default_config_dir());
+    dirs.dedup();
+    dirs
 }
 
 /// Append-to-file logger (best-effort), optionally echoing to stdout.
