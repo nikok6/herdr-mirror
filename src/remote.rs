@@ -2,7 +2,9 @@
 // forward) over one ControlMaster per host. Pane streams deliberately use
 // their own direct connections instead (see pane.rs).
 
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -61,6 +63,31 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
         Ok(Err(e)) => SshOutput { code: 1, out: String::new(), err: e.to_string() },
         Err(_) => SshOutput { code: 1, out: String::new(), err: "ssh timeout".into() },
     }
+}
+
+fn remove_stale_control_socket(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(err(format!(
+                "cannot inspect ssh control socket {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(err(format!(
+            "refusing to replace ssh control path {} because it is not a socket",
+            path.display()
+        )));
+    }
+    fs::remove_file(path).map_err(|e| {
+        err(format!(
+            "cannot remove stale ssh control socket {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 pub struct RemoteHost {
@@ -135,8 +162,15 @@ impl RemoteHost {
             return Ok(());
         }
         self.forwarded = false;
-        let mut start: Vec<String> =
-            vec!["-M".into(), "-S".into(), self.ctl_path.display().to_string()];
+        // OpenSSH falls back to a standalone connection when ControlPath exists
+        // but no master is listening. With -f -N that silently leaks one process
+        // per retry, while every later -O command keeps targeting the dead socket.
+        remove_stale_control_socket(&self.ctl_path)?;
+        let mut start: Vec<String> = vec![
+            "-M".into(),
+            "-S".into(),
+            self.ctl_path.display().to_string(),
+        ];
         start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
         start.extend([
             "-o".into(),
@@ -151,6 +185,14 @@ impl RemoteHost {
                 "ssh master to {} failed: {}",
                 self.cfg.target,
                 nonempty(&res.err, res.code)
+            )));
+        }
+        let verified = ssh(&check, 15000).await;
+        if verified.code != 0 {
+            return Err(err(format!(
+                "ssh master to {} did not create a usable control socket: {}",
+                self.cfg.target,
+                nonempty(&verified.err, verified.code)
             )));
         }
         Ok(())
@@ -314,6 +356,40 @@ fn version_supported(version: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "herdr-mirror-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn removes_stale_control_socket() {
+        let path = test_path("stale-control");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(listener);
+
+        remove_stale_control_socket(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn refuses_to_replace_non_socket_control_path() {
+        let path = test_path("non-socket-control");
+        fs::write(&path, "do not delete").unwrap();
+
+        let error = remove_stale_control_socket(&path).unwrap_err().to_string();
+
+        assert!(error.contains("is not a socket"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "do not delete");
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn version_gate() {
