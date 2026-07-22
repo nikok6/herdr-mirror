@@ -7,6 +7,12 @@
 
 use std::fmt::Write as _;
 use std::rc::Rc;
+use unicode_width::UnicodeWidthChar;
+
+/// Terminal display width of a char (CJK/Hangul are 2 columns).
+fn cw(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+}
 
 #[derive(Clone, PartialEq)]
 pub struct Cell {
@@ -84,11 +90,17 @@ impl Grid {
             }
             let ch = chars[i];
             if ch >= ' ' || ch == '\t' {
+                let ch = if ch == '\t' { ' ' } else { ch };
+                let w = cw(ch);
                 if row < self.height && col < self.width {
-                    let ch = if ch == '\t' { ' ' } else { ch };
                     self.rows[row][col] = Some(Cell { sgr: sgr.clone(), ch });
+                    // wide char spans two columns: clear any stale cell in the
+                    // spacer slot so delta frames cannot leave mixed glyphs
+                    if w == 2 && col + 1 < self.width {
+                        self.rows[row][col + 1] = None;
+                    }
                 }
-                col += 1;
+                col += w;
             }
             i += 1;
         }
@@ -196,14 +208,27 @@ impl Renderer {
             let cells = grid.rows.get(r + offset_r).unwrap_or(&empty);
             let mut line = String::new();
             let mut prev_sgr: Option<&str> = None;
-            for c in 0..out_cols.min(grid.width) {
+            let limit = out_cols.min(grid.width);
+            let mut c = 0usize;
+            while c < limit {
                 let cell = cells.get(c).and_then(|c| c.as_ref());
                 let sgr = cell.map(|c| &*c.sgr).unwrap_or("\x1b[0m");
                 if prev_sgr != Some(sgr) {
                     line.push_str(if sgr.is_empty() { "\x1b[0m" } else { sgr });
                     prev_sgr = Some(sgr);
                 }
-                line.push(cell.map(|c| c.ch).unwrap_or(' '));
+                let ch = cell.map(|c| c.ch).unwrap_or(' ');
+                let w = cw(ch);
+                // a wide char that would straddle the right edge is blanked
+                if w == 2 && c + 1 >= limit {
+                    line.push(' ');
+                    c += 1;
+                    continue;
+                }
+                line.push(ch);
+                // wide char occupies two columns: skip its spacer cell so the
+                // painted columns stay aligned with the grid (Hangul/CJK fix)
+                c += w;
             }
             let is_status_row = r == out_rows - 1 && !self.status_text.is_empty();
             let painted = if is_status_row {
@@ -270,6 +295,30 @@ mod tests {
         // delta frame erases the bottom content with spaces
         g.apply("\x1b[7;1H      ");
         assert_eq!(g.content_bottom, 0);
+    }
+
+    #[test]
+    fn wide_chars_do_not_drift() {
+        let mut g = Grid::new();
+        g.resize(10, 1);
+        // the server skips the spacer cell after a wide char with a CUP jump
+        g.apply("\x1b[1;1H한\x1b[1;3H글\x1b[1;5H!");
+        assert_eq!((g.cursor_row, g.cursor_col), (0, 5));
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 10, 1);
+        // without width handling this painted "한 글 !" and drifted right
+        assert!(out.contains("한글!"), "got: {out:?}");
+    }
+
+    #[test]
+    fn wide_char_overwrites_stale_spacer() {
+        let mut g = Grid::new();
+        g.resize(10, 1);
+        g.apply("\x1b[1;1Hab"); // narrow content first
+        g.apply("\x1b[1;1H한"); // delta frame paints a wide char over it
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 10, 1);
+        assert!(!out.contains('b'), "stale spacer cell survived: {out:?}");
     }
 
     #[test]
