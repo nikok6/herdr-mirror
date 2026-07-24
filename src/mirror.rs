@@ -1141,6 +1141,7 @@ mod tests {
             prefix: "vps".into(),
             remote_bin: "~/.local/bin/herdr".into(),
             always_control: true,
+            api_transport: crate::config::ApiTransport::Auto,
         }
     }
 

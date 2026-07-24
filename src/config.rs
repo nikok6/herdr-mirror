@@ -26,6 +26,37 @@ impl HostKind {
     }
 }
 
+/// How an ssh host's API socket is reached. Meaningless for docker hosts,
+/// which always bridge through `docker exec` (see docker.rs) — present on
+/// every host regardless of kind for the same reason `docker_bin` is present
+/// on ssh hosts: a field that is a no-op for the other kind is simpler than
+/// rejecting it.
+///
+/// `Auto` (the default) is what most hosts want: try the streamlocal `-L`
+/// socket forward first, since it is one process cheaper per connection, and
+/// fall back to an exec relay only if that turns out not to work. Some ssh
+/// servers — notably embedded Go sshds fronting container/VM workspaces —
+/// accept a direct-streamlocal channel open but never service it, which
+/// without a fallback looks like the remote herdr hanging rather than what it
+/// actually is: the transport silently going nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiTransport {
+    Auto,
+    Socket,
+    Exec,
+}
+
+impl ApiTransport {
+    fn parse(s: &str) -> Option<ApiTransport> {
+        match s {
+            "auto" => Some(ApiTransport::Auto),
+            "socket" => Some(ApiTransport::Socket),
+            "exec" => Some(ApiTransport::Exec),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub name: String,
@@ -36,6 +67,8 @@ pub struct HostConfig {
     pub docker_bin: String,
     pub prefix: String,
     pub remote_bin: String,
+    /// ssh hosts only; see `ApiTransport`. Default `Auto`.
+    pub api_transport: ApiTransport,
     /// keep each mirror pane in control (writable, no idle release, and sized to
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
@@ -101,6 +134,7 @@ struct RawHost {
     remote_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    api_transport: Option<String>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -198,11 +232,25 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 continue;
             }
         };
+        let api_transport = match h.api_transport.as_deref() {
+            None => ApiTransport::Auto,
+            Some(s) => match ApiTransport::parse(s) {
+                Some(t) => t,
+                None => {
+                    warnings.push(format!(
+                        "skipping host: [hosts.{name}]: unknown api_transport \"{s}\" \
+                         (expected auto, socket, or exec)"
+                    ));
+                    continue;
+                }
+            },
+        };
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
             always_control: h.always_control.unwrap_or(global_always_control),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
+            api_transport,
             kind,
             target,
             name,
@@ -359,6 +407,32 @@ mod tests {
         for case in cases {
             assert!(parse_config(case).is_err(), "should reject: {case}");
         }
+    }
+
+    #[test]
+    fn api_transport_defaults_to_auto_and_parses_overrides() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.hosts[0].api_transport, ApiTransport::Auto);
+
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\napi_transport = \"socket\"\n").unwrap();
+        assert_eq!(c.hosts[0].api_transport, ApiTransport::Socket);
+
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\napi_transport = \"exec\"\n").unwrap();
+        assert_eq!(c.hosts[0].api_transport, ApiTransport::Exec);
+    }
+
+    /// An unknown value must be as loud as any other malformed host: skipped
+    /// with a named reason, not silently coerced to a default.
+    #[test]
+    fn unknown_api_transport_is_skipped_with_reason() {
+        let c = parse_config(
+            "[hosts.good]\ntarget = \"g\"\n\
+             [hosts.bad]\ntarget = \"b\"\napi_transport = \"turbo\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "good");
+        assert!(c.warnings[0].contains("unknown api_transport"), "{:?}", c.warnings);
     }
 
     #[test]

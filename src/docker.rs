@@ -159,7 +159,11 @@ pub async fn probe_socat(docker_bin: &str, cid: &str) -> Result<()> {
 /// The path comes from `herdr status --json` *inside the container*, which is
 /// the less-trusted side of the boundary, so it is validated rather than
 /// trusted.
-fn validate_socket_path(sock: &str) -> Result<()> {
+///
+/// Shared with `ssh_relay`, whose socket path comes from `herdr status --json`
+/// over ssh instead of over `docker exec` — the same trust boundary, so the
+/// same check.
+pub(crate) fn validate_socket_path(sock: &str) -> Result<()> {
     if !sock.starts_with('/') {
         return Err(err(format!("remote socket path is not absolute: {sock}")));
     }

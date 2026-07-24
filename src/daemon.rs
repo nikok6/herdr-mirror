@@ -159,9 +159,16 @@ async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
     backoff_idx: &mut usize,
+    remembered_transport: &mut Option<crate::config::ApiTransport>,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
+    // a fresh RemoteHost is built on every reconnect, so what worked last
+    // time (specifically: an auto host that fell back to the exec relay)
+    // would otherwise be re-probed via streamlocal on every single reconnect
+    // for the life of the daemon
+    remote_host.hint_transport(*remembered_transport);
     let (remote, _status) = remote_host.connect_api().await?;
+    *remembered_transport = remote_host.last_api_transport;
     *backoff_idx = 0;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
@@ -262,8 +269,11 @@ const DORMANT_DELAY: u64 = 300;
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
     let mut was_dormant = false;
+    // persists across reconnects for the daemon's whole lifetime — the
+    // point of remembering at all (see `run_connected`)
+    let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     loop {
-        let e = match run_connected(&ctx, &mut poke, &mut backoff_idx).await {
+        let e = match run_connected(&ctx, &mut poke, &mut backoff_idx, &mut remembered_transport).await {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };

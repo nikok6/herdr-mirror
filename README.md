@@ -198,6 +198,15 @@ target = "work"
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
+# api_transport = "auto"             # default. Reaches the remote API socket
+                                     # via ssh's streamlocal `-L` forward, and
+                                     # falls back to an exec relay (one ssh
+                                     # exec per API connection, no config
+                                     # needed on the remote beyond socat or
+                                     # python3) if that doesn't work — some
+                                     # sshds accept the forward but never
+                                     # service it. Set "socket" or "exec" to
+                                     # pin one and skip the probe.
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
@@ -261,6 +270,11 @@ independently, exactly like multiple ssh hosts.
   can't render a richer affordance (group headers, collapse, colour).
 - **Remote must be reachable and running herdr**; the daemon surfaces a
   readable status if a host is down or on too old a version.
+- **ssh hosts whose sshd won't service streamlocal forwards** (some embedded
+  Go sshds fronting container/VM workspaces accept the channel open and then
+  never move a byte) fall back automatically to an exec relay — see
+  `api_transport` above. The remote needs `socat` or `python3` for that path;
+  almost everything has one or the other.
 
 ## License
 
