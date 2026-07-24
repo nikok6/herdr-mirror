@@ -30,6 +30,28 @@ struct Pending {
     at: Instant,
 }
 
+/// Position inside a terminal escape sequence. Sequences are commands (arrows,
+/// shift+enter's CSI-u, mouse reports forwarded to a remote TUI), but their
+/// bodies are printable ASCII, so a byte-at-a-time classifier happily echoes
+/// the *encoding* of a keypress as ghost text.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum EscState {
+    #[default]
+    Ground,
+    /// saw ESC; still ambiguous with a bare Escape keypress
+    Esc,
+    /// ESC [ ... : arrows, CSI-u, SGR mouse, function keys
+    Csi,
+    /// ESC O x : application-mode arrows
+    Ss3,
+    /// ESC ] ... : terminated by BEL or ST
+    Osc,
+    OscEsc,
+}
+
+/// a malformed run must never swallow real typing forever
+const MAX_ESC_LEN: usize = 64;
+
 #[derive(Default)]
 pub struct Predictor {
     pending: Vec<Pending>,
@@ -38,6 +60,10 @@ pub struct Predictor {
     /// a prediction was cleared without a frame repainting it — the renderer
     /// must invalidate so ghost characters get wiped
     dirty: bool,
+    /// escape-sequence position. Persists across calls: a mouse burst can be
+    /// split mid-sequence by the reader's 1024-byte boundary.
+    esc: EscState,
+    esc_len: usize,
 }
 
 // debug tracing (temporary): HERDR_MIRROR_PREDICT_LOG=1 or presence of the
@@ -65,11 +91,75 @@ impl Predictor {
         self.streak >= CONFIRM_THRESHOLD
     }
 
-    /// Feed user keystrokes (after mouse extraction). Returns true when the
-    /// visible overlay may have changed and an immediate repaint helps.
+    /// Consume one byte of an escape sequence. Returns true when the byte
+    /// belonged to one, and so must never become a prediction.
+    fn consume_escape(&mut self, b: u8, changed: &mut bool) -> bool {
+        if self.esc == EscState::Ground {
+            if b != 0x1b {
+                return false;
+            }
+            // same reasoning as the control-byte arm: the line's fate is
+            // unknowable locally, so drop optimism and let frames drive
+            if !self.pending.is_empty() {
+                self.dirty = true;
+                *changed = true;
+                self.pending.clear();
+            }
+            self.esc = EscState::Esc;
+            self.esc_len = 0;
+            return true;
+        }
+        self.esc_len += 1;
+        if self.esc_len > MAX_ESC_LEN {
+            // never seen a terminator: assume garbage and hand the byte back
+            self.esc = EscState::Ground;
+            return false;
+        }
+        match self.esc {
+            EscState::Esc => {
+                self.esc = match b {
+                    b'[' => EscState::Csi,
+                    b'O' => EscState::Ss3,
+                    b']' => EscState::Osc,
+                    // two-byte escape (alt+key): a command, not typed text
+                    _ => EscState::Ground,
+                };
+            }
+            EscState::Csi => {
+                if (0x40..=0x7e).contains(&b) {
+                    self.esc = EscState::Ground; // final byte
+                } else if !(0x20..=0x3f).contains(&b) {
+                    // C0 control inside a CSI: malformed. Bail rather than risk
+                    // eating the keystrokes that follow.
+                    self.esc = EscState::Ground;
+                    return false;
+                }
+            }
+            EscState::Ss3 => self.esc = EscState::Ground,
+            EscState::Osc => {
+                if b == 0x07 {
+                    self.esc = EscState::Ground;
+                } else if b == 0x1b {
+                    self.esc = EscState::OscEsc;
+                }
+            }
+            EscState::OscEsc => {
+                self.esc = if b == b'\\' { EscState::Ground } else { EscState::Osc };
+            }
+            EscState::Ground => return false,
+        }
+        true
+    }
+
+    /// Feed user keystrokes (after mouse extraction). Escape sequences are
+    /// consumed whole and never predicted. Returns true when the visible
+    /// overlay may have changed and an immediate repaint helps.
     pub fn on_input(&mut self, bytes: &[u8], grid: &Grid) -> bool {
         let mut changed = false;
         for &b in bytes {
+            if self.consume_escape(b, &mut changed) {
+                continue;
+            }
             match b {
                 0x20..=0x7e => {
                     if self.pending.len() >= MAX_PENDING {
@@ -108,6 +198,13 @@ impl Predictor {
                     }
                 }
             }
+        }
+        // A chunk ending on a bare ESC is the Escape KEY, not a truncated
+        // sequence: terminals emit sequences in a single write. Resetting keeps
+        // the next chunk's first letter predictable (Escape then typing in vim),
+        // while deeper states still carry over so a split mouse burst stays safe.
+        if self.esc == EscState::Esc {
+            self.esc = EscState::Ground;
         }
         changed
     }
@@ -258,6 +355,72 @@ mod tests {
         assert_eq!(p.pending.len(), 1);
         p.on_input(b"\r", &g);
         assert!(p.pending.is_empty());
+    }
+
+    /// confident predictor at a shell prompt: the state every ghost-garbage
+    /// report starts from
+    fn confident() -> (Predictor, Grid) {
+        let mut p = Predictor::new();
+        p.streak = 5;
+        (p, grid_at("$ ", 2))
+    }
+
+    #[test]
+    fn shift_enter_is_not_predicted() {
+        let (mut p, g) = confident();
+        // ghostty encodes shift+enter as CSI-u; every byte after ESC is printable
+        p.on_input(b"\x1b[13;2u", &g);
+        assert!(p.pending.is_empty());
+        assert_eq!(p.overlay(&g, 20, 2), "");
+    }
+
+    #[test]
+    fn arrow_and_function_keys_are_not_predicted() {
+        let (mut p, g) = confident();
+        p.on_input(b"\x1b[A", &g); // cursor-mode arrow
+        p.on_input(b"\x1bOB", &g); // application-mode arrow (SS3)
+        p.on_input(b"\x1b[15~", &g); // F5
+        p.on_input(b"\x1bb", &g); // alt+b, readline word-back
+        assert!(p.pending.is_empty());
+        assert_eq!(p.overlay(&g, 20, 2), "");
+    }
+
+    #[test]
+    fn forwarded_mouse_report_is_not_predicted() {
+        let (mut p, g) = confident();
+        // remote foreground is a TUI, so pane.rs forwards SGR mouse bytes raw
+        p.on_input(b"\x1b[<0;33;15M", &g); // click
+        p.on_input(b"\x1b[<64;33;15M", &g); // wheel up
+        p.on_input(b"\x1b[<65;33;15M", &g); // wheel down
+        p.on_input(b"\x1b[<35;40;12M", &g); // motion
+        assert!(p.pending.is_empty());
+    }
+
+    #[test]
+    fn mouse_report_split_across_reads_is_not_predicted() {
+        let (mut p, g) = confident();
+        p.on_input(b"\x1b[<0;33", &g); // read boundary lands mid-sequence
+        p.on_input(b";15M", &g);
+        assert!(p.pending.is_empty());
+        p.on_input(b"x", &g); // and real typing still predicts after
+        assert_eq!(p.pending.len(), 1);
+    }
+
+    #[test]
+    fn literally_typed_sequence_text_still_predicts() {
+        let (mut p, g) = confident();
+        // the same characters from the keyboard carry no ESC, so they are text
+        p.on_input(b"[13;2u", &g);
+        assert_eq!(p.pending.iter().map(|x| x.ch).collect::<String>(), "[13;2u");
+        assert!(p.overlay(&g, 20, 2).contains('u'));
+    }
+
+    #[test]
+    fn bare_escape_does_not_eat_the_next_chunk() {
+        let (mut p, g) = confident();
+        p.on_input(&[0x1b], &g); // Escape key in vim, arrives alone
+        p.on_input(b"ls", &g);
+        assert_eq!(p.pending.len(), 2);
     }
 
     #[test]
