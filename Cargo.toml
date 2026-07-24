@@ -1,6 +1,6 @@
 [package]
 name = "herdr-mirror"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 license = "MIT"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
