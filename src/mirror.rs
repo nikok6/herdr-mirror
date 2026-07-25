@@ -66,6 +66,13 @@ pub struct AgentInfo {
     // carries the same title as `title`, so accept either
     #[serde(alias = "title")]
     pub name: Option<String>,
+    /// the remote's live terminal title (e.g. a coding agent's current task
+    /// summary), stripped of spinner/status glyphs. Only present on hosts new
+    /// enough to publish it — default so older remotes still parse.
+    #[serde(default)]
+    pub terminal_title_stripped: Option<String>,
+    #[serde(default)]
+    pub terminal_title: Option<String>,
     #[serde(default)]
     pub agent_status: Option<String>,
     pub custom_status: Option<String>,
@@ -81,6 +88,18 @@ impl AgentInfo {
     pub fn has_agent(&self) -> bool {
         self.agent.as_deref().is_some_and(|a| !a.is_empty())
             || self.agent_status.as_deref().is_some_and(|s| s != "unknown")
+    }
+
+    /// The single `title` slot `pane.report_metadata` accepts. A remote agent
+    /// with a user-given `name` keeps showing it (unchanged behavior — don't
+    /// bury a name the user picked under an ever-changing task title). Only
+    /// when there's no name do we fall back to the remote's live terminal
+    /// title, so a mirrored agent's current task is visible instead of blank.
+    pub fn effective_title(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.terminal_title_stripped.as_deref())
+            .or(self.terminal_title.as_deref())
     }
 }
 
@@ -888,7 +907,7 @@ pub async fn push_pane_status(
                 "pane_id": entry.local_id,
                 "source": source,
                 "display_agent": display,
-                "title": agent.name,
+                "title": agent.effective_title(),
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
                 "tokens": agent.tokens.clone(),
                 "seq": entry.seq,
@@ -1286,6 +1305,41 @@ mod tests {
         assert_eq!(info.display_agent.as_deref(), Some("Claude"));
         assert_eq!(info.name.as_deref(), Some("fix the bug")); // title -> name
         assert!(info.has_agent());
+    }
+
+    /// A remote agent with a user-given name keeps showing it; only an
+    /// unnamed agent falls back to the remote's live terminal title, so a
+    /// mirrored agent's current task is visible instead of always blank
+    /// (the reported gap: oldmac reports `terminal_title_stripped` on every
+    /// agent, but the mirror only ever forwarded `name`, which most agents
+    /// never set).
+    #[test]
+    fn effective_title_prefers_name_falls_back_to_terminal_title() {
+        let named = AgentInfo {
+            name: Some("l2-r3".into()),
+            terminal_title_stripped: Some("实现论文引用图数据层".into()),
+            ..Default::default()
+        };
+        assert_eq!(named.effective_title(), Some("l2-r3"));
+
+        let unnamed = AgentInfo {
+            name: None,
+            terminal_title_stripped: Some("实现论文引用图数据层".into()),
+            terminal_title: Some("✳ 实现论文引用图数据层".into()),
+            ..Default::default()
+        };
+        assert_eq!(unnamed.effective_title(), Some("实现论文引用图数据层"));
+
+        let stripped_missing = AgentInfo {
+            name: None,
+            terminal_title_stripped: None,
+            terminal_title: Some("✳ working".into()),
+            ..Default::default()
+        };
+        assert_eq!(stripped_missing.effective_title(), Some("✳ working"));
+
+        let bare = AgentInfo { name: None, ..Default::default() };
+        assert_eq!(bare.effective_title(), None);
     }
 
     // simulate herdr's move_workspace(source, insert_index) on an id list
