@@ -369,6 +369,32 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
     None
 }
 
+/// How a parsed mouse event should be routed while in control mode.
+#[derive(Debug, PartialEq, Eq)]
+enum MouseAction {
+    /// wheel: send as a semantic terminal.scroll (server decides app vs scrollback)
+    Scroll { up: bool },
+    /// click/drag on a remote TUI: forward the raw SGR sequence
+    ForwardRaw,
+    /// click/drag at a shell (or unclassified): drop, keep mouse local
+    Drop,
+}
+
+/// Wheel always scrolls semantically, regardless of the foreground
+/// classification — the remote herdr server knows the real app's mouse mode
+/// and is a better judge than this side's process-name heuristic (e.g. a TUI
+/// that doesn't consume wheel events, like an agent CLI). Non-wheel
+/// clicks/drags keep the existing foreground-based routing.
+fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
+    if press && (btn == 64 || btn == 65) {
+        MouseAction::Scroll { up: btn == 64 }
+    } else if remote_is_shell == Some(false) {
+        MouseAction::ForwardRaw
+    } else {
+        MouseAction::Drop
+    }
+}
+
 fn contains_wheel_press(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
@@ -732,22 +758,21 @@ impl App {
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                if self.remote_is_shell == Some(false) {
-                    // remote foreground is a TUI → forward wheel and clicks raw
-                    rest.extend_from_slice(&buf[i..i + len]);
-                } else if press && (btn == 64 || btn == 65) {
-                    // shell / not-yet-classified: wheel becomes a semantic scroll
-                    scrolls.push(json!({
-                        "type": "terminal.scroll",
-                        "direction": if btn == 64 { "up" } else { "down" },
-                        "lines": 3,
-                        "source": "wheel",
-                        "column": x.saturating_sub(1),
-                        "row": y.saturating_sub(1),
-                        "modifiers": 0,
-                    }));
+                match mouse_action(self.remote_is_shell, btn, press) {
+                    MouseAction::Scroll { up } => {
+                        scrolls.push(json!({
+                            "type": "terminal.scroll",
+                            "direction": if up { "up" } else { "down" },
+                            "lines": 3,
+                            "source": "wheel",
+                            "column": x.saturating_sub(1),
+                            "row": y.saturating_sub(1),
+                            "modifiers": 0,
+                        }));
+                    }
+                    MouseAction::ForwardRaw => rest.extend_from_slice(&buf[i..i + len]),
+                    MouseAction::Drop => {}
                 }
-                // else: shell/unknown click → drop (keep mouse local)
                 i += len;
             } else {
                 rest.push(buf[i]);
@@ -932,6 +957,22 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_always_semantic_scroll_even_on_tui_foreground() {
+        // remote foreground classified as a TUI (e.g. `claude`) — wheel must
+        // still produce a semantic scroll, not a raw forward, or it silently
+        // does nothing when the TUI doesn't consume mouse wheel input
+        assert_eq!(mouse_action(Some(false), 64, true), MouseAction::Scroll { up: true });
+        assert_eq!(mouse_action(Some(false), 65, true), MouseAction::Scroll { up: false });
+        // unclassified/shell foreground: wheel still scrolls
+        assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
+        assert_eq!(mouse_action(Some(true), 65, true), MouseAction::Scroll { up: false });
+        // non-wheel clicks/drags keep the existing foreground-based routing
+        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::ForwardRaw); // TUI click
+        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::Drop); // shell click
+        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
+    }
 
     #[test]
     fn mouse_parsing() {
