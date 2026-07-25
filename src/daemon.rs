@@ -82,6 +82,10 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.created",
     "pane.closed",
     "pane.exited",
+    // a bare remote resize (no pane created/closed) has no other event to
+    // hang a converge off of; falls into the generic converge_at branch below
+    // like any subscription this daemon doesn't special-case.
+    "layout.updated",
 ];
 
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {

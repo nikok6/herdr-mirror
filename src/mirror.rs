@@ -145,25 +145,59 @@ pub enum LayoutNode {
 }
 
 /// Locate `pane_id` in a split tree: the parent split's direction (already
-/// "right"/"down", pane.split's vocabulary) plus the sibling subtree's pane
-/// ids ordered nearest-to-the-split-point first. This is exact — the tree
-/// records how the panes were actually split, so no geometry heuristics.
-pub fn locate_in_layout(node: &LayoutNode, pane_id: &str) -> Option<(String, Vec<String>)> {
-    let LayoutNode::Split { direction, first, second, .. } = node else { return None };
+/// "right"/"down", pane.split's vocabulary) and ratio, plus the sibling
+/// subtree's pane ids ordered nearest-to-the-split-point first. This is
+/// exact — the tree records how the panes were actually split, so no
+/// geometry heuristics.
+pub fn locate_in_layout(node: &LayoutNode, pane_id: &str) -> Option<(String, f64, Vec<String>)> {
+    let LayoutNode::Split { direction, ratio, first, second } = node else { return None };
     let is_the_pane =
         |n: &LayoutNode| matches!(n, LayoutNode::Pane { pane_id: Some(p), .. } if p == pane_id);
     if is_the_pane(first) {
         let mut sibs = Vec::new();
         walk_pane_ids(second, &mut sibs);
-        return Some((direction.clone(), sibs));
+        return Some((direction.clone(), *ratio, sibs));
     }
     if is_the_pane(second) {
         let mut sibs = Vec::new();
         walk_pane_ids(first, &mut sibs);
         sibs.reverse();
-        return Some((direction.clone(), sibs));
+        return Some((direction.clone(), *ratio, sibs));
     }
     locate_in_layout(first, pane_id).or_else(|| locate_in_layout(second, pane_id))
+}
+
+/// Ratio drift below this is ignored — both sides derive ratios from
+/// independent cell-grid math, so sub-percent wobble isn't a real desync.
+const RATIO_EPSILON: f64 = 0.01;
+
+/// Walk the remote and local split trees together and collect every split
+/// path whose remote ratio has drifted from the local one. Stops descending
+/// wherever the two trees' shapes disagree at that point — a structural
+/// mismatch (a pane the topology sync hasn't placed yet, mid-converge) is a
+/// different problem, not something a ratio correction should paper over.
+fn ratio_corrections(remote: &LayoutNode, local: &LayoutNode) -> Vec<(Vec<bool>, f64)> {
+    fn walk(remote: &LayoutNode, local: &LayoutNode, path: &mut Vec<bool>, out: &mut Vec<(Vec<bool>, f64)>) {
+        let (
+            LayoutNode::Split { ratio: rratio, first: rfirst, second: rsecond, .. },
+            LayoutNode::Split { ratio: lratio, first: lfirst, second: lsecond, .. },
+        ) = (remote, local)
+        else {
+            return;
+        };
+        if (rratio - lratio).abs() > RATIO_EPSILON {
+            out.push((path.clone(), *rratio));
+        }
+        path.push(false);
+        walk(rfirst, lfirst, path, out);
+        path.pop();
+        path.push(true);
+        walk(rsecond, lsecond, path, out);
+        path.pop();
+    }
+    let mut out = Vec::new();
+    walk(remote, local, &mut Vec::new(), &mut out);
+    out
 }
 
 fn walk_pane_ids(node: &LayoutNode, out: &mut Vec<String>) {
@@ -771,20 +805,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     }
                     // place the mirror where the REMOTE layout says the pane
                     // lives: split its nearest already-mirrored layout sibling
-                    // in the tree's recorded direction. Falls back to the old
-                    // first-pane/right when the layout doesn't resolve.
+                    // in the tree's recorded direction and ratio. Falls back
+                    // to the old first-pane/right/default-ratio when the
+                    // layout doesn't resolve.
                     let placed = locate_in_layout(&exported.layout.root, &rp.pane_id).and_then(
-                        |(dir, sibs)| {
+                        |(dir, ratio, sibs)| {
                             sibs.iter()
                                 .find_map(|rid| state.panes.get(rid).map(|e| e.local_id.clone()))
-                                .map(|t| (t, dir))
+                                .map(|t| (t, dir, Some(ratio)))
                         },
                     );
-                    let Some((target, direction)) = placed.or_else(|| {
+                    let Some((target, direction, ratio)) = placed.or_else(|| {
                         remote_panes_in_tab
                             .iter()
                             .find_map(|p| state.panes.get(&p.pane_id).map(|e| e.local_id.clone()))
-                            .map(|t| (t, "right".to_string()))
+                            .map(|t| (t, "right".to_string(), None))
                     }) else {
                         continue;
                     };
@@ -796,18 +831,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     struct SplitPane {
                         pane_id: String,
                     }
-                    let split: Split = deps
-                        .local
-                        .request_t(
-                            "pane.split",
-                            json!({
-                                "target_pane_id": target,
-                                "direction": direction,
-                                "cwd": cwd,
-                                "focus": false,
-                            }),
-                        )
-                        .await?;
+                    let mut split_params = json!({
+                        "target_pane_id": target,
+                        "direction": direction,
+                        "cwd": cwd,
+                        "focus": false,
+                    });
+                    if let Some(r) = ratio {
+                        split_params["ratio"] = json!(r);
+                    }
+                    let split: Split =
+                        deps.local.request_t("pane.split", split_params).await?;
                     spawn_streamer_pane(&deps.local, &split.pane.pane_id, &cmd_for(&rp.pane_id), &deps.log).await;
                     state.panes.insert(
                         rp.pane_id.clone(),
@@ -825,6 +859,34 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     .local
                     .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
                     .await;
+            }
+
+            // topology sync above only sets a ratio for a split it JUST
+            // created; a remote resize of an already-mirrored split has no
+            // topology change to hang off of, so it needs its own check every
+            // pass (cheap: one export each side) or it silently drifts out of
+            // sync forever. `layout.updated` is in daemon.rs's broadcast
+            // subscriptions, so a bare remote resize (no create/close) still
+            // reaches this via the normal debounced converge.
+            #[derive(Deserialize)]
+            struct Exported {
+                layout: ExportedLayout,
+            }
+            #[derive(Deserialize)]
+            struct ExportedLayout {
+                root: LayoutNode,
+            }
+            let remote_layout =
+                deps.remote.request_t::<Exported>("layout.export", json!({ "tab_id": rtab.tab_id })).await;
+            let local_layout =
+                deps.local.request_t::<Exported>("layout.export", json!({ "tab_id": tab_local })).await;
+            if let (Ok(r), Ok(l)) = (remote_layout, local_layout) {
+                for (path, ratio) in ratio_corrections(&r.layout.root, &l.layout.root) {
+                    let params = json!({ "tab_id": tab_local, "path": path, "ratio": ratio });
+                    if let Err(e) = deps.local.request("layout.set_split_ratio", params).await {
+                        log.log(&format!("split ratio sync failed for {}: {e}", rtab.tab_id));
+                    }
+                }
             }
         }
     }
@@ -1142,6 +1204,69 @@ mod tests {
             remote_bin: "~/.local/bin/herdr".into(),
             always_control: true,
         }
+    }
+
+    fn leaf(pane_id: &str) -> LayoutNode {
+        LayoutNode::Pane { pane_id: Some(pane_id.into()), label: None }
+    }
+
+    fn split(direction: &str, ratio: f64, first: LayoutNode, second: LayoutNode) -> LayoutNode {
+        LayoutNode::Split { direction: direction.into(), ratio, first: Box::new(first), second: Box::new(second) }
+    }
+
+    /// `locate_in_layout` must report the split's ratio (used to replicate a
+    /// new remote pane's placement with `pane.split --ratio`), not just its
+    /// direction — the ratio-blind version was the reported gap: a remote
+    /// split at 0.3 mirrored locally at the server's 0.5 default.
+    #[test]
+    fn locate_in_layout_reports_direction_and_ratio() {
+        let tree = split("right", 0.3, leaf("p1"), leaf("p2"));
+        let (dir, ratio, sibs) = locate_in_layout(&tree, "p2").unwrap();
+        assert_eq!(dir, "right");
+        assert_eq!(ratio, 0.3);
+        assert_eq!(sibs, vec!["p1".to_string()]);
+
+        // nested: p3 is under a "down" split with its own ratio, inside the
+        // "right" split's second branch
+        let tree = split("right", 0.3, leaf("p1"), split("down", 0.4, leaf("p2"), leaf("p3")));
+        let (dir, ratio, sibs) = locate_in_layout(&tree, "p3").unwrap();
+        assert_eq!(dir, "down");
+        assert_eq!(ratio, 0.4);
+        assert_eq!(sibs, vec!["p2".to_string()]);
+
+        assert!(locate_in_layout(&tree, "nope").is_none());
+    }
+
+    /// Only a split whose ratio actually drifted (beyond RATIO_EPSILON) is
+    /// reported, at the path `layout.set_split_ratio` expects (verified
+    /// against a live server: `false` = descend into `first`, `true` =
+    /// `second`, `path: []` = the root split). Descent stops the moment the
+    /// two trees' shapes disagree instead of guessing.
+    #[test]
+    fn ratio_corrections_finds_drifted_splits_by_path() {
+        // root split: remote resized 0.5 -> 0.3, no other change
+        let remote = split("right", 0.3, leaf("p1"), leaf("p2"));
+        let local = split("right", 0.5, leaf("p1"), leaf("p2"));
+        assert_eq!(ratio_corrections(&remote, &local), vec![(vec![], 0.3)]);
+
+        // in sync: no corrections
+        let local_synced = split("right", 0.3, leaf("p1"), leaf("p2"));
+        assert!(ratio_corrections(&remote, &local_synced).is_empty());
+
+        // sub-epsilon wobble is not a correction
+        let local_close = split("right", 0.301, leaf("p1"), leaf("p2"));
+        assert!(ratio_corrections(&remote, &local_close).is_empty());
+
+        // nested split drifted, root split in sync
+        let remote = split("right", 0.5, leaf("p1"), split("down", 0.7, leaf("p2"), leaf("p3")));
+        let local = split("right", 0.5, leaf("p1"), split("down", 0.4, leaf("p2"), leaf("p3")));
+        assert_eq!(ratio_corrections(&remote, &local), vec![(vec![true], 0.7)]);
+
+        // structural mismatch (local hasn't mirrored the nested split yet) —
+        // stop at the divergence, don't force a path that doesn't exist locally
+        let remote = split("right", 0.5, leaf("p1"), split("down", 0.7, leaf("p2"), leaf("p3")));
+        let local = split("right", 0.5, leaf("p1"), leaf("p2"));
+        assert!(ratio_corrections(&remote, &local).is_empty());
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
