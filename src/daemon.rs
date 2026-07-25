@@ -410,6 +410,10 @@ async fn local_events_task(
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
+            // resizing a mirror pane locally is an edit the remote should
+            // follow on a host we drive; the poke below is what gets it there
+            // promptly instead of on the next unrelated event
+            json!({ "type": "layout.updated" }),
         ];
         match local.subscribe(subs).await {
             Ok(mut stream) => {

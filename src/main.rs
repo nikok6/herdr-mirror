@@ -13,6 +13,7 @@ mod daemon;
 mod docker;
 mod foreground;
 mod grid;
+mod layout_sync;
 mod mirror;
 mod pane;
 mod predict;

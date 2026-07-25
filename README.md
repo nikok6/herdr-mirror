@@ -249,9 +249,6 @@ independently, exactly like multiple ssh hosts.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
-- **Layout geometry is copied, not linked**: pane content and typing are
-  always live — only sizes are a snapshot. Remote pane adds/removes reconcile,
-  but a split-ratio change at the remote doesn't resize an existing mirror.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real

@@ -75,6 +75,13 @@ pub struct HostState {
     /// so a remote that reconnects mid-restore doesn't mass-close mirrors.
     #[serde(default)]
     pub prev_remote_ids: std::collections::BTreeSet<String>,
+    /// last split ratio both sides agreed on, keyed `<remote tab id>|<path>`
+    /// (see layout_sync::path_key). This is the base of the three-way merge
+    /// that makes ratio sync two-way: without it a converge can see that the
+    /// two sides differ but not which one was resized, so it has to pick a
+    /// permanent winner and revert the other side's drag.
+    #[serde(default)]
+    pub ratios: BTreeMap<String, f64>,
 }
 
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
