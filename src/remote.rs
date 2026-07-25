@@ -104,6 +104,12 @@ pub struct RemoteHost {
     /// is in use. Same lifecycle reasoning as `relay` above, one level up
     /// the transport stack (ssh exec instead of `docker exec`).
     exec_relay: Option<crate::ssh_relay::RelayHandle>,
+    /// ssh hosts only: where the exec relay listens. Deliberately NOT
+    /// `fwd_sock`: sharing one path with the streamlocal forward makes the
+    /// relay's "is a healthy relay already serving this?" check answerable by
+    /// a live `-L` forward, which silently ignores `api_transport = "exec"`
+    /// and leaves the daemon believing it is on a relay it never started.
+    exec_sock: PathBuf,
     /// ssh hosts only: which transport to try first. Seeded from `cfg` at
     /// construction; `hint_transport` lets the daemon override it with what
     /// last worked, since a fresh `RemoteHost` is built on every reconnect
@@ -127,6 +133,7 @@ impl RemoteHost {
             container: None,
             relay: None,
             exec_relay: None,
+            exec_sock: state_dir.join(format!("{}-api-exec.sock", cfg.name)),
             last_api_transport: None,
             log: Logger::new(state_dir, false),
         }
@@ -321,10 +328,26 @@ impl RemoteHost {
     /// the first sign of trouble is the API layer's own connect/ping timing
     /// out or the channel closing with zero bytes read — which is exactly
     /// what `ApiClient::connect`'s ping round-trip surfaces.
-    async fn try_socket_transport(&mut self, remote_socket: &str) -> Result<PathBuf> {
+    ///
+    /// That ping is the client `connect_api` returns, not an extra probe on
+    /// top of it: a working host must not pay a round trip for a fallback it
+    /// never needs.
+    async fn try_socket_transport(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let sock = self.forward_api(remote_socket).await?;
-        ApiClient::connect(&sock).await?;
-        Ok(sock)
+        ApiClient::connect(&sock).await
+    }
+
+    /// Drop a forward that just proved itself dead, so it doesn't sit
+    /// registered on the ControlMaster for the connection's life with its
+    /// socket file unlinked. Unlike `forward_api`'s guard this cannot steal a
+    /// healthy forward: it only runs after a real ping failed.
+    async fn cancel_forward(&mut self, remote_socket: &str) {
+        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+        let mut args = self.base_args();
+        args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
+        let _ = ssh(&args, 15000).await;
+        let _ = std::fs::remove_file(&self.fwd_sock);
+        self.forwarded = false;
     }
 
     /// Bridge the remote socket over a plain ssh exec channel instead of a
@@ -335,16 +358,23 @@ impl RemoteHost {
         // NEVER steal a healthy relay — same reasoning as the docker guard:
         // the socket path is per-host but shared across processes (daemon,
         // `remote-*` actions, `once`), and state_dir is a single fixed path.
-        if self.exec_relay.is_none() && ApiClient::connect(&self.fwd_sock).await.is_ok() {
-            return Ok(self.fwd_sock.clone());
+        // `exec_sock` is the relay's OWN path, so a live streamlocal forward
+        // can't answer for it and quietly cancel the exec transport.
+        if self.exec_relay.is_none() && ApiClient::connect(&self.exec_sock).await.is_ok() {
+            return Ok(self.exec_sock.clone());
         }
         self.exec_relay = None;
         let relay_cmd = crate::ssh_relay::detect_relay_command(self, remote_socket).await?;
+        self.log.log(&format!(
+            "[{}] exec relay via {} → {remote_socket}",
+            self.cfg.name,
+            relay_cmd.tool()
+        ));
         let handle = crate::ssh_relay::serve_relay(
             self.ctl_path.clone(),
             self.cfg.target.clone(),
             relay_cmd,
-            self.fwd_sock.clone(),
+            self.exec_sock.clone(),
             self.log.clone(),
         )?;
         let path = handle.path.clone();
@@ -358,7 +388,11 @@ impl RemoteHost {
     /// (unless a prior connection in this daemon's lifetime already learned
     /// it doesn't work here — see `hint_transport`) and falls back to the
     /// exec relay on failure, logging the switch exactly once per fallback.
-    async fn connect_ssh_api(&mut self, remote_socket: &str) -> Result<PathBuf> {
+    ///
+    /// Returns a CONNECTED client rather than a path: the connect is the
+    /// probe, so the socket transport costs a working host exactly what it
+    /// cost before this fallback existed.
+    async fn connect_ssh_api(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let configured = self.cfg.api_transport;
         let start_with_socket =
             (if configured == ApiTransport::Auto { self.transport_hint } else { configured })
@@ -366,9 +400,9 @@ impl RemoteHost {
 
         if start_with_socket {
             match self.try_socket_transport(remote_socket).await {
-                Ok(sock) => {
+                Ok(api) => {
                     self.last_api_transport = Some(ApiTransport::Socket);
-                    return Ok(sock);
+                    return Ok(api);
                 }
                 // only auto may fall back; an explicit `socket` pin means the
                 // caller wants the real failure, not a silent transport swap
@@ -379,13 +413,16 @@ impl RemoteHost {
                         self.cfg.name
                     ));
                     self.transport_hint = ApiTransport::Exec;
+                    // it answered nothing; don't leave it registered
+                    self.cancel_forward(remote_socket).await;
                 }
             }
         }
 
         let sock = self.exec_relay_transport(remote_socket).await?;
+        let api = ApiClient::connect(&sock).await?;
         self.last_api_transport = Some(ApiTransport::Exec);
-        Ok(sock)
+        Ok(api)
     }
 
     pub async fn connect_api(&mut self) -> Result<(ApiClient, RemoteStatus)> {
@@ -401,8 +438,11 @@ impl RemoteHost {
         if !status.supported {
             return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
         }
-        let sock = match &self.container {
-            None => self.connect_ssh_api(&status.socket).await?,
+        // ssh hosts hand back a connected client (its ping doubles as the
+        // transport probe); the docker branch resolves a path and connects below
+        let container = self.container.clone();
+        let sock = match &container {
+            None => return Ok((self.connect_ssh_api(&status.socket).await?, status)),
             Some(c) => {
                 // NEVER steal a healthy relay — the socket path is per-HOST but
                 // shared across processes (daemon, `remote-*` actions, `once`),

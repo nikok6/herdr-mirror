@@ -153,6 +153,31 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
     need_converge
 }
 
+/// Which transport the next reconnect should try first.
+///
+/// A fallback to the exec relay is only remembered once it has happened twice
+/// running. The probe fails for transient reasons too (the remote herdr
+/// restarting, a mux hiccup, one slow ping), and remembering the first one
+/// pins a healthy host to the slower transport for the daemon's whole life
+/// with a single log line as the only clue. A genuinely broken host wastes one
+/// probe on the next reconnect and then sticks, which is what the memory is
+/// for.
+fn remember_transport(
+    last: Option<crate::config::ApiTransport>,
+    exec_streak: &mut u32,
+) -> Option<crate::config::ApiTransport> {
+    match last {
+        Some(crate::config::ApiTransport::Exec) => {
+            *exec_streak += 1;
+            (*exec_streak >= 2).then_some(crate::config::ApiTransport::Exec)
+        }
+        other => {
+            *exec_streak = 0;
+            other
+        }
+    }
+}
+
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
 /// until the connection drops (returns Err).
 async fn run_connected(
@@ -160,6 +185,7 @@ async fn run_connected(
     poke: &mut mpsc::Receiver<()>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
+    exec_streak: &mut u32,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -168,7 +194,7 @@ async fn run_connected(
     // for the life of the daemon
     remote_host.hint_transport(*remembered_transport);
     let (remote, _status) = remote_host.connect_api().await?;
-    *remembered_transport = remote_host.last_api_transport;
+    *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
@@ -272,8 +298,17 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     // persists across reconnects for the daemon's whole lifetime — the
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
+    let mut exec_streak = 0u32;
     loop {
-        let e = match run_connected(&ctx, &mut poke, &mut backoff_idx, &mut remembered_transport).await {
+        let e = match run_connected(
+            &ctx,
+            &mut poke,
+            &mut backoff_idx,
+            &mut remembered_transport,
+            &mut exec_streak,
+        )
+        .await
+        {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
@@ -747,6 +782,35 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One fallback is not evidence: the probe also fails when the remote herdr
+    /// is restarting or the mux hiccups, and pinning a healthy host to the
+    /// slower transport for the daemon's life is worse than re-probing once.
+    #[test]
+    fn a_single_fallback_is_not_remembered() {
+        use crate::config::ApiTransport;
+        let mut streak = 0u32;
+
+        // transient: fell back once, then the forward worked again
+        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
+        assert_eq!(streak, 0);
+
+        // genuinely broken: two in a row sticks, and stays stuck
+        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Exec), &mut streak),
+            Some(ApiTransport::Exec)
+        );
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Exec), &mut streak),
+            Some(ApiTransport::Exec)
+        );
+
+        // a later success clears it, so a fixed host returns to the forward
+        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
+        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+    }
 
     fn argv(parts: &[&str]) -> Vec<Value> {
         parts.iter().map(|s| json!(s)).collect()

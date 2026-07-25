@@ -44,7 +44,19 @@ use crate::util::{err, Logger, Result};
 /// already remembers the *transport* choice across reconnects for the same
 /// reason.
 #[derive(Debug, Clone)]
-pub struct RelayCommand(String);
+pub struct RelayCommand {
+    cmd: String,
+    /// which bridge this is, for the log line: "is it socat or the python
+    /// bridge" is the first question when a host misbehaves, and a short-lived
+    /// relay child is not something you can catch in `ps` after the fact.
+    tool: &'static str,
+}
+
+impl RelayCommand {
+    pub fn tool(&self) -> &'static str {
+        self.tool
+    }
+}
 
 /// Find a relay command the remote can run: socat if present (cheap, no
 /// runtime dependency beyond the binary itself), else a python3 fallback.
@@ -52,18 +64,23 @@ pub struct RelayCommand(String);
 pub async fn detect_relay_command(host: &RemoteHost, remote_sock: &str) -> Result<RelayCommand> {
     validate_socket_path(remote_sock)?;
     if !host.exec("command -v socat", 8000).await.unwrap_or_default().trim().is_empty() {
-        // socat's address grammar is not a plain path (`,` starts an option
-        // list, `!!` a dual address); validated above, same reasoning as the
-        // docker relay.
-        return Ok(RelayCommand(format!("socat - UNIX-CONNECT:{remote_sock}")));
+        return Ok(RelayCommand { cmd: socat_bridge_command(remote_sock), tool: "socat" });
     }
     if !host.exec("command -v python3", 8000).await.unwrap_or_default().trim().is_empty() {
-        return Ok(RelayCommand(python_bridge_command(remote_sock)));
+        return Ok(RelayCommand { cmd: python_bridge_command(remote_sock), tool: "python3" });
     }
     Err(err(
         "remote has neither socat nor python3, which one of is needed to reach herdr's \
          socket over an exec relay — install either",
     ))
+}
+
+/// socat's stdio↔unix form. Its address grammar is not a plain path (`,` starts
+/// an option list, `!!` a dual address), so the path is validated by
+/// `detect_relay_command` before it reaches here — same reasoning as the docker
+/// relay.
+fn socat_bridge_command(remote_sock: &str) -> String {
+    format!("socat - UNIX-CONNECT:{remote_sock}")
 }
 
 /// Minimal stdio↔`AF_UNIX` bridge for hosts without socat.
@@ -72,7 +89,9 @@ pub async fn detect_relay_command(host: &RemoteHost, remote_sock: &str) -> Resul
 /// those wrap a buffered, text-capable layer that both delays bytes (bad for
 /// a request/response protocol waiting on a prompt-less socket) and risks
 /// re-encoding on non-UTF8 bytes. Raw fd I/O is the only way to get
-/// unbuffered, binary-safe transfer in either direction.
+/// unbuffered, binary-safe transfer in either direction. `os.write` is looped
+/// rather than called once: it returns a count, and a short write (a signal
+/// landing mid-transfer) would silently drop the tail of a response.
 ///
 /// The two directions run as separate strands (a background thread for
 /// stdin→socket, the main thread for socket→stdout) so they proceed
@@ -116,7 +135,12 @@ while True:
         break
     if not b:
         break
-    os.write(1,b)
+    while b:
+        try:
+            n=os.write(1,b)
+        except OSError:
+            sys.exit(0)
+        b=b[n:]
 "#;
     let sock_b64 = B64.encode(remote_sock.as_bytes());
     format!("python3 -c '{BRIDGE}' '{sock_b64}'")
@@ -141,7 +165,7 @@ impl ExecTarget {
             "-o",
             "BatchMode=yes",
             &self.ssh_target,
-            &self.relay_cmd.0,
+            &self.relay_cmd.cmd,
         ]);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -307,10 +331,32 @@ async fn pump(target: &ExecTarget, stream: UnixStream, shutdown: watch::Receiver
 mod tests {
     use super::*;
 
+    /// The socat form is a cross-process contract with the remote's socat, and
+    /// the path must arrive whole: `UNIX-CONNECT:` takes the rest of the word
+    /// as the address.
     #[test]
     fn socat_command_uses_dash_stdio_form() {
-        let cmd = "socat - UNIX-CONNECT:/home/vscode/.config/herdr/herdr.sock";
-        assert!(cmd.starts_with("socat - UNIX-CONNECT:"));
+        let cmd = socat_bridge_command("/home/vscode/.config/herdr/herdr.sock");
+        assert_eq!(cmd, "socat - UNIX-CONNECT:/home/vscode/.config/herdr/herdr.sock");
+    }
+
+    /// A relay reports which bridge it is, so the log line can say so: catching
+    /// a per-request relay child in `ps` after the fact is not a diagnostic.
+    #[test]
+    fn relay_command_reports_its_tool() {
+        let socat = RelayCommand { cmd: socat_bridge_command("/tmp/x.sock"), tool: "socat" };
+        assert_eq!(socat.tool(), "socat");
+        let py = RelayCommand { cmd: python_bridge_command("/tmp/x.sock"), tool: "python3" };
+        assert_eq!(py.tool(), "python3");
+    }
+
+    /// The response half must be written in full. `os.write` returns a count,
+    /// so a single call can short-write and silently truncate a JSON response.
+    #[test]
+    fn python_bridge_loops_until_the_write_completes() {
+        let cmd = python_bridge_command("/tmp/x.sock");
+        assert!(cmd.contains("n=os.write(1,b)"), "{cmd}");
+        assert!(cmd.contains("b=b[n:]"), "expected the remainder to be re-written: {cmd}");
     }
 
     /// The socket path must never appear verbatim in the command line: it is
@@ -377,7 +423,8 @@ mod tests {
             .expect("ssh master spawn");
         assert!(start.success(), "ssh ControlMaster failed to start");
 
-        let relay_cmd = RelayCommand(python_bridge_command(&sock));
+        let relay_cmd =
+            RelayCommand { cmd: python_bridge_command(&sock), tool: "python3" };
         let handle = serve_relay(ctl_path.clone(), ssh_target.clone(), relay_cmd, local_sock.clone(), Logger::new(&dir, false))
             .unwrap();
 
