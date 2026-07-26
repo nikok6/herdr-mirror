@@ -221,6 +221,32 @@ fn map_node(node: &LayoutNode, cwd: &str) -> Value {
     }
 }
 
+/// Drop panes whose mirror the user closed (tombstoned) from an exported
+/// layout tree, collapsing a split left with one child. None means every pane
+/// in the tree is tombstoned — the whole tab's mirror was closed.
+fn prune_closed(node: &LayoutNode, panes: &BTreeMap<String, PaneEntry>) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Pane { pane_id, .. } => {
+            let closed = pane_id
+                .as_deref()
+                .and_then(|rid| panes.get(rid))
+                .is_some_and(|e| e.is_tombstoned());
+            (!closed).then(|| node.clone())
+        }
+        LayoutNode::Split { direction, ratio, first, second } => {
+            match (prune_closed(first, panes), prune_closed(second, panes)) {
+                (Some(f), Some(s)) => Some(LayoutNode::Split {
+                    direction: direction.clone(),
+                    ratio: *ratio,
+                    first: Box::new(f),
+                    second: Box::new(s),
+                }),
+                (one, two) => one.or(two),
+            }
+        }
+    }
+}
+
 /// Mark a local id the plugin itself is about to close, so the close event it
 /// raises isn't read back as the user closing the mirror (see closes.rs).
 fn mark_self_close(deps: &ConvergeDeps, local_id: &str) {
@@ -859,6 +885,19 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         let tab_exists = tab_entry.as_ref().is_some_and(|t| local_tab_ids.contains(t.local_id.as_str()));
         let remote_panes_in_tab: Vec<&PaneInfo> =
             remote_snap.panes.iter().filter(|p| p.tab_id == rtab.tab_id).collect();
+        // A tab whose mirror the user closed leaves only tombstoned pane
+        // entries behind (a TabEntry has no tombstone of its own — its stale
+        // local id just stops resolving). Rebuilding it would recreate panes
+        // the tombstones then forbid wiring up; skip before the layout.export
+        // round-trip. `restore` deletes the tombstones, which lifts this.
+        if !tab_exists
+            && !remote_panes_in_tab.is_empty()
+            && remote_panes_in_tab
+                .iter()
+                .all(|p| state.panes.get(&p.pane_id).is_some_and(|e| e.is_tombstoned()))
+        {
+            continue;
+        }
 
         if !tab_exists || remote_panes_in_tab.iter().any(|p| !state.panes.contains_key(&p.pane_id)) {
             #[derive(Deserialize)]
@@ -871,14 +910,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             }
             let exported: Exported =
                 deps.remote.request_t("layout.export", json!({ "tab_id": rtab.tab_id })).await?;
-            let mut remote_order = Vec::new();
-            walk_pane_ids(&exported.layout.root, &mut remote_order);
 
             if !tab_exists {
+                // apply only the non-tombstoned part of the tree: layout.apply
+                // creates a real local pane per leaf, so a tombstoned leaf
+                // would materialize as a titled dead shell in the marker cwd
+                // that the mapping loop below then can't wire a streamer into
+                let Some(live_root) = prune_closed(&exported.layout.root, &state.panes) else {
+                    continue;
+                };
+                let mut remote_order = Vec::new();
+                walk_pane_ids(&live_root, &mut remote_order);
                 // non-git cwd so herdr shows no (misleading) sidebar git status
                 // for the mirror; the pane exec's the streamer regardless
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
-                let root = map_node(&exported.layout.root, &cwd);
+                let root = map_node(&live_root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
                 let mut params = json!({ "tab_label": rtab.label, "root": root, "focus": false });
@@ -908,9 +954,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 walk_pane_ids(&applied.layout.root, &mut local_order);
                 for (i, rid) in remote_order.iter().enumerate() {
                     if rid.is_empty() || local_order.get(i).is_none_or(|l| l.is_empty()) {
-                        continue;
-                    }
-                    if state.panes.get(rid).is_some_and(|e| e.is_tombstoned()) {
                         continue;
                     }
                     let local_id = local_order[i].clone();
@@ -1393,6 +1436,46 @@ mod tests {
         assert_eq!(sibs, vec!["p2".to_string()]);
 
         assert!(locate_in_layout(&tree, "nope").is_none());
+    }
+
+    fn tombstoned(local_id: &str) -> PaneEntry {
+        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+    }
+
+    /// A locally-closed (tombstoned) pane must not survive into the tree a tab
+    /// rebuild applies: layout.apply creates a real local pane per leaf, and a
+    /// tombstoned one would be left as a dead shell no streamer ever claims.
+    #[test]
+    fn prune_closed_drops_tombstoned_panes_and_collapses_splits() {
+        let tree = split("right", 0.3, leaf("p1"), split("down", 0.4, leaf("p2"), leaf("p3")));
+
+        // untracked and live panes survive untouched
+        let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        panes.insert(
+            "p1".into(),
+            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+        );
+        let mut ids = Vec::new();
+        walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);
+        assert_eq!(ids, vec!["p1".to_string(), "p2".to_string(), "p3".to_string()]);
+
+        // a tombstoned leaf disappears and its split collapses to the sibling
+        panes.insert("p2".into(), tombstoned("l2"));
+        let pruned = prune_closed(&tree, &panes).unwrap();
+        let mut ids = Vec::new();
+        walk_pane_ids(&pruned, &mut ids);
+        assert_eq!(ids, vec!["p1".to_string(), "p3".to_string()]);
+        // the surviving outer split keeps its geometry
+        let LayoutNode::Split { direction, ratio, .. } = &pruned else {
+            panic!("outer split should survive");
+        };
+        assert_eq!(direction, "right");
+        assert_eq!(*ratio, 0.3);
+
+        // every pane tombstoned → None: the whole tab's mirror was closed
+        panes.insert("p1".into(), tombstoned("l1"));
+        panes.insert("p3".into(), tombstoned("l3"));
+        assert!(prune_closed(&tree, &panes).is_none());
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
