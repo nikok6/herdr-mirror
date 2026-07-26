@@ -95,6 +95,11 @@ same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
 
+**One key for both worlds** — `smart-tab` is `remote-new-tab` when invoked
+inside a mirror workspace and a plain local tab (cwd inherited, focused)
+anywhere else, so it can replace native `new_tab` outright: move `new_tab`
+off `prefix+c` and bind `prefix+c` to `mirror.smart-tab` (example below).
+
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar
@@ -144,6 +149,17 @@ command = "mirror.remote-new-tab"
 key = "prefix+alt+v"           # native split_vertical = prefix+v
 type = "plugin_action"
 command = "mirror.remote-split-right"
+
+# Or make prefix+c context-aware instead of learning the alt variant: move
+# native new_tab aside, then give its key to smart-tab. In a mirror workspace
+# it creates the tab on the remote; anywhere else it's a normal local tab.
+#[keys]
+#new_tab = "prefix+shift+c"
+#
+#[[keys.command]]
+#key = "prefix+c"
+#type = "plugin_action"
+#command = "mirror.smart-tab"
 
 [[keys.command]]
 key = "prefix+alt+minus"       # native split_horizontal = prefix+minus

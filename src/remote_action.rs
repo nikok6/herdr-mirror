@@ -6,12 +6,14 @@
 //   herdr-mirror remote-workspace           # new workspace on the context's host
 //   herdr-mirror remote-tab                 # new tab in the mirrored remote workspace
 //   herdr-mirror remote-split right|down    # split the mirrored remote pane
+//   herdr-mirror smart-tab                  # remote-tab inside a mirror, local tab elsewhere
 //
 // Resolution: the invocation context's local workspace/tab/pane ids are
 // reverse-looked-up in the per-host id maps. Inside a mirror, that pins both
 // the host and the remote object (and the remote pane's own cwd). Outside a
 // mirror, only `remote-workspace` works, targeting hosts.toml `default_host`
-// (else the first host declared).
+// (else the first host declared) — and `smart-tab`, which degrades to a plain
+// local tab so one key can replace native new_tab wholesale.
 //
 // These create REMOTE objects only; the daemon mirrors them back within a
 // couple of seconds. Local mirror objects stay daemon-owned.
@@ -57,17 +59,69 @@ fn resolve_context(env: &Env, hosts: &[HostConfig], ctx: &InvocationContext) -> 
     None
 }
 
+/// Invocation context from `HERDR_PLUGIN_CONTEXT_JSON` (plugin actions), with
+/// the `HERDR_ACTIVE_*` variables herdr hands to `[[keys.command]]` shell
+/// bindings as a fallback — so the actions work identically from either.
+fn invocation_context() -> InvocationContext {
+    let mut ctx: InvocationContext = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let env_id = |name: &str| std::env::var(name).ok().filter(|s| !s.is_empty());
+    if ctx.workspace_id.is_none() {
+        ctx.workspace_id = env_id("HERDR_ACTIVE_WORKSPACE_ID");
+    }
+    if ctx.focused_pane_id.is_none() {
+        ctx.focused_pane_id = env_id("HERDR_ACTIVE_PANE_ID");
+    }
+    ctx
+}
+
+/// The smart-tab fallback: a plain local tab in the invocation workspace,
+/// matching native new_tab (cwd inherited from the focused pane, focused).
+async fn local_tab(env: &Env, ctx: &InvocationContext) -> Result<()> {
+    let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+    // shell bindings carry the cwd directly; plugin actions don't, so fall
+    // back to the focused pane's cwd from the local snapshot
+    let mut cwd = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty());
+    if cwd.is_none() {
+        if let Some(pane_id) = &ctx.focused_pane_id {
+            let snap = fetch_snapshot(&api).await?;
+            cwd = snap
+                .panes
+                .iter()
+                .find(|p| &p.pane_id == pane_id)
+                .and_then(|p| p.foreground_cwd.clone().or_else(|| p.cwd.clone()));
+        }
+    }
+    let mut params = json!({ "cwd": cwd, "focus": true });
+    if let Some(ws) = &ctx.workspace_id {
+        params["workspace_id"] = json!(ws);
+    }
+    let res: Value = api.request("tab.create", params).await?;
+    println!(
+        "created local tab {}",
+        res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?")
+    );
+    Ok(())
+}
+
 pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     if kind == "split" && !matches!(direction, Some("right") | Some("down")) {
         return Err(err("remote-split needs a direction: right|down"));
     }
 
-    let ctx: InvocationContext = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let ctx = invocation_context();
     let config = load_config(&env.config_search)?;
     let resolved = resolve_context(&env, &config.hosts, &ctx);
+
+    // smart-tab: one key for both worlds. Inside a mirror workspace it is
+    // exactly remote-tab; anywhere else it degrades to a plain local tab
+    // instead of erroring, so it can replace native new_tab wholesale.
+    if kind == "smart-tab" && resolved.is_none() {
+        return local_tab(&env, &ctx).await;
+    }
+    let kind = if kind == "smart-tab" { "tab" } else { kind };
 
     if resolved.is_none() && kind != "workspace" {
         return Err(err(format!(
