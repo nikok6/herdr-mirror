@@ -5,7 +5,6 @@
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
-//   herdr-mirror smart-tab               # remote-tab in a mirror, local tab elsewhere
 
 mod api;
 mod closes;
@@ -82,14 +81,13 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         }
         "remote-workspace" => rt.block_on(remote_action::run(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run(Env::resolve()?, "tab", None)),
-        "smart-tab" => rt.block_on(remote_action::run(Env::resolve()?, "smart-tab", None)),
         "remote-split" => rt.block_on(remote_action::run(
             Env::resolve()?,
             "split",
             rest.get(1).map(String::as_str),
         )),
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|smart-tab)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split)"
         ))),
     }
 }

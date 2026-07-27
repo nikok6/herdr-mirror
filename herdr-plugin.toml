@@ -60,12 +60,6 @@ description = "Split the mirrored remote pane downward"
 command = ["./target/release/herdr-mirror", "remote-split", "down"]
 
 [[actions]]
-id = "smart-tab"
-title = "Mirror: smart new tab"
-description = "New tab on the remote when invoked inside a mirror workspace, else a plain local tab"
-command = ["./target/release/herdr-mirror", "smart-tab"]
-
-[[actions]]
 id = "restore"
 title = "Mirror: restore closed mirrors"
 description = "Bring back mirror workspaces/panes you closed locally"
