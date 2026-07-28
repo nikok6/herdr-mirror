@@ -301,6 +301,32 @@ Locally, name it in a sidebar row (`~/.config/herdr/config.toml`):
 rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 ```
 
+### `$branch`
+
+The daemon publishes one token of its own: `branch`, the remote workspace's git
+branch, resolved by the remote herdr — the only side that can see the repo. Each
+mirror row carries its own branch, so worktree workspaces show the branch they
+are actually on rather than the repo's default.
+
+Add it to the row herdr already renders the native branch on, so mirror rows sit
+exactly where local ones do (this is the default layout plus `$branch`):
+
+```toml
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["branch", "git_status", "$branch"]]
+```
+
+A local workspace fills `branch`, a mirror fills `$branch`, and an empty token is
+skipped — so every row shows exactly one of them. Both render in the sidebar's
+branch style, so the two are indistinguishable.
+
+Workspaces outside a git work tree carry no `branch`, and a workspace that leaves
+one has the token cleared rather than left stale. A lookup that merely *fails*
+clears nothing, so a dropped request can't blank a branch that is still valid. If
+the remote publishes a `branch` token itself, that value is forwarded untouched
+instead — herdr's token map is keyed by name across every source, so the remote's
+own intent wins.
+
 ## Limitations
 
 - **Version-locked to preview** until the `terminal session` streams reach
@@ -308,10 +334,12 @@ rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
-- **No git status on mirror rows** — herdr derives the sidebar git branch and
-  ahead/behind from the local workspace cwd, and there's no API to feed it a
-  remote repo's state, so mirror workspaces show no git chip. The remote's real
-  branch and status stay visible in the streamed pane's prompt.
+- **No native git chip on mirror rows** — herdr derives the sidebar git branch
+  and ahead/behind from the local workspace cwd, which for a mirror is a non-git
+  marker directory, and no API can feed it a remote repo's state. The branch is
+  available as the `$branch` token above; ahead/behind and dirty state are not,
+  since the remote doesn't expose them over the API. Both stay visible in the
+  streamed pane's prompt.
 - **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
   label prefix and the daemon keeps them ordered into per-host groups, but it
   can't render a richer affordance (group headers, collapse, colour).

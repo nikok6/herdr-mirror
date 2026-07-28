@@ -270,6 +270,130 @@ pub fn mirror_source(host_name: &str) -> String {
     format!("plugin:mirror:{host_name}")
 }
 
+/// Sidebar token carrying the remote workspace's git branch. herdr's token map
+/// is keyed by name across every source, so this is a name a remote plugin can
+/// also claim — and when it does, the remote's value wins (see section 3b).
+const BRANCH_TOKEN: &str = "branch";
+
+/// The remote workspace's current git branch, resolved by the REMOTE herdr —
+/// the only side that can see the repo.
+///
+/// `None` covers both "not in a git work tree" (herdr answers `not_git_worktree`,
+/// a fact about the workspace rather than a failure) and a remote too old to
+/// serve `worktree.list`; either way the mirror simply shows no branch.
+/// What a branch lookup actually established.
+///
+/// `Unavailable` is deliberately distinct from "no branch": clearing a good
+/// branch because one round-trip failed is worse than briefly keeping it, so
+/// only a definitive answer is allowed to touch the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchLookup {
+    Branch(String),
+    /// the remote answered, and this workspace has no branch to show — not in a
+    /// work tree, or on a detached HEAD
+    NoBranch,
+    Unavailable,
+}
+
+/// How many branch lookups may be in flight at once.
+///
+/// Each is a request on its own connection, which for an `exec` transport host
+/// is a separate multiplexed ssh session — and OpenSSH's `MaxSessions` defaults
+/// to 10, shared with the event subscription. Fanning out one per workspace
+/// would start failing on a host with enough mirrors, which (before the tri-state
+/// above) silently blanked branches that were perfectly valid.
+const BRANCH_FETCH_CONCURRENCY: usize = 4;
+
+/// Branches for many workspaces, a bounded few at a time.
+///
+/// `worktree.list` is a full round-trip, so doing every workspace in series adds
+/// one per mirrored workspace to EVERY converge pass — measured at ~130ms each.
+async fn remote_branches(
+    remote: &ApiClient,
+    remote_ws_ids: Vec<String>,
+) -> HashMap<String, BranchLookup> {
+    let mut out = HashMap::new();
+    for chunk in remote_ws_ids.chunks(BRANCH_FETCH_CONCURRENCY) {
+        let mut set = tokio::task::JoinSet::new();
+        for ws in chunk {
+            let remote = remote.clone();
+            let ws = ws.clone();
+            set.spawn(async move {
+                let branch = remote_branch(&remote, &ws).await;
+                (ws, branch)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            // a panicked fetch establishes nothing, so leave the token alone
+            if let Ok((ws, branch)) = joined {
+                out.insert(ws, branch);
+            }
+        }
+    }
+    out
+}
+
+async fn remote_branch(remote: &ApiClient, remote_ws_id: &str) -> BranchLookup {
+    match remote.request_t::<WorktreeList>("worktree.list", json!({ "workspace_id": remote_ws_id })).await
+    {
+        Ok(list) => match pick_branch(&list, remote_ws_id) {
+            Some(branch) => BranchLookup::Branch(branch),
+            None => BranchLookup::NoBranch,
+        },
+        Err(e) => classify_branch_error(&e.to_string()),
+    }
+}
+
+/// Tell "this workspace has no branch" apart from "we couldn't find out".
+///
+/// herdr refuses worktree actions outside a work tree, which is an answer about
+/// the workspace rather than a failed round-trip. Matched on the message because
+/// the api client surfaces text rather than the error code; a wording change
+/// upstream only ever costs a stale token, never a wrong one.
+fn classify_branch_error(message: &str) -> BranchLookup {
+    if message.contains("Git work tree") {
+        BranchLookup::NoBranch
+    } else {
+        BranchLookup::Unavailable
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorktreeEntry {
+    branch: Option<String>,
+    open_workspace_id: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorktreeListSource {
+    source_checkout_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorktreeList {
+    source: WorktreeListSource,
+    #[serde(default)]
+    worktrees: Vec<WorktreeEntry>,
+}
+
+/// Pick the branch belonging to `remote_ws_id` out of a `worktree.list`.
+///
+/// The list covers every checkout of the repo, so the workspace's own row has to
+/// be identified rather than assumed: prefer the checkout herdr has open as this
+/// workspace, and fall back to the one at the resolved source checkout path —
+/// which is what a plain, non-worktree repo workspace looks like. Picking the
+/// first entry would report a sibling worktree's branch.
+fn pick_branch(list: &WorktreeList, remote_ws_id: &str) -> Option<String> {
+    list.worktrees
+        .iter()
+        .find(|w| w.open_workspace_id.as_deref() == Some(remote_ws_id))
+        .or_else(|| {
+            list.worktrees.iter().find(|w| w.path == list.source.source_checkout_path)
+        })
+        .and_then(|w| w.branch.clone())
+}
+
 /// The server rejects custom_status longer than this.
 const CUSTOM_STATUS_MAX: usize = 32;
 
@@ -865,20 +989,62 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     // 3b. forward the remote's workspace tokens onto the mirror rows, so a mirror
     //     carries the same values a native workspace does under whatever layout is
     //     configured locally. Ignored by a pre-0.7.4 local server.
+    //
+    //     The remote's git branch rides along as a token too. herdr derives the
+    //     native branch chip from the LOCAL workspace cwd, which for a mirror is
+    //     the non-git marker dir, so the chip is blank by construction and no API
+    //     can fill it — but a token renders wherever the sidebar layout puts it,
+    //     which is the mechanism herdr points plugins at for exactly this.
     let source = mirror_source(&host.name);
+    let git_source = format!("{source}:git");
+    let live_mirror = |rws: &WsInfo| {
+        state
+            .workspaces
+            .get(&rws.workspace_id)
+            .is_some_and(|e| !e.is_tombstoned() && local_ws_ids.contains(&e.local_id))
+    };
+    // a `branch` the remote publishes itself is the remote's intent; only derive
+    // one for the rows that left the key free
+    let branch_targets: Vec<String> = remote_snap
+        .workspaces
+        .iter()
+        .filter(|rws| !rws.tokens.contains_key(BRANCH_TOKEN) && live_mirror(rws))
+        .map(|rws| rws.workspace_id.clone())
+        .collect();
+    let branches = remote_branches(&deps.remote, branch_targets).await;
+
     for rws in &remote_snap.workspaces {
-        if rws.tokens.is_empty() {
-            continue; // nothing to forward (also the pre-0.7.4 remote case)
-        }
         let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
+        if !rws.tokens.is_empty() {
+            let _ = deps
+                .local
+                .request(
+                    "workspace.report_metadata",
+                    json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
+                )
+                .await;
+        }
+        // Its own request under its own source, NOT appended to the forwarded
+        // tokens: report_metadata accepts at most 16 tokens while a workspace may
+        // carry 32, so folding it in would push a remote that already publishes
+        // 16 over the cap and get the whole payload rejected — losing every
+        // forwarded token, not just the branch.
+        let tokens = match branches.get(&rws.workspace_id) {
+            Some(BranchLookup::Branch(b)) => json!({ BRANCH_TOKEN: b }),
+            // null clears: a workspace that left its work tree must not keep
+            // showing the branch it had when it was still in one
+            Some(BranchLookup::NoBranch) => json!({ BRANCH_TOKEN: Value::Null }),
+            // nothing established — leave whatever is already there
+            Some(BranchLookup::Unavailable) | None => continue,
+        };
         let _ = deps
             .local
             .request(
                 "workspace.report_metadata",
-                json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
+                json!({ "workspace_id": entry.local_id, "source": git_source, "tokens": tokens }),
             )
             .await;
     }
@@ -1769,6 +1935,93 @@ mod tests {
 
     fn ranked(items: &[(&str, usize)]) -> Vec<(String, usize)> {
         items.iter().map(|(s, r)| (s.to_string(), *r)).collect()
+    }
+
+    // --- remote branch token ---
+    //
+    // Payloads are trimmed copies of real `worktree.list` responses from a
+    // 0.7.5 remote, so a shape change upstream shows up as a test failure.
+
+    fn worktree_list(json: &str) -> WorktreeList {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A worktree group: the branch must be the workspace's OWN checkout, not
+    /// whichever sibling worktree happens to come first.
+    #[test]
+    fn branch_comes_from_the_workspaces_own_checkout() {
+        let list = worktree_list(
+            r#"{"source":{"repo_key":"/r/.git","repo_name":"jb","repo_root":"/r",
+                "source_checkout_path":"/r","source_workspace_id":"wJ"},
+                "worktrees":[
+                 {"branch":"dev","is_linked_worktree":false,"open_workspace_id":"wJ","path":"/r"},
+                 {"branch":"ticket/17","is_linked_worktree":true,"open_workspace_id":"wK","path":"/wt/17"},
+                 {"branch":"ticket/168","is_linked_worktree":true,"open_workspace_id":"wP","path":"/wt/168"}]}"#,
+        );
+        assert_eq!(pick_branch(&list, "wJ").as_deref(), Some("dev"));
+        assert_eq!(pick_branch(&list, "wK").as_deref(), Some("ticket/17"));
+        assert_eq!(pick_branch(&list, "wP").as_deref(), Some("ticket/168"));
+    }
+
+    /// A plain repo workspace: one checkout, and herdr may not have associated
+    /// it with the workspace at all — the source checkout path carries it.
+    #[test]
+    fn branch_falls_back_to_the_source_checkout_path() {
+        let list = worktree_list(
+            r#"{"source":{"repo_key":"/acm/.git","repo_name":"acm","repo_root":"/acm",
+                "source_checkout_path":"/acm","source_workspace_id":"w9"},
+                "worktrees":[
+                 {"branch":"main","is_linked_worktree":false,"open_workspace_id":null,"path":"/acm"}]}"#,
+        );
+        assert_eq!(pick_branch(&list, "w9").as_deref(), Some("main"));
+    }
+
+    /// A detached HEAD has no branch, and must not fall through to a sibling's.
+    #[test]
+    fn a_detached_checkout_reports_no_branch() {
+        let list = worktree_list(
+            r#"{"source":{"repo_key":"/r/.git","repo_name":"r","repo_root":"/r",
+                "source_checkout_path":"/r","source_workspace_id":"wA"},
+                "worktrees":[
+                 {"branch":null,"is_detached":true,"open_workspace_id":"wA","path":"/r"},
+                 {"branch":"main","is_linked_worktree":true,"open_workspace_id":"wB","path":"/wt/x"}]}"#,
+        );
+        assert_eq!(pick_branch(&list, "wA"), None);
+    }
+
+    /// The distinction that keeps a failed round-trip from blanking a good
+    /// branch: only a definitive answer may clear the token. The `not_git_worktree`
+    /// text is herdr 0.7.5's verbatim message.
+    #[test]
+    fn only_a_definitive_answer_clears_the_branch() {
+        assert_eq!(
+            classify_branch_error(
+                "worktree.list: Herdr worktree actions require a workspace inside a Git work tree"
+            ),
+            BranchLookup::NoBranch
+        );
+        for transport in [
+            "worktree.list: api connect timeout: /tmp/herdr.sock",
+            "api closed before response: worktree.list",
+            "worktree.list: unknown method",
+        ] {
+            assert_eq!(
+                classify_branch_error(transport),
+                BranchLookup::Unavailable,
+                "a failed round-trip must not clear a valid branch: {transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_workspace_matches_nothing() {
+        let list = worktree_list(
+            r#"{"source":{"repo_key":"/r/.git","repo_name":"r","repo_root":"/r",
+                "source_checkout_path":"/elsewhere","source_workspace_id":"wA"},
+                "worktrees":[
+                 {"branch":"main","open_workspace_id":"wA","path":"/r"}]}"#,
+        );
+        assert_eq!(pick_branch(&list, "wZ"), None);
     }
 
     #[test]
