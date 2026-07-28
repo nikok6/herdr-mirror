@@ -255,6 +255,14 @@ fn mark_self_close(deps: &ConvergeDeps, local_id: &str) {
     }
 }
 
+/// A remote rename is reflected through the local API and raises a local
+/// `tab_renamed` event. Mark it first so that echo is not pushed back upstream.
+fn mark_self_rename(deps: &ConvergeDeps, local_id: &str) {
+    if let Ok(mut t) = deps.renames.lock() {
+        t.mark_self_rename(local_id);
+    }
+}
+
 fn map_status(remote: &str) -> &'static str {
     match remote {
         "working" => "working",
@@ -332,6 +340,8 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// local tab renames initiated while reflecting remote state
+    pub renames: crate::renames::Renames,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -1067,6 +1077,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             let tab_local = &tab_entry.as_ref().unwrap().local_id;
             let local_tab = local_snap.tabs.iter().find(|t| &t.tab_id == tab_local);
             if local_tab.is_some_and(|t| t.label != rtab.label) {
+                mark_self_rename(deps, tab_local);
                 let _ = deps
                     .local
                     .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
