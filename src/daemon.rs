@@ -70,13 +70,6 @@ struct HostCtx {
     log: Logger,
     close_remote_on_local_close: bool,
     closes: crate::closes::Closes,
-    renames: crate::renames::Renames,
-}
-
-#[derive(Debug)]
-struct RemoteTabRename {
-    remote_id: String,
-    label: String,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -194,7 +187,6 @@ fn remember_transport(
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
-    tab_renames: &mut mpsc::UnboundedReceiver<RemoteTabRename>,
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
@@ -216,17 +208,11 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
-        renames: ctx.renames.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
-    // A rename can arrive while this host is disconnected. Apply queued user
-    // intent before converge gets a chance to restore the old remote label.
-    while let Ok(rename) = tab_renames.try_recv() {
-        push_remote_tab_rename(ctx, &remote, rename).await;
-    }
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
@@ -240,10 +226,6 @@ async fn run_connected(
     loop {
         let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
         tokio::select! {
-            biased;
-            Some(rename) = tab_renames.recv() => {
-                push_remote_tab_rename(ctx, &remote, rename).await;
-            }
             ev = stream.next() => {
                 match ev {
                     None => return Err(err("event stream closed")),
@@ -314,11 +296,7 @@ async fn run_connected(
 const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
 const DORMANT_DELAY: u64 = 300;
 
-async fn host_task(
-    ctx: HostCtx,
-    mut poke: mpsc::Receiver<()>,
-    mut tab_renames: mpsc::UnboundedReceiver<RemoteTabRename>,
-) {
+async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut backoff_idx = 0usize;
     let mut was_dormant = false;
     // persists across reconnects for the daemon's whole lifetime — the
@@ -329,7 +307,6 @@ async fn host_task(
         let e = match run_connected(
             &ctx,
             &mut poke,
-            &mut tab_renames,
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
@@ -366,18 +343,6 @@ async fn host_task(
         tokio::time::sleep(Duration::from_secs(delay)).await;
         // drain stale pokes accumulated while down (reconnect converges anyway)
         while poke.try_recv().is_ok() {}
-    }
-}
-
-async fn push_remote_tab_rename(ctx: &HostCtx, remote: &ApiClient, rename: RemoteTabRename) {
-    if let Err(e) = remote
-        .request("tab.rename", json!({ "tab_id": &rename.remote_id, "label": &rename.label }))
-        .await
-    {
-        ctx.log.log(&format!(
-            "[{}] remote tab rename failed for {}: {e}",
-            ctx.host.name, rename.remote_id
-        ));
     }
 }
 
@@ -474,24 +439,25 @@ async fn heal_zombie_mirrors(
     }
 }
 
-// Local events: mirror closes drive tombstoning and mirror tab renames are sent
-// to their owning host task.
+// Local events: mirror closes drive tombstoning — poke every host so the
+/// next converge records the user's intent promptly.
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
-    tab_renamers: Vec<mpsc::UnboundedSender<RemoteTabRename>>,
     prefixes: Vec<String>,
     hosts: Vec<HostConfig>,
     state_dir: PathBuf,
     log: Logger,
     closes: crate::closes::Closes,
-    renames: crate::renames::Renames,
 ) {
     loop {
         let subs = vec![
             json!({ "type": "workspace.created" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
+            // renaming a mirror tab locally is intent for the remote tab, which
+            // converge resolves against the label it last stamped; without this
+            // the rename is never noticed and the next converge reverts it
             json!({ "type": "tab.renamed" }),
             // resizing a mirror pane locally is an edit the remote should
             // follow on a host we drive; the poke below is what gets it there
@@ -507,37 +473,6 @@ async fn local_events_task(
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 heal_zombie_mirrors(&local, &state_dir, &hosts, &pokers, &log).await;
                 while let Some(e) = stream.next().await {
-                    if e.event == "tab_renamed" {
-                        let local_id = e.data.get("tab_id").and_then(|v| v.as_str());
-                        let label = e.data.get("label").and_then(|v| v.as_str());
-                        if let (Some(local_id), Some(label)) = (local_id, label) {
-                            let user_rename = renames
-                                .lock()
-                                .map(|mut tracker| tracker.note_rename_event(local_id))
-                                .unwrap_or(false);
-                            if user_rename {
-                                for (i, host) in hosts.iter().enumerate() {
-                                    let state = load_state(&state_dir, &host.name);
-                                    let remote_id = state
-                                        .tabs
-                                        .iter()
-                                        .find(|(_, entry)| entry.local_id == local_id)
-                                        .map(|(remote_id, _)| remote_id.clone());
-                                    if let Some(remote_id) = remote_id {
-                                        let _ = tab_renamers[i].send(RemoteTabRename {
-                                            remote_id,
-                                            label: label.to_string(),
-                                        });
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // This event is either our swallowed echo or has its own
-                        // targeted remote action. A generic converge could race
-                        // that action and restore the old label first.
-                        continue;
-                    }
                     // A close EVENT is the authoritative "the user closed this";
                     // snapshot absence is not (rebuild/restart/failed converge).
                     // Our own closes are marked beforehand and swallowed here.
@@ -591,15 +526,11 @@ pub async fn cmd_run(env: Env) -> Result<()> {
 
     let local = ApiClient::connect(&env.local_socket).await?;
     let closes = crate::closes::new_closes();
-    let renames = crate::renames::new_renames();
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
-    let mut tab_renamers: Vec<mpsc::UnboundedSender<RemoteTabRename>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for h in &config.hosts {
         let (tx, rx) = mpsc::channel(8);
-        let (rename_tx, rename_rx) = mpsc::unbounded_channel();
         pokers.push(tx);
-        tab_renamers.push(rename_tx);
         let ctx = HostCtx {
             env_state_dir: env.state_dir.clone(),
             host: h.clone(),
@@ -607,21 +538,18 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
             closes: closes.clone(),
-            renames: renames.clone(),
         };
-        tasks.push(tokio::spawn(host_task(ctx, rx, rename_rx)));
+        tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
         local.clone(),
         pokers.clone(),
-        tab_renamers,
         prefixes,
         config.hosts.clone(),
         env.state_dir.clone(),
         log.clone(),
         closes.clone(),
-        renames,
     )));
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -795,7 +723,6 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
-            renames: crate::renames::new_renames(),
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));

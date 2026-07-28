@@ -19,7 +19,6 @@ mod pane;
 mod predict;
 mod remote;
 mod remote_action;
-mod renames;
 mod ssh_relay;
 mod state;
 mod util;

@@ -60,6 +60,10 @@ impl WsEntry {
 #[serde(rename_all = "camelCase")]
 pub struct TabEntry {
     pub local_id: String,
+    /// remote label as of the last converge, exactly as on `WsEntry`: it is
+    /// what tells "remote renamed" apart from "user renamed the mirror tab"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_remote_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,6 +127,9 @@ mod tests {
         assert_eq!(state.workspaces["w9"].local_id, "w1234");
         assert_eq!(state.workspaces["w9"].root_tab_local_id.as_deref(), Some("t99"));
         assert!(state.workspaces["wB"].is_tombstoned());
+        // a tab mapped before label history existed loads with none, which the
+        // resolver reads as "remote wins once"
+        assert_eq!(state.tabs["w9:t1"].last_remote_label, None);
         assert_eq!(state.panes["w9:p1"].seq, 12);
         assert_eq!(state.panes["w9:p1"].reported.as_deref(), Some("claude"));
         assert!(state.panes["wB:p1"].is_tombstoned());
