@@ -133,19 +133,30 @@ impl Grid {
     }
 }
 
-/// CSI: ESC [ <params: 0-9;:?> <final: alpha>. Returns (params, final, char len).
+/// CSI (ECMA-48): ESC [ <params 0x30-0x3F> <intermediates 0x20-0x2F> <final
+/// 0x40-0x7E>. Returns (params, final, char len).
+///
+/// Intermediates and the non-alphabetic finals matter even though no sequence
+/// using them touches the grid: an unrecognized sequence is *skipped*, while an
+/// unparsed one falls through to the two-byte ESC skip in `apply` and prints its
+/// own tail as text. That is where `CSI 2 SP q` (DECSCUSR, set cursor style —
+/// emitted by every TUI that picks a cursor shape) lands in the pane as a
+/// literal `2 q`.
 fn parse_csi(chars: &[char]) -> Option<(String, char, usize)> {
     if chars.len() < 3 || chars[0] != '\x1b' || chars[1] != '[' {
         return None;
     }
     let mut params = String::new();
+    let mut in_intermediates = false;
     for (idx, &c) in chars.iter().enumerate().skip(2).take(62) {
-        if c.is_ascii_digit() || c == ';' || c == ':' || c == '?' {
-            params.push(c);
-        } else if c.is_ascii_alphabetic() {
-            return Some((params, c, idx + 1));
-        } else {
-            return None;
+        match c {
+            // parameter bytes: digits and ;:?<=>, but only before intermediates
+            '\u{30}'..='\u{3f}' if !in_intermediates => params.push(c),
+            // intermediate bytes: space, !, ", #, $, …
+            '\u{20}'..='\u{2f}' => in_intermediates = true,
+            // final byte: alphabetic plus @[\]^_`{|}~
+            '\u{40}'..='\u{7e}' => return Some((params, c, idx + 1)),
+            _ => return None,
         }
     }
     None
@@ -265,6 +276,36 @@ mod tests {
         assert_eq!((g.cursor_row, g.cursor_col), (1, 0));
         assert!(g.cursor_visible);
         assert_eq!(&*g.rows[2][1].as_ref().unwrap().sgr, "\x1b[31m");
+    }
+
+    #[test]
+    fn cursor_style_does_not_print_itself() {
+        // DECSCUSR: ESC [ 2 SP q. The space is an intermediate byte, so a
+        // params-only parser bails and `apply` prints the "2 q" tail into the
+        // grid — the stray characters seen in mirrored agent prompts.
+        let mut g = Grid::new();
+        g.resize(10, 2);
+        g.apply("\x1b[1;1H\x1b[2 qhi");
+        assert_eq!(g.text_lines(), vec!["hi", ""]);
+    }
+
+    #[test]
+    fn non_alphabetic_finals_are_consumed() {
+        // @ and ~ are legal CSI finals; unparsed, they print their params too
+        let mut g = Grid::new();
+        g.resize(10, 2);
+        g.apply("\x1b[1;1H\x1b[3~\x1b[2@ok");
+        assert_eq!(g.text_lines(), vec!["ok", ""]);
+    }
+
+    #[test]
+    fn csi_parsing_shape() {
+        // params stop at the first intermediate; the final is reported
+        assert_eq!(parse_csi(&"\x1b[2 q".chars().collect::<Vec<_>>()), Some(("2".into(), 'q', 5)));
+        assert_eq!(parse_csi(&"\x1b[?25h".chars().collect::<Vec<_>>()), Some(("?25".into(), 'h', 6)));
+        assert_eq!(parse_csi(&"\x1b[1;31m".chars().collect::<Vec<_>>()), Some(("1;31".into(), 'm', 7)));
+        // C1 and other non-CSI bytes are still rejected
+        assert_eq!(parse_csi(&"\x1b[1;\x07m".chars().collect::<Vec<_>>()), None);
     }
 
     #[test]
