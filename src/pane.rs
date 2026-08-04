@@ -459,6 +459,19 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 
+/// Remote pane id is gone for good (user typed `exit`, remote closed the pane,
+/// etc). Reconnecting forever only spams the status line; the daemon reaps the
+/// local mirror on the next converge / `pane.closed`.
+fn is_target_gone(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    // herdr: "terminal session observe failed: terminal target w4:p1 not found"
+    r.contains("not found")
+        || r.contains("no such pane")
+        || r.contains("unknown pane")
+        || r.contains("unknown target")
+        || r.contains("does not exist")
+}
+
 struct App {
     args: Args,
     tty: bool,
@@ -475,6 +488,9 @@ struct App {
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
+    /// remote pane id disappeared — do not schedule reconnect until the user
+    /// types (which clears this and retries once)
+    target_gone: bool,
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
@@ -664,11 +680,21 @@ impl App {
                     },
                 );
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_target_gone(&msg) {
+                    self.mark_target_gone(&msg);
+                } else {
+                    self.schedule_reconnect(m, &msg);
+                }
+            }
         }
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
+        if self.target_gone {
+            return;
+        }
         let delay = BACKOFF[self.backoff_idx.min(BACKOFF.len() - 1)];
         self.backoff_idx += 1;
         let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
@@ -676,6 +702,22 @@ impl App {
             .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
+    }
+
+    /// Remote pane is gone: freeze the last frame, stop the reconnect loop, and
+    /// wait for the daemon to close this local mirror (or for a keystroke retry).
+    fn mark_target_gone(&mut self, reason: &str) {
+        self.target_gone = true;
+        self.reconnect_at = None;
+        self.switching_to = None;
+        self.switch_at = None;
+        self.control_failures = 0;
+        self.pending_input.clear();
+        let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
+        self.renderer.status(&format!(
+            "remote terminal gone{suffix} — close this pane, or type to retry"
+        ));
+        self.paint();
     }
 
     fn switch_mode(&mut self, m: Mode) {
@@ -743,6 +785,14 @@ impl App {
         self.session = None;
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        // Pane deleted on the remote (`exit`, workspace/pane close, reap).
+        // Do this before the control→observe fallback: otherwise two quick
+        // control failures switch to observe, which also fails with "not found"
+        // and the status line spins forever ("reconnecting in 10s … not found").
+        if is_target_gone(&reason_line) {
+            self.mark_target_gone(&reason_line);
+            return;
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
@@ -784,6 +834,8 @@ impl App {
             }
             // any keystroke takes control and is delivered once the session is up
             self.control_sticky = false;
+            // allow one more attach attempt after a "target gone" freeze
+            self.target_gone = false;
             self.pending_input.push(buf);
             self.switch_mode(Mode::Control);
             return;
@@ -908,6 +960,7 @@ pub async fn run(args: Args) -> Result<()> {
         next_gen: 0,
         backoff_idx: 0,
         reconnect_at: None,
+        target_gone: false,
         control_failures: 0,
         control_sticky: false,
         pending_input: Vec::new(),
@@ -1058,6 +1111,18 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_gone_detects_herdr_not_found_errors() {
+        assert!(is_target_gone(
+            "terminal session observe failed: terminal target w4:p1 not found"
+        ));
+        assert!(is_target_gone("terminal target w4:p1 not found"));
+        assert!(is_target_gone("No such pane"));
+        assert!(!is_target_gone("api timeout: session.snapshot"));
+        assert!(!is_target_gone("ssh timeout"));
+        assert!(!is_target_gone(""));
+    }
 
     #[test]
     fn wheel_always_semantic_scroll_even_on_tui_foreground() {
