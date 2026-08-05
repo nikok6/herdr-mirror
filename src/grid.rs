@@ -244,6 +244,15 @@ impl Renderer {
             let is_status_row = r == out_rows - 1 && !self.status_text.is_empty();
             let painted = if is_status_row {
                 format!("\x1b[0;7m {} \x1b[0m\x1b[K", self.status_text)
+            } else if limit >= out_cols {
+                // A row painted to the full width leaves the cursor IN the last
+                // column with the terminal's deferred-wrap flag set — it has not
+                // moved to the next line yet. EL erases from the cursor, so it
+                // would wipe the cell just written, costing one character on
+                // every full-width row (i.e. every wrapped line). Nothing needs
+                // clearing anyway: the loop paints all `limit` columns, blank
+                // cells included.
+                format!("{line}\x1b[0m")
             } else {
                 format!("{line}\x1b[0m\x1b[K")
             };
@@ -360,6 +369,33 @@ mod tests {
         let mut r = Renderer::new();
         let out = r.paint(&g, 10, 1);
         assert!(!out.contains('b'), "stale spacer cell survived: {out:?}");
+    }
+
+    #[test]
+    fn a_full_width_row_is_not_erased_by_its_own_el() {
+        // EL after filling the last column erases the cell just written: the
+        // cursor is still IN that column with the deferred-wrap flag set, so
+        // "erase to end of line" starts there. Cost was one character on every
+        // row long enough to wrap — a wrapped line lost the char at the break.
+        let mut g = Grid::new();
+        g.resize(5, 1);
+        g.apply("\x1b[1;1Habcde");
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 5, 1);
+        assert!(out.contains("abcde"), "got: {out:?}");
+        assert!(!out.contains("abcde\x1b[0m\x1b[K"), "EL would erase the 'e': {out:?}");
+    }
+
+    #[test]
+    fn a_short_row_still_clears_its_tail() {
+        // the other half: when the remote is narrower than the local pane the
+        // gutter must still be cleared, or stale content survives to the right
+        let mut g = Grid::new();
+        g.resize(3, 1);
+        g.apply("\x1b[1;1Hab");
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 10, 1);
+        assert!(out.contains("\x1b[K"), "narrow grid must still emit EL: {out:?}");
     }
 
     #[test]
