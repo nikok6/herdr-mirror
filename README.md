@@ -100,6 +100,18 @@ action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
 errors rather than splitting locally, which would desync the mirrored layout.
 
+**Invoke any remote plugin** — keys you bind locally are consumed by the local
+herdr before a mirror pane ever sees them, so a plugin installed on the remote
+can't be driven by typing its bindings into a mirror. `remote-invoke
+<plugin>.<action>` bridges that: inside a mirror it runs the action on the
+mirrored host via `plugin.action.invoke`, handing it the *remote* workspace,
+pane, and cwd behind your focused mirror pane; outside a mirror it invokes the
+same action on the local herdr, so one key covers both worlds here too. The
+plugin must be installed on whichever end the action runs, and the remote
+herdr must be new enough to have `plugin.action.invoke`. Layout changes the
+action makes mirror back like any other remote change (UI it opens — popups,
+notifications — renders on the remote's session, not yours).
+
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar
@@ -160,6 +172,20 @@ Outside a mirror, `remote-new-workspace` targets `default_host` and the others
 act locally. The remaining actions — `mirror.status`, `mirror.once`,
 `mirror.ensure` — are lifecycle/diagnostic and are usually run from the CLI
 rather than bound.
+
+`remote-invoke` takes the action to forward as an argument, which plugin
+actions can't carry — bind it as a `shell` command instead (the `HERDR_ACTIVE_*`
+variables herdr hands shell bindings give it the same invocation context).
+Put the `herdr-mirror` binary somewhere stable on PATH, e.g.
+`ln -s ~/.config/herdr/plugins/github/mirror-*/target/release/herdr-mirror ~/.local/bin/`
+(or your checkout's `target/release` for a linked dev install):
+
+```toml
+[[keys.command]]
+key = "prefix+alt+e"
+type = "shell"
+command = "herdr-mirror remote-invoke lilexe.some-action"
+```
 
 **If you live in mirrors, drop the alt variants.** Since these fall back to the
 native behaviour anyway, hand them the native keys and keep one set of muscle

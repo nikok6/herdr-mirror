@@ -5,6 +5,7 @@
 //   herdr-mirror pane <host> <target>   # data plane: one per mirror pane
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
+//   herdr-mirror remote-invoke <plugin>.<action>
 
 mod api;
 mod closes;
@@ -86,8 +87,14 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             "split",
             rest.get(1).map(String::as_str),
         )),
+        "remote-invoke" => {
+            let spec = rest
+                .get(1)
+                .ok_or_else(|| util::err("usage: herdr-mirror remote-invoke <plugin>.<action>"))?;
+            rt.block_on(remote_action::invoke(Env::resolve()?, spec))
+        }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split|remote-invoke)"
         ))),
     }
 }

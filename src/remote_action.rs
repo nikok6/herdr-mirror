@@ -6,6 +6,7 @@
 //   herdr-mirror remote-workspace           # new workspace on the context's host
 //   herdr-mirror remote-tab                 # new tab in the mirrored remote workspace
 //   herdr-mirror remote-split right|down    # split the mirrored remote pane
+//   herdr-mirror remote-invoke <plugin>.<action>  # invoke a plugin action on the remote
 //
 // Resolution: the invocation context's local workspace/tab/pane ids are
 // reverse-looked-up in the per-host id maps. Inside a mirror, that pins both
@@ -24,6 +25,16 @@
 //
 // Anything created inside a mirror is a REMOTE object; the daemon mirrors it
 // back within a couple of seconds. Local mirror objects stay daemon-owned.
+//
+// `remote-invoke` generalizes the trio to plugins the local herdr can't see:
+// keys bound locally never reach a mirror pane's stdin, so a remote plugin's
+// bindings are unreachable by typing. Instead, bind a local key to
+// `remote-invoke <plugin>.<action>` and it calls `plugin.action.invoke` on the
+// mirrored host with the invocation context translated to the REMOTE ids.
+// Outside a mirror it invokes the same action on the local herdr — the same
+// one-key-for-both-worlds degrade as remote-tab/split. The action runs on
+// whichever end is chosen, so the plugin must be installed there; anything it
+// does to the remote layout mirrors back like any other remote change.
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -140,6 +151,89 @@ async fn local_split(env: &Env, ctx: &InvocationContext, direction: &str) -> Res
         ctx.focused_pane_id.as_deref().unwrap_or("focused"),
         res.pointer("/pane/pane_id").and_then(|v| v.as_str()).unwrap_or("?")
     );
+    Ok(())
+}
+
+/// Context for the local-invoke fallback: the plugin-action JSON verbatim when
+/// present (full fidelity — cwd, tab, selection all pass through), else the
+/// `HERDR_ACTIVE_*` fields a shell binding gets.
+fn local_context_value(ctx: &InvocationContext) -> Value {
+    if let Some(v) = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object)
+    {
+        return v;
+    }
+    let mut out = json!({});
+    if let Some(ws) = &ctx.workspace_id {
+        out["workspace_id"] = json!(ws);
+    }
+    if let Some(pane) = &ctx.focused_pane_id {
+        out["focused_pane_id"] = json!(pane);
+    }
+    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty()) {
+        out["focused_pane_cwd"] = json!(cwd);
+    }
+    out
+}
+
+/// `remote-invoke <plugin>.<action>`: run a plugin action on the mirrored
+/// host, with the invocation context translated to the remote ids. Outside a
+/// mirror the action is invoked on the local herdr instead. A bare action id
+/// (no dot) is passed without a plugin_id for the server to resolve.
+pub async fn invoke(env: Env, spec: &str) -> Result<()> {
+    let (plugin_id, action_id) = match spec.split_once('.') {
+        Some((p, a)) if !p.is_empty() && !a.is_empty() => (Some(p), a),
+        Some(_) => return Err(err(format!("bad action spec {spec:?}: want <plugin>.<action>"))),
+        None => (None, spec),
+    };
+
+    let ctx = invocation_context();
+    // Same deliberate non-`?` as run(): the local fallback needs no host config.
+    let config = load_config(&env.config_search);
+    let resolved = config.as_ref().ok().and_then(|c| resolve_context(&env, &c.hosts, &ctx));
+
+    let Some(resolved) = resolved else {
+        let api = crate::api::ApiClient::connect(&env.local_socket).await?;
+        let mut params = json!({ "action_id": action_id, "context": local_context_value(&ctx) });
+        if let Some(p) = plugin_id {
+            params["plugin_id"] = json!(p);
+        }
+        api.request("plugin.action.invoke", params).await?;
+        println!("invoked {spec} locally");
+        return Ok(());
+    };
+
+    let mut remote = RemoteHost::new(&resolved.host, &env.state_dir);
+    let (api, _status) = remote.connect_api().await?;
+
+    // the remote action sees the REMOTE objects behind the invoking mirror,
+    // including the real cwd of the pane it will act on
+    let mut context = json!({ "invocation_source": "mirror" });
+    if let Some(ws) = &resolved.remote_ws_id {
+        context["workspace_id"] = json!(ws);
+    }
+    if let Some(pane_id) = &resolved.remote_pane_id {
+        context["focused_pane_id"] = json!(pane_id);
+        let snap = fetch_snapshot(&api).await?;
+        if let Some(pane) = snap.panes.iter().find(|p| &p.pane_id == pane_id) {
+            if let Some(cwd) = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()) {
+                context["focused_pane_cwd"] = json!(cwd);
+            }
+        }
+    }
+    let mut params = json!({ "action_id": action_id, "context": context });
+    if let Some(p) = plugin_id {
+        params["plugin_id"] = json!(p);
+    }
+    api.request("plugin.action.invoke", params).await.map_err(|e| {
+        err(format!(
+            "remote invoke {spec} on {}: {e} (needs the plugin installed there, and a herdr with plugin.action.invoke)",
+            resolved.host.name
+        ))
+    })?;
+    println!("invoked {spec} on {}", resolved.host.name);
     Ok(())
 }
 
