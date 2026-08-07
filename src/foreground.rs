@@ -46,14 +46,14 @@ pub fn classify(json: &str) -> Option<bool> {
 /// on any failure (ssh/network/parse) so the caller keeps its last known value.
 pub async fn poll(
     ssh_target: &str,
-    remote_bin: &str,
+    remote_bin: Option<&str>,
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
 ) -> Option<bool> {
-    // remote_bin stays unquoted for remote-shell ~ expansion, matching the
-    // observe session's command construction
-    let cmd = format!("exec {} pane process-info --pane {}", remote_bin, sh_quote(pane));
+    // same expression as the observe session (configured path or PATH auto)
+    let bin = crate::config::remote_bin_expr(remote_bin);
+    let cmd = format!("exec {} pane process-info --pane {}", bin, sh_quote(pane));
     let mut sc = match container {
         Some(ct) => {
             // async resolve, not the blocking one: this runs on the pane's

@@ -7,7 +7,7 @@
 //   herdr-mirror pane <ssh-target> <pane-target> [options]
 //
 // options:
-//   --remote-bin PATH   remote herdr binary (default ~/.local/bin/herdr)
+//   --remote-bin PATH   remote herdr binary (default: PATH, then ~/.local/bin/herdr)
 //   --cols N --rows N   observe request size (default 240x72; must be >= the
 //                       remote PTY size or the server clips bottom rows away)
 //   --dump              headless mode: print plain-text screen per frame
@@ -48,7 +48,9 @@ use crate::predict::Predictor;
 pub struct Args {
     pub ssh_target: String,
     pub pane_target: String,
-    pub remote_bin: String,
+    /// Configured remote herdr path. `None` = auto-resolve on the remote
+    /// (PATH, then `~/.local/bin/herdr`). See `config::remote_bin_expr`.
+    pub remote_bin: Option<String>,
     pub cols: usize,
     pub rows: usize,
     pub dump: bool,
@@ -81,7 +83,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     let mut args = Args {
         ssh_target: String::new(),
         pane_target: String::new(),
-        remote_bin: "~/.local/bin/herdr".into(),
+        remote_bin: None,
         cols: 240,
         rows: 72,
         dump: false,
@@ -102,7 +104,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             it.next().cloned().ok_or_else(|| err(format!("{flag} needs a value")))
         };
         match a.as_str() {
-            "--remote-bin" => args.remote_bin = next("--remote-bin")?,
+            "--remote-bin" => args.remote_bin = Some(next("--remote-bin")?),
             "--cols" => {
                 args.cols = next("--cols")?.parse().map_err(|_| err("--cols must be a number"))?;
                 args.size_fixed = true;
@@ -203,11 +205,12 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         .as_ref()
         .map(|s| format!(" --session {}", sh_quote(s)))
         .unwrap_or_default();
-    // remote_bin stays unquoted on purpose: the default ~/.local/bin/herdr
-    // relies on remote-shell tilde expansion
+    // Configured paths stay unquoted so remote-shell ~ expands; auto mode is a
+    // command-substitution expression (see config::remote_bin_expr).
+    let bin = crate::config::remote_bin_expr(args.remote_bin.as_deref());
     let cmd = format!(
         "exec {}{} terminal session {} {} --cols {} --rows {}",
-        args.remote_bin,
+        bin,
         session_flag,
         mode.as_str(),
         sh_quote(&args.pane_target),
@@ -555,8 +558,14 @@ impl App {
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
         tokio::spawn(async move {
-            let v =
-                crate::foreground::poll(&ssh, &bin, &pane, ctl.as_deref(), container.as_ref()).await;
+            let v = crate::foreground::poll(
+                &ssh,
+                bin.as_deref(),
+                &pane,
+                ctl.as_deref(),
+                container.as_ref(),
+            )
+            .await;
             let _ = tx.send(Msg::Foreground(v)).await;
         });
     }
@@ -1107,7 +1116,7 @@ mod tests {
         let a = parse_args(&argv).unwrap();
         assert_eq!(a.ssh_target, "work");
         assert_eq!(a.pane_target, "w9:p1");
-        assert_eq!(a.remote_bin, "/opt/herdr");
+        assert_eq!(a.remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!((a.cols, a.rows), (176, 66));
         assert!(a.size_fixed);
         assert!(parse_args(&["onlyone".to_string()]).is_err());

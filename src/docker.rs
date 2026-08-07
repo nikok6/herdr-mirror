@@ -180,7 +180,8 @@ impl Container {
     /// never sources `/etc/profile*`. Matching that matters because the output
     /// is parsed as JSON — an image whose profile prints a welcome banner would
     /// otherwise make every connect fail with "expected value at line 1
-    /// column 1". Tilde expansion in `remote_bin` works either way.
+    /// column 1". Tilde expansion and `command -v` in `remote_bin_expr` work
+    /// either way.
     pub async fn exec(&self, command: &str, timeout_ms: u64) -> Result<String> {
         let fut = Command::new(&self.docker_bin)
             .args(["exec", &self.id, "sh", "-c", command])

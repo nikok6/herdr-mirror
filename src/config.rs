@@ -7,6 +7,18 @@ use serde::Deserialize;
 
 use crate::util::{err, Result};
 
+/// Shell expression for `exec <expr> ...` on the remote.
+///
+/// A configured path is used as-is (unquoted so remote-shell `~` expands).
+/// When unset, the remote shell resolves `herdr` via PATH, falling back to
+/// `~/.local/bin/herdr` if `command -v` finds nothing.
+pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
+    match remote_bin {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)".into(),
+    }
+}
+
 /// How to reach a host. `Ssh` is the default and the only kind that existed
 /// before container support; every existing hosts.toml parses to it.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,7 +78,9 @@ pub struct HostConfig {
     pub kind: HostKind,
     pub docker_bin: String,
     pub prefix: String,
-    pub remote_bin: String,
+    /// Remote herdr binary. `None` = auto-resolve on the remote: PATH first
+    /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_bin_expr`.
+    pub remote_bin: Option<String>,
     /// ssh hosts only; see `ApiTransport`. Default `Auto`.
     pub api_transport: ApiTransport,
     /// keep each mirror pane in control (writable, no idle release, and sized to
@@ -247,7 +261,8 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         };
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
-            remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
+            // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
+            remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
@@ -299,7 +314,7 @@ mod tests {
         let h = &c.hosts[0];
         assert_eq!(h.name, "work");
         assert_eq!(h.prefix, "work");
-        assert_eq!(h.remote_bin, "~/.local/bin/herdr");
+        assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert!(h.always_control); // default on
     }
 
@@ -331,6 +346,7 @@ mod tests {
         assert_eq!(c.poll_seconds, 30);
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.hosts[0].prefix, "v");
+        assert_eq!(c.hosts[0].remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!(c.default_host().unwrap().name, "vps");
     }
 
@@ -362,7 +378,21 @@ mod tests {
         let c = parse_config("[hosts.work]\ntarget = \"work\"\n").unwrap();
         assert_eq!(c.hosts[0].kind, HostKind::Ssh);
         assert_eq!(c.hosts[0].target, "work");
-        assert_eq!(c.hosts[0].remote_bin, "~/.local/bin/herdr");
+        assert_eq!(c.hosts[0].remote_bin, None);
+    }
+
+    #[test]
+    fn remote_bin_expr_configured_vs_auto() {
+        assert_eq!(remote_bin_expr(Some("/opt/herdr")), "/opt/herdr");
+        assert_eq!(remote_bin_expr(Some("~/.local/bin/herdr")), "~/.local/bin/herdr");
+        assert_eq!(
+            remote_bin_expr(None),
+            "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)"
+        );
+        assert_eq!(
+            remote_bin_expr(Some("")),
+            "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)"
+        );
     }
 
     #[test]

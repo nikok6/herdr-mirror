@@ -367,9 +367,12 @@ pub(crate) fn cmd_for_pane(
             "pane".into(),
             target.clone(),
             pane_id.to_string(),
-            "--remote-bin".into(),
-            remote_bin.clone(),
         ];
+        // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
+        // defaults to the same resolution so the argv stays short
+        if let Some(bin) = &remote_bin {
+            argv.extend(["--remote-bin".into(), bin.clone()]);
+        }
         if always_control {
             argv.push("--always-control".into());
         }
@@ -1460,7 +1463,7 @@ mod tests {
             kind: crate::config::HostKind::Ssh,
             docker_bin: "docker".into(),
             prefix: "vps".into(),
-            remote_bin: "~/.local/bin/herdr".into(),
+            remote_bin: None,
             always_control: true,
             api_transport: crate::config::ApiTransport::Auto,
         }
@@ -1557,8 +1560,7 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
-                "--remote-bin",
-                "~/.local/bin/herdr",
+                // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
@@ -1566,6 +1568,29 @@ mod tests {
         );
         // argv[0] is the resolved exe path, which varies by install
         assert!(argv[0].ends_with("herdr-mirror") || argv[0].contains("herdr_mirror"), "{}", argv[0]);
+    }
+
+    /// When remote_bin is set, it must appear on the argv (cross-process contract
+    /// with the pane parser) rather than being re-resolved by the streamer.
+    #[test]
+    fn ssh_pane_argv_carries_explicit_remote_bin() {
+        let mut host = ssh_host();
+        host.remote_bin = Some("/opt/herdr".into());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--remote-bin",
+                "/opt/herdr",
+                "--always-control",
+                "--ctl-path",
+                "/state/vps.ctl",
+            ]
+        );
     }
 
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
@@ -1585,8 +1610,6 @@ mod tests {
                 "pane",
                 "/Users/n/proj",
                 "w1:p1",
-                "--remote-bin",
-                "~/.local/bin/herdr",
                 "--always-control",
                 // no identity token at all: healing asks herdr per pane
                 "--container-folder",
@@ -1629,7 +1652,7 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--remote-bin", "~/.local/bin/herdr", "--ctl-path", "/state/vps.ctl"]
+            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
         );
     }
 
