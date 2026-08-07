@@ -11,11 +11,14 @@ use crate::util::{err, Result};
 ///
 /// A configured path is used as-is (unquoted so remote-shell `~` expands).
 /// When unset, the remote shell resolves `herdr` via PATH, falling back to
-/// `~/.local/bin/herdr` if `command -v` finds nothing.
+/// `~/.local/bin/herdr` if `command -v` finds nothing. The auto form is
+/// double-quoted so a path with spaces (PATH entry or `$HOME`) stays one word.
 pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
     match remote_bin {
         Some(b) if !b.is_empty() => b.to_string(),
-        _ => "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)".into(),
+        // Quotes around the substitution prevent word-splitting if the resolved
+        // path contains spaces; ~ still expands inside the unquoted `echo` arg.
+        _ => "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\"".into(),
     }
 }
 
@@ -387,11 +390,11 @@ mod tests {
         assert_eq!(remote_bin_expr(Some("~/.local/bin/herdr")), "~/.local/bin/herdr");
         assert_eq!(
             remote_bin_expr(None),
-            "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)"
+            "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
         );
         assert_eq!(
             remote_bin_expr(Some("")),
-            "$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)"
+            "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
         );
     }
 
