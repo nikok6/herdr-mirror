@@ -462,6 +462,11 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 
+/// herdr: "terminal session … failed: terminal target w4:p1 not found"
+fn is_target_gone(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("not found")
+}
+
 struct App {
     args: Args,
     tty: bool,
@@ -673,7 +678,14 @@ impl App {
                     },
                 );
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(e) => {
+                let msg = e.to_string();
+                if is_target_gone(&msg) {
+                    self.freeze_gone(&msg);
+                } else {
+                    self.schedule_reconnect(m, &msg);
+                }
+            }
         }
     }
 
@@ -685,6 +697,13 @@ impl App {
             .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
+    }
+
+    /// Dead remote pane: stop reconnect; keystroke already re-enters control.
+    fn freeze_gone(&mut self, reason: &str) {
+        self.reconnect_at = None;
+        self.renderer.status(&format!("remote terminal gone — {reason}"));
+        self.paint();
     }
 
     fn switch_mode(&mut self, m: Mode) {
@@ -752,6 +771,11 @@ impl App {
         self.session = None;
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        // before control→observe: dead pane must not reconnect
+        if is_target_gone(&reason_line) {
+            self.freeze_gone(&reason_line);
+            return;
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
@@ -1067,6 +1091,15 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_gone_detects_herdr_not_found() {
+        assert!(is_target_gone(
+            "terminal session observe failed: terminal target w4:p1 not found"
+        ));
+        assert!(!is_target_gone("api timeout: session.snapshot"));
+        assert!(!is_target_gone("ssh timeout"));
+    }
 
     #[test]
     fn wheel_always_semantic_scroll_even_on_tui_foreground() {
