@@ -18,7 +18,7 @@ pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
         Some(b) if !b.is_empty() => b.to_string(),
         // Quotes around the substitution prevent word-splitting if the resolved
         // path contains spaces; ~ still expands inside the unquoted `echo` arg.
-        _ => "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\"".into(),
+        _ => "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\"".into(),
     }
 }
 
@@ -390,11 +390,11 @@ mod tests {
         assert_eq!(remote_bin_expr(Some("~/.local/bin/herdr")), "~/.local/bin/herdr");
         assert_eq!(
             remote_bin_expr(None),
-            "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
+            "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
         );
         assert_eq!(
             remote_bin_expr(Some("")),
-            "\"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
+            "env \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\""
         );
     }
 
