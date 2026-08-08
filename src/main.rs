@@ -20,6 +20,7 @@ mod grid;
 mod layout_sync;
 mod mirror;
 mod pane;
+mod paste;
 mod predict;
 mod remote;
 mod remote_action;

@@ -236,6 +236,24 @@ the file already binds, and reloads herdr, so the key is live immediately;
 `unbind` removes only blocks that `bind` wrote. `remote-actions` also prints a
 paste-ready binding block.
 
+### Image paste
+
+herdr's native image paste (`remote_image_paste`, ctrl+v) only exists in
+`herdr --remote` — a mirror pane is attached to your *local* server, and the
+stream driving the remote carries no image message. Mirror panes close that
+gap themselves: press **ctrl+v** in a mirror pane and, if the local clipboard
+holds an image, it is uploaded over the pane's own transport (ssh, reusing the
+daemon's ControlMaster; or docker exec) to `~/.cache/herdr-mirror/pastes/` on
+the remote, and the resulting absolute path is pasted as bracketed text — an
+agent over there (claude, codex, …) reads the image from that path.
+
+When the clipboard has no image, the ctrl+v is forwarded unchanged (vim's
+visual-block and shell quoted-insert keep working); the only cost is the
+clipboard probe's latency on that one keystroke. Reading the clipboard uses
+`pngpaste` if installed, else AppleScript on macOS; `wl-paste` or `xclip` on
+Linux. Uploads are never cleaned up automatically — they're small, but
+`rm -rf ~/.cache/herdr-mirror/pastes` on the remote is always safe.
+
 ### Mouse
 
 Mirror panes adapt to what's running on the remote pane:

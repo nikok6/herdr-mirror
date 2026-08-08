@@ -185,6 +185,7 @@ enum Msg {
     /// result of a background foreground-process poll: Some(true)=shell,
     /// Some(false)=TUI, None=poll failed (keep last value)
     Foreground(Option<bool>),
+    Paste(crate::paste::Outcome),
 }
 
 struct Session {
@@ -503,6 +504,7 @@ struct App {
     /// whether the local pane is currently in application cursor mode (?1h), held
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
+    paste_inflight: bool,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -777,6 +779,20 @@ impl App {
     }
 
     async fn handle_stdin(&mut self, buf: Vec<u8>) {
+        if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+            self.paste_inflight = true;
+            let tx = self.tx.clone();
+            let ssh = self.args.ssh_target.clone();
+            let ctl = self.args.ctl_path.clone();
+            let container = self.args.container.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    crate::paste::clipboard_to_remote(&ssh, ctl.as_deref(), container.as_ref())
+                        .await;
+                let _ = tx.send(Msg::Paste(outcome)).await;
+            });
+            return;
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -868,6 +884,38 @@ impl App {
             }
         }
     }
+
+    async fn deliver_input(&mut self, buf: Vec<u8>) {
+        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
+            self.control_sticky = false;
+            self.pending_input.push(buf);
+            self.switch_mode(Mode::Control);
+            return;
+        }
+        self.last_input = Instant::now();
+        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
+            self.pending_input.push(buf);
+            if let Some((_, m)) = self.reconnect_at {
+                self.reconnect_at = Some((Instant::now(), m));
+            }
+            return;
+        }
+        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
+    }
+
+    async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
+        self.paste_inflight = false;
+        match outcome {
+            crate::paste::Outcome::NoImage => self.deliver_input(vec![0x16]).await,
+            crate::paste::Outcome::Pasted(path) => {
+                self.deliver_input(crate::paste::bracketed(&path)).await;
+                self.hint(&format!("image → {path}"));
+            }
+            crate::paste::Outcome::Failed(e) => {
+                self.hint(&format!("image paste failed: {e}"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -955,6 +1003,7 @@ pub async fn run(args: Args) -> Result<()> {
         // startup leaves the pane in normal cursor mode; the first classification
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
+        paste_inflight: false,
     };
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
@@ -1013,6 +1062,7 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
+                    Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
                 }
             }
             _ = sigwinch.recv() => {
