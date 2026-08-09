@@ -175,6 +175,7 @@ struct Frame {
     width: Option<usize>,
     height: Option<usize>,
     bytes: Option<String>,
+    data: Option<String>,
     reason: Option<String>,
 }
 
@@ -375,6 +376,11 @@ fn write_stdout(s: &str) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes());
     let _ = out.flush();
+}
+
+fn clipboard_osc52(data: Option<&str>) -> Option<String> {
+    let decoded = B64.decode(data?).ok()?;
+    Some(format!("\x1b]52;c;{}\x07", B64.encode(decoded)))
 }
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
@@ -713,6 +719,12 @@ impl App {
             let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             self.renderer.status(&format!("remote terminal closed{suffix}"));
             self.paint();
+            return;
+        }
+        if frame.kind == "terminal.clipboard" {
+            if let Some(sequence) = clipboard_osc52(frame.data.as_deref()) {
+                write_stdout(&sequence);
+            }
             return;
         }
         if frame.kind != "terminal.frame" {
@@ -1092,6 +1104,20 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_frame_becomes_osc52() {
+        assert_eq!(
+            clipboard_osc52(Some("cmVtb3RlIHRleHQ=")),
+            Some("\x1b]52;c;cmVtb3RlIHRleHQ=\x07".to_string())
+        );
+    }
+
+    #[test]
+    fn invalid_clipboard_frame_is_ignored() {
+        assert_eq!(clipboard_osc52(Some("not base64")), None);
+        assert_eq!(clipboard_osc52(None), None);
+    }
 
     #[test]
     fn wheel_always_semantic_scroll_even_on_tui_foreground() {
