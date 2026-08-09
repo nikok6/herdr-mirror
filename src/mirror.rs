@@ -346,7 +346,7 @@ pub struct ConvergeDeps {
 /// known size get no --cols/--rows (the wrapper falls back to a default).
 pub(crate) fn cmd_for_pane(
     host: &HostConfig,
-    state_dir: &std::path::Path,
+    _state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
 ) -> impl Fn(&str) -> Vec<String> {
     let exe = std::env::current_exe()
@@ -357,9 +357,6 @@ pub(crate) fn cmd_for_pane(
     let always_control = host.always_control;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
-    // daemon's ControlMaster socket for this host (see remote.rs); the streamer
-    // reuses it for cheap foreground polls
-    let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -376,14 +373,10 @@ pub(crate) fn cmd_for_pane(
         if always_control {
             argv.push("--always-control".into());
         }
-        // ssh only: the pane reuses the daemon's ControlMaster for cheap
-        // foreground polls. Docker has no ControlMaster, and healing no longer
-        // needs a host-identity token in the argv at all — it asks herdr what
+        // Healing needs no host-identity token in the argv: it asks herdr what
         // is running in each pane instead (see daemon::has_live_streamer).
         match &kind {
-            crate::config::HostKind::Ssh => {
-                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
-            }
+            crate::config::HostKind::Ssh => {}
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
@@ -1584,16 +1577,8 @@ mod tests {
     }
 
     /// Characterization test: the ssh pane argv is a cross-process contract.
-    ///
-    /// The daemon spawns `herdr-mirror pane ...` as a separate process, and
-    /// `count_streamers` (daemon.rs) identifies a host's live streamers by
-    /// string-matching `--ctl-path` in that argv. Nothing else pins the shape,
-    /// so a change here silently breaks mirror healing on upgrade: streamers
-    /// started by the old binary carry the old argv, the new daemon fails to
-    /// match them, concludes they died, and re-execs over live panes.
-    ///
-    /// If this test fails, that is the question to answer — not a prompt to
-    /// update the expected value.
+    /// Healing identifies the wrapper from argv[0] and the `pane` subcommand,
+    /// so no host-specific process-polling flag is needed.
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
@@ -1607,8 +1592,6 @@ mod tests {
                 "w1:p1",
                 // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
                 "--always-control",
-                "--ctl-path",
-                "/state/vps.ctl",
             ]
         );
         // argv[0] is the resolved exe path, which varies by install
@@ -1632,8 +1615,6 @@ mod tests {
                 "--remote-bin",
                 "/opt/herdr",
                 "--always-control",
-                "--ctl-path",
-                "/state/vps.ctl",
             ]
         );
     }
@@ -1681,24 +1662,19 @@ mod tests {
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
-        assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
         let ct = parsed.container.expect("container must survive the argv round trip");
         assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));
         assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
     }
 
-    /// always_control is the only conditional flag; its absence must not
-    /// disturb the position of --ctl-path.
+    /// A watch-only SSH pane needs no extra host-specific flags.
     #[test]
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
         host.always_control = false;
         let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
         let argv = cmd("w1:p1");
-        assert_eq!(
-            argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
-        );
+        assert_eq!(argv[1..], ["pane", "vps", "w1:p1"]);
     }
 
     #[test]

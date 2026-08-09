@@ -27,6 +27,9 @@ A remote can be another machine over **ssh**, or a **container** on this one
 
 - **Both ends**: herdr with the `terminal session` streams — preview build
   `2026-06-30` or newer (`herdr channel set preview`), until the next stable.
+- **Native mouse routing**: a herdr build whose terminal-session stream emits
+  `terminal.state` and accepts `terminal.mouse`. Older builds stay usable for
+  local selection, but mouse-aware remote apps need this capability.
 - **Local machine**: macOS or Linux on x86_64/aarch64 — install fetches the
   prebuilt binary from Releases (dev installs via `herdr plugin link` build
   from source with `cargo build --release`).
@@ -77,7 +80,9 @@ If you've disabled autostart, start the daemon yourself by keybinding the
 (a vps, a server) with no window of their own: it keeps each mirror pane
 writable and sized to your local pane, so the headless remote fills it instead
 of showing a tiny default-sized window. Type and your keystrokes go to the
-remote, tmux-style; the mouse wheel scrolls remote scrollback.
+remote, tmux-style; the mouse wheel scrolls remote scrollback. Because the
+wrapper must capture the wheel in control mode, it also owns text selection:
+drag normally to highlight the visible remote text and copy it on release.
 
 **Watch-only** — for a machine with its own display or a human sitting at it,
 set `always_control = false` (globally or per host). Its mirrors become
@@ -240,14 +245,17 @@ paste-ready binding block.
 
 Mirror panes adapt to what's running on the remote pane:
 
-- at a **shell**, the mouse stays local — drag-select and copy work natively, and
-  nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+- when the remote terminal reports **mouse input off**, drag-select and copy stay
+  local, and clicks never leak into the prompt or app;
+- when it reports **cell-based mouse input on**, clicks and drags reach the app as
+  structured mouse events;
+- wheel input is always sent semantically so the remote Herdr runtime can choose
+  app input or scrollback using its real terminal state.
 
-herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
-from the remote pane's foreground process — anything that isn't a known shell is
-treated as a mouse-aware TUI. Detection is polled, so after switching between a
-shell and a TUI there's a brief lag before the mouse mode catches up.
+This uses Herdr's terminal-session state, not process-name detection. If the
+remote Herdr is too old to report that state, the mirror selects locally and
+shows an update message instead of guessing. Pixel-coordinate mouse mode also
+stays local because mirror panes currently receive cell coordinates.
 
 ## Configuration
 
@@ -354,6 +362,13 @@ rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
+- **Selection covers the rendered grid**, not hidden remote scrollback. Scroll
+  the wanted text into view first. Streamed frames also lack soft-wrap metadata,
+  so a selection crossing visual rows copies a newline between those rows. If
+  the selected characters repaint during a drag, the selection is cancelled
+  instead of silently copying different text.
+- **No remote scrollbar yet**: wheel scrolling reaches the source pane, but the
+  streamed view does not currently draw the source pane's scroll position.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real

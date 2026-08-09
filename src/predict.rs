@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn forwarded_mouse_report_is_not_predicted() {
         let (mut p, g) = confident();
-        // remote foreground is a TUI, so pane.rs forwards SGR mouse bytes raw
+        // Pane input decoding keeps SGR mouse reports out of predictive echo.
         p.on_input(b"\x1b[<0;33;15M", &g); // click
         p.on_input(b"\x1b[<64;33;15M", &g); // wheel up
         p.on_input(b"\x1b[<65;33;15M", &g); // wheel down
