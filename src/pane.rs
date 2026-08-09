@@ -428,6 +428,8 @@ enum MouseAction {
 fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
     if press && (btn == 64 || btn == 65) {
         MouseAction::Scroll { up: btn == 64 }
+    } else if btn == 66 || btn == 67 {
+        MouseAction::Drop
     } else if remote_is_shell == Some(false) {
         MouseAction::ForwardRaw
     } else {
