@@ -252,16 +252,47 @@ fn create_fifo(path: &Path) {
 }
 
 fn inject_frame(path: &Path, seq: u64, ansi: &str, timeout: Duration) {
+    inject_sized_frame(path, seq, false, 100, 40, ansi, timeout);
+}
+
+fn inject_sized_frame(
+    path: &Path,
+    seq: u64,
+    full: bool,
+    width: usize,
+    height: usize,
+    ansi: &str,
+    timeout: Duration,
+) {
     let frame = serde_json::json!({
         "type": "terminal.frame",
         "seq": seq,
-        "full": false,
-        "width": 100,
-        "height": 40,
+        "full": full,
+        "width": width,
+        "height": height,
         "bytes": B64.encode(ansi.as_bytes()),
     })
     .to_string();
     inject_line(path, &frame, timeout);
+}
+
+fn terminal_state_line(alternate_screen: bool, scroll: Option<(u64, u64, u64)>) -> String {
+    let mut state = serde_json::json!({
+        "type": "terminal.state",
+        "mouse_reporting": false,
+        "mouse_pixel_reporting": false,
+        "mouse_any_motion": false,
+        "alternate_screen": alternate_screen,
+        "application_cursor": false,
+    });
+    if let Some((offset_from_bottom, max_offset_from_bottom, viewport_rows)) = scroll {
+        state["scroll"] = serde_json::json!({
+            "offset_from_bottom": offset_from_bottom,
+            "max_offset_from_bottom": max_offset_from_bottom,
+            "viewport_rows": viewport_rows,
+        });
+    }
+    state.to_string()
 }
 
 fn inject_line(path: &Path, line: &str, timeout: Duration) {
@@ -315,6 +346,16 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn captured_resize_sizes(path: &Path) -> Vec<(u64, u64)> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value.get("type").and_then(|kind| kind.as_str()) == Some("terminal.resize"))
+        .filter_map(|value| Some((value.get("cols")?.as_u64()?, value.get("rows")?.as_u64()?)))
+        .collect()
 }
 
 fn assert_remote_state_applied_before_mouse(initial: &[u8]) {
@@ -399,16 +440,16 @@ fn controlled_local_mouse_state_routes_wheel_and_copies_drag_selection() {
         wait_for_file_occurrences(&capture, "terminal.scroll", 2, Duration::from_secs(5));
     assert!(captured.contains(r#""modifiers":1"#), "{captured}");
 
-    // Core deserializes semantic coordinates as u16. An absurd but valid SGR
-    // report must clamp instead of making the complete scroll command invalid.
+    // An absurd but valid SGR report clamps to the primary-screen source
+    // viewport, never into the reserved scrollbar column or beyond its rows.
     master
         .write_all(b"\x1b[<64;4294967295;4294967295M")
         .unwrap();
     master.flush().unwrap();
     let captured =
         wait_for_file_occurrences(&capture, "terminal.scroll", 3, Duration::from_secs(5));
-    assert!(captured.contains(r#""column":65535"#), "{captured}");
-    assert!(captured.contains(r#""row":65535"#), "{captured}");
+    assert!(captured.contains(r#""column":98"#), "{captured}");
+    assert!(captured.contains(r#""row":39"#), "{captured}");
 
     // Authoritative mouse_reporting=false keeps drag selection local: it paints
     // and copies "hello" through OSC 52 instead of sending mouse input remote.
@@ -431,6 +472,174 @@ fn controlled_local_mouse_state_routes_wheel_and_copies_drag_selection() {
     master.write_all(b"\x1b[<2;3;1M\x1b[<2;3;1m").unwrap();
     master.flush().unwrap();
     assert_file_stays_without(&capture, "terminal.mouse", Duration::from_millis(100));
+
+    unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) };
+    let status = wait_for_exit(&mut child.0, Duration::from_secs(5));
+    assert!(status.success(), "wrapper exited with {status}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn controlled_primary_scrollbar_tracks_state_and_keeps_input_out_of_the_gutter() {
+    let dir = temp_dir();
+    write_fake_ssh(&dir);
+    let capture = dir.join("control-input.jsonl");
+    let calls = dir.join("ssh-calls.log");
+    let frames = dir.join("frames.fifo");
+    File::create(&capture).unwrap();
+    File::create(&calls).unwrap();
+    create_fifo(&frames);
+
+    let (mut master, slave) = open_pty(100, 40);
+    let path = format!(
+        "{}:{}",
+        dir.join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-mirror"));
+    command
+        .args([
+            "pane",
+            "fake-host",
+            "w1:p1",
+            "--always-control",
+            "--cols",
+            "100",
+            "--rows",
+            "40",
+        ])
+        .env("PATH", path)
+        .env("MIRROR_TEST_CAPTURE", &capture)
+        .env("MIRROR_TEST_CALLS", &calls)
+        .env("MIRROR_TEST_FRAME_FIFO", &frames)
+        .env("MIRROR_TEST_STATE", "local")
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    let mut child = ChildGuard(command.spawn().unwrap());
+
+    let initial = wait_for_output(
+        &mut master,
+        b"\x1b[1;12H\x1b[?25h\x1b[?2026l",
+        Duration::from_secs(5),
+    );
+    assert!(contains_bytes(&initial, b"hello world"), "{initial:?}");
+    let call = wait_for_file(&calls, "--cols 100 --rows 40", Duration::from_secs(5));
+    assert!(call.contains("terminal session control"), "{call}");
+    wait_for_file(&capture, "terminal.resize", Duration::from_secs(5));
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40)]);
+
+    // A resized source frame keeps its final content cell at source column 99.
+    // Scroll state arrives separately, so this is also proof that state-only
+    // updates repaint the gutter without waiting for another terminal frame.
+    let _ = read_available(&mut master);
+    inject_sized_frame(
+        &frames,
+        2,
+        true,
+        99,
+        40,
+        "\x1b[1;1Hleft\x1b[1;99HX\x1b[?25l",
+        Duration::from_secs(5),
+    );
+    let frame = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(contains_bytes(&frame, b"X"), "{frame:?}");
+    let _ = read_available(&mut master);
+
+    let top_state = terminal_state_line(false, Some((360, 360, 40)));
+    inject_line(&frames, &top_state, Duration::from_secs(5));
+    let top_bar = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(
+        contains_bytes(&top_bar, b"\x1b[1;100H\x1b[0m\xe2\x96\x90"),
+        "top thumb was not painted: {top_bar:?}"
+    );
+    let edge = top_bar.iter().position(|byte| *byte == b'X').unwrap();
+    let bar = top_bar
+        .windows(b"\x1b[1;100H".len())
+        .position(|window| window == b"\x1b[1;100H")
+        .unwrap();
+    assert!(edge < bar, "source edge was overwritten: {top_bar:?}");
+
+    // A gesture born in column 100 belongs to the display-only gutter. Moving
+    // back into the source must not create a selection or clipboard write.
+    let _ = read_available(&mut master);
+    master
+        .write_all(b"\x1b[<0;100;1M\x1b[<32;4;1M\x1b[<0;4;1m")
+        .unwrap();
+    master.flush().unwrap();
+    let gutter_release = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(!contains_bytes(&gutter_release, b"\x1b]52;"));
+    assert!(!contains_bytes(&gutter_release, b"\x1b[7m"));
+    assert_file_stays_without(&capture, "terminal.mouse", Duration::from_millis(100));
+
+    // Wheel input over the gutter remains useful, but its source coordinate is
+    // clamped to source column 99 (zero-based 98) and the last source row.
+    master.write_all(b"\x1b[<64;100;40M").unwrap();
+    master.flush().unwrap();
+    let captured = wait_for_file(&capture, "terminal.scroll", Duration::from_secs(5));
+    assert!(captured.contains(r#""column":98"#), "{captured}");
+    assert!(captured.contains(r#""row":39"#), "{captured}");
+
+    // Repeating identical scroll metrics must not create a resize loop.
+    inject_line(&frames, &top_state, Duration::from_secs(5));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40)]);
+
+    // Moving the thumb is a state-only repaint: the old top becomes track and
+    // the bottom four rows become the thumb, with no terminal frame in between.
+    let _ = read_available(&mut master);
+    inject_line(
+        &frames,
+        &terminal_state_line(false, Some((0, 360, 40))),
+        Duration::from_secs(5),
+    );
+    let bottom_bar = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(
+        contains_bytes(&bottom_bar, b"\x1b[37;100H\x1b[0m\xe2\x96\x90"),
+        "bottom thumb was not painted: {bottom_bar:?}"
+    );
+    assert!(
+        contains_bytes(&bottom_bar, b"\x1b[1;100H\x1b[0;2m\xe2\x96\x95"),
+        "old thumb was not repainted as track: {bottom_bar:?}"
+    );
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40)]);
+
+    // max_offset=0 clears every stale gutter glyph without changing width.
+    let _ = read_available(&mut master);
+    inject_line(
+        &frames,
+        &terminal_state_line(false, Some((0, 0, 40))),
+        Duration::from_secs(5),
+    );
+    let cleared = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(!contains_bytes(&cleared, "▐".as_bytes()), "{cleared:?}");
+    assert!(!contains_bytes(&cleared, "▕".as_bytes()), "{cleared:?}");
+    assert!(contains_bytes(&cleared, b"\x1b[K"), "{cleared:?}");
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40)]);
+
+    // Recreate a bar, then enter alternate screen while retaining deliberately
+    // stale scroll metrics. Alternate screen reclaims column 100 and clears the
+    // bar; it emits exactly one resize back to the full 100-column source.
+    let _ = read_available(&mut master);
+    inject_line(&frames, &top_state, Duration::from_secs(5));
+    let restored = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(
+        contains_bytes(&restored, b"\x1b[1;100H\x1b[0m\xe2\x96\x90"),
+        "top thumb was not restored: {restored:?}"
+    );
+    let _ = read_available(&mut master);
+    let alternate_state = terminal_state_line(true, Some((360, 360, 40)));
+    inject_line(&frames, &alternate_state, Duration::from_secs(5));
+    wait_for_file_occurrences(&capture, "terminal.resize", 2, Duration::from_secs(5));
+    let alternate = wait_for_output(&mut master, b"\x1b[?2026l", Duration::from_secs(5));
+    assert!(!contains_bytes(&alternate, "▐".as_bytes()), "{alternate:?}");
+    assert!(!contains_bytes(&alternate, "▕".as_bytes()), "{alternate:?}");
+    assert!(contains_bytes(&alternate, b"\x1b[K"), "{alternate:?}");
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40), (100, 40)]);
+
+    inject_line(&frames, &alternate_state, Duration::from_secs(5));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(captured_resize_sizes(&capture), vec![(99, 40), (100, 40)]);
 
     unsafe { libc::kill(child.0.id() as i32, libc::SIGTERM) };
     let status = wait_for_exit(&mut child.0, Duration::from_secs(5));

@@ -40,6 +40,7 @@ use tokio::time::Instant;
 use crate::grid::{Grid, Renderer, Selection};
 use crate::mouse_input::{MouseInputItem, SgrMouseEvent, SgrMouseInputParser};
 use crate::predict::Predictor;
+use crate::scroll::ScrollInfo;
 use crate::util::{err, Result};
 
 // ---------------------------------------------------------------------------
@@ -185,13 +186,13 @@ struct Frame {
     bytes: Option<String>,
 }
 
-/// Input modes reported by the remote terminal session.
+/// Input modes and scroll position reported by the remote terminal session.
 ///
 /// Every field is independently optional because older Herdr servers do not
 /// emit `terminal.state`, and newer peers may add fields without coordinating
-/// an upgrade with this plugin. Missing, null, and malformed input-mode fields
-/// all mean "unknown"; unknown mouse state must never be guessed from the app
-/// name or process tree.
+/// an upgrade with this plugin. Missing, null, and malformed fields all mean
+/// "unknown"; unknown mouse state must never be guessed from the app name or
+/// process tree, and unknown scroll metrics must never draw a stale bar.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct TerminalSessionState {
     mouse_reporting: Option<bool>,
@@ -199,9 +200,7 @@ struct TerminalSessionState {
     mouse_any_motion: Option<bool>,
     alternate_screen: Option<bool>,
     application_cursor: Option<bool>,
-    /// Retained for forward compatibility. Scrollbar rendering is deliberately
-    /// a separate change from mouse routing.
-    scroll: Option<serde_json::Value>,
+    scroll: Option<ScrollInfo>,
 }
 
 impl TerminalSessionState {
@@ -212,7 +211,7 @@ impl TerminalSessionState {
             mouse_any_motion: value.get("mouse_any_motion").and_then(|v| v.as_bool()),
             alternate_screen: value.get("alternate_screen").and_then(|v| v.as_bool()),
             application_cursor: value.get("application_cursor").and_then(|v| v.as_bool()),
-            scroll: value.get("scroll").filter(|v| !v.is_null()).cloned(),
+            scroll: value.get("scroll").and_then(ScrollInfo::from_value),
         }
     }
 }
@@ -455,6 +454,23 @@ fn term_size() -> (usize, usize) {
     (80, 24)
 }
 
+/// Match Herdr's native stable scrollbar gutter. Primary-screen panes reserve
+/// one column before history exists so wrapping does not change when the first
+/// scrollback line appears. Alternate-screen and unknown peers keep the full
+/// width. Very narrow panes cannot afford a gutter.
+const MIN_SCROLLBAR_GUTTER_WIDTH: usize = 5;
+
+fn source_viewport_size(
+    (cols, rows): (usize, usize),
+    alternate_screen: Option<bool>,
+) -> (usize, usize) {
+    if alternate_screen == Some(false) && cols >= MIN_SCROLLBAR_GUTTER_WIDTH {
+        (cols - 1, rows)
+    } else {
+        (cols, rows)
+    }
+}
+
 struct RawMode {
     orig: libc::termios,
 }
@@ -563,8 +579,27 @@ fn mouse_modifiers(button: u32) -> u8 {
     shift | control | alt
 }
 
-fn cell_coordinate(one_based: u32) -> u16 {
-    one_based.saturating_sub(1).min(u16::MAX as u32) as u16
+fn bounded_cell_coordinate(one_based: u32, extent: usize, clamp: bool) -> Option<u16> {
+    if extent == 0 {
+        return None;
+    }
+    let zero_based = u64::from(one_based.saturating_sub(1));
+    let extent = u64::try_from(extent).unwrap_or(u64::MAX);
+    if !clamp && zero_based >= extent {
+        return None;
+    }
+    Some(zero_based.min(extent - 1).min(u64::from(u16::MAX)) as u16)
+}
+
+fn bounded_mouse_cell(
+    event: &SgrMouseEvent,
+    (cols, rows): (usize, usize),
+    clamp: bool,
+) -> Option<(u16, u16)> {
+    Some((
+        bounded_cell_coordinate(event.column, cols, clamp)?,
+        bounded_cell_coordinate(event.row, rows, clamp)?,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,6 +716,10 @@ struct App {
     switching_to: Option<Mode>,
     switch_at: Option<Instant>,
     session: Option<Session>,
+    /// Last source size successfully requested by this control stream. Scroll
+    /// state can update many times per second; never turn those updates into a
+    /// resize loop or repeatedly reflow the source terminal.
+    control_size: Option<(usize, usize)>,
     next_gen: u64,
 
     backoff_idx: usize,
@@ -738,14 +777,19 @@ impl App {
             self.renderer.invalidate();
         }
         let (cols, rows) = term_size();
-        let mut out = self.renderer.paint_with_selection(
+        let (content_cols, content_rows) = self.content_viewport_size();
+        let scroll = (self.terminal_state.alternate_screen == Some(false))
+            .then_some(self.terminal_state.scroll)
+            .flatten();
+        let mut out = self.renderer.paint_with_selection_and_scrollbar(
             &self.grid,
             cols,
             rows,
             visible_selection(self.selection.as_ref(), self.selection_dragged),
+            scroll,
         );
         // inject the prediction overlay inside the synchronized-update block
-        let overlay = self.predict.overlay(&self.grid, cols, rows);
+        let overlay = self.predict.overlay(&self.grid, content_cols, content_rows);
         if !overlay.is_empty() {
             const SYNC_END: &str = "\x1b[?2026l";
             if let Some(pos) = out.rfind(SYNC_END) {
@@ -880,9 +924,48 @@ impl App {
         (self.args.cols.max(c), self.args.rows.max(r))
     }
 
+    fn content_viewport_size(&self) -> (usize, usize) {
+        let local = term_size();
+        match self.mode {
+            Mode::Control => source_viewport_size(local, self.terminal_state.alternate_screen),
+            // Observe never resizes the source. Its actual frame width is the
+            // only safe content boundary when the local pane is wider.
+            Mode::Observe => (local.0.min(self.grid.width), local.1),
+        }
+    }
+
+    fn desired_control_size(&self) -> (usize, usize) {
+        source_viewport_size(term_size(), self.terminal_state.alternate_screen)
+    }
+
+    async fn sync_control_size(&mut self) {
+        let has_control_session =
+            matches!(self.session.as_ref(), Some(session) if session.mode == Mode::Control);
+        if self.mode != Mode::Control || !has_control_session {
+            self.control_size = None;
+            return;
+        }
+
+        let desired = self.desired_control_size();
+        if self.control_size == Some(desired) {
+            return;
+        }
+        let sent = self
+            .send(json!({
+                "type": "terminal.resize",
+                "cols": desired.0,
+                "rows": desired.1,
+            }))
+            .await;
+        if sent {
+            self.control_size = Some(desired);
+        }
+    }
+
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
     fn stop_session(&mut self) {
+        self.control_size = None;
         if let Some(mut s) = self.session.take() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
@@ -899,6 +982,7 @@ impl App {
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        self.control_size = None;
         self.clear_selection();
         // Input modes belong to one session generation. Unknown is deliberately
         // local until the new session reports authoritative state.
@@ -909,7 +993,7 @@ impl App {
         self.predict = Predictor::new();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
-            Mode::Control => term_size(),
+            Mode::Control => self.desired_control_size(),
         };
         if let Some(s) = self.session.take() {
             unsafe { libc::kill(s.pid, libc::SIGTERM) };
@@ -918,6 +1002,7 @@ impl App {
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
             Ok(mut s) => {
                 if m == Mode::Control {
+                    self.control_size = Some((cols, rows));
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
@@ -970,6 +1055,10 @@ impl App {
         self.clear_selection();
         self.switching_to = Some(m);
         self.stop_session();
+        // The stopped stream's scroll position and screen mode are no longer
+        // authoritative. Clear them before painting the switch gap so a stale
+        // scrollbar cannot survive until the replacement stream speaks.
+        self.terminal_state = TerminalSessionState::default();
         self.renderer.invalidate();
         // immediate feedback for the mode-switch gap (stop + 200ms + reconnect)
         self.renderer.status(if m == Mode::Control {
@@ -1031,13 +1120,21 @@ impl App {
         }
     }
 
-    fn handle_state(&mut self, gen: u64, state: TerminalSessionState) {
+    async fn handle_state(&mut self, gen: u64, state: TerminalSessionState) {
         if self.session.as_ref().map(|session| session.gen) != Some(gen) {
             return;
         }
+        let changed = self.terminal_state != state;
         self.terminal_state = state;
         self.sync_mouse_grab();
         self.sync_cursor_key_mode();
+        self.sync_control_size().await;
+        if changed {
+            // Scroll metrics and alternate-screen mode can change without any
+            // terminal frame. Repaint now or the thumb freezes until unrelated
+            // output happens to arrive.
+            self.paint();
+        }
     }
 
     fn handle_closed(&mut self, gen: u64, reason: String) {
@@ -1059,6 +1156,10 @@ impl App {
             return; // an old child we already replaced/killed
         }
         self.session = None;
+        self.control_size = None;
+        self.terminal_state = TerminalSessionState::default();
+        self.sync_mouse_grab();
+        self.sync_cursor_key_mode();
         self.clear_selection();
         let reason_line = reason
             .lines()
@@ -1092,11 +1193,12 @@ impl App {
         self.schedule_reconnect(exited_mode, &reason_line);
     }
 
-    async fn send(&mut self, msg: serde_json::Value) {
+    async fn send(&mut self, msg: serde_json::Value) -> bool {
         if let Some(s) = self.session.as_mut() {
             let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
+            return s.stdin.write_all(line.as_bytes()).await.is_ok();
         }
+        false
     }
 
     async fn handle_stdin(&mut self, buf: Vec<u8>) {
@@ -1206,7 +1308,7 @@ impl App {
 
     fn selection_grid_point(&self, event: &SgrMouseEvent) -> Option<crate::grid::GridPoint> {
         let grid = self.selection_source.as_ref().unwrap_or(&self.grid);
-        let (cols, rows) = term_size();
+        let (cols, rows) = self.content_viewport_size();
         grid.point_at_viewport_clamped(
             event.column.saturating_sub(1) as usize,
             event.row.saturating_sub(1) as usize,
@@ -1220,13 +1322,17 @@ impl App {
         grid: &Grid,
         event: &SgrMouseEvent,
     ) -> Option<crate::grid::GridPoint> {
-        let (cols, rows) = term_size();
+        let (cols, rows) = self.content_viewport_size();
         grid.point_at_viewport(
             event.column.saturating_sub(1) as usize,
             event.row.saturating_sub(1) as usize,
             cols,
             rows,
         )
+    }
+
+    fn mouse_cell(&self, event: &SgrMouseEvent, clamp: bool) -> Option<(u16, u16)> {
+        bounded_mouse_cell(event, self.content_viewport_size(), clamp)
     }
 
     fn selection_source_matches(&self) -> bool {
@@ -1244,12 +1350,16 @@ impl App {
         event: &SgrMouseEvent,
         kind: &'static str,
         button: Option<MouseButton>,
+        clamp: bool,
     ) {
+        let Some((column, row)) = self.mouse_cell(event, clamp) else {
+            return;
+        };
         let mut message = json!({
             "type": "terminal.mouse",
             "kind": kind,
-            "column": cell_coordinate(event.column),
-            "row": cell_coordinate(event.row),
+            "column": column,
+            "row": row,
             "modifiers": mouse_modifiers(event.button),
         });
         if let Some(button) = button {
@@ -1264,18 +1374,34 @@ impl App {
                 if self.clear_selection_without_splitting_gesture() {
                     self.paint();
                 }
+                let Some((column, row)) = self.mouse_cell(&event, true) else {
+                    return;
+                };
                 self.send(json!({
                     "type": "terminal.scroll",
                     "direction": if up { "up" } else { "down" },
                     "lines": 3,
                     "source": "wheel",
-                    "column": cell_coordinate(event.column),
-                    "row": cell_coordinate(event.row),
+                    "column": column,
+                    "row": row,
                     "modifiers": mouse_modifiers(event.button),
                 }))
                 .await;
             }
             MouseKind::Down(button) => {
+                if self.mouse_cell(&event, false).is_none() {
+                    let had_selection = self.clear_selection();
+                    // Own and cancel the complete physical gesture so motion
+                    // from the display-only gutter cannot later leak into the
+                    // source as a drag or release without a matching down.
+                    self.gesture_owner = Some(GestureOwner::Local);
+                    self.gesture_button = Some(button);
+                    self.selection_cancelled = true;
+                    if had_selection {
+                        self.paint();
+                    }
+                    return;
+                }
                 let owner = self.new_gesture_owner();
                 let had_selection = self.clear_selection();
                 self.gesture_owner = Some(owner);
@@ -1299,11 +1425,19 @@ impl App {
                         if had_selection {
                             self.paint();
                         }
-                        self.send_terminal_mouse(&event, "down", Some(button)).await;
+                        self.send_terminal_mouse(&event, "down", Some(button), false)
+                            .await;
                     }
                 }
             }
             MouseKind::Drag(button) => {
+                let continuing = self.gesture_owner.is_some();
+                if !continuing && self.mouse_cell(&event, false).is_none() {
+                    self.gesture_owner = Some(GestureOwner::Local);
+                    self.gesture_button = Some(button);
+                    self.selection_cancelled = true;
+                    return;
+                }
                 let owner = match self.gesture_owner {
                     Some(owner) => owner,
                     None => {
@@ -1337,7 +1471,8 @@ impl App {
                     }
                     GestureOwner::Local => {}
                     GestureOwner::Remote => {
-                        self.send_terminal_mouse(&event, "drag", Some(button)).await;
+                        self.send_terminal_mouse(&event, "drag", Some(button), continuing)
+                            .await;
                     }
                 }
             }
@@ -1345,6 +1480,10 @@ impl App {
                 if self.gesture_button.is_some_and(|active| active != button) {
                     // One SGR stream can only describe one tracked drag here.
                     // A mismatched release must not end or reroute that gesture.
+                    return;
+                }
+                let continuing = self.gesture_owner.is_some();
+                if !continuing && self.mouse_cell(&event, false).is_none() {
                     return;
                 }
                 let owner = match self.gesture_owner.take() {
@@ -1393,17 +1532,20 @@ impl App {
                     }
                     GestureOwner::Local => {}
                     GestureOwner::Remote => {
-                        self.send_terminal_mouse(&event, "up", Some(button)).await;
+                        self.send_terminal_mouse(&event, "up", Some(button), continuing)
+                            .await;
                     }
                 }
             }
             MouseKind::Moved => {
+                let continuing = self.gesture_owner.is_some();
                 let owner = match self.gesture_owner {
                     Some(owner) => owner,
                     None => self.new_gesture_owner(),
                 };
                 if owner == GestureOwner::Remote {
-                    self.send_terminal_mouse(&event, "moved", None).await;
+                    self.send_terminal_mouse(&event, "moved", None, continuing)
+                        .await;
                 }
             }
             MouseKind::Other => {}
@@ -1481,6 +1623,7 @@ pub async fn run(args: Args) -> Result<()> {
         switching_to: None,
         switch_at: None,
         session: None,
+        control_size: None,
         next_gen: 0,
         backoff_idx: 0,
         reconnect_at: None,
@@ -1562,7 +1705,7 @@ pub async fn run(args: Args) -> Result<()> {
                 match msg {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
-                    Some(Msg::State { gen, state }) => app.handle_state(gen, state),
+                    Some(Msg::State { gen, state }) => app.handle_state(gen, state).await,
                     Some(Msg::Closed { gen, reason }) => app.handle_closed(gen, reason),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
@@ -1580,8 +1723,7 @@ pub async fn run(args: Args) -> Result<()> {
                     app.switch_mode(Mode::Control);
                 }
                 if app.mode == Mode::Control {
-                    let (cols, rows) = term_size();
-                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                    app.sync_control_size().await;
                 }
                 app.paint();
             }
@@ -1686,10 +1828,29 @@ mod tests {
         assert_eq!(mouse_modifiers(72), 4); // Alt
         assert_eq!(mouse_modifiers(80), 2); // Control
         assert_eq!(mouse_modifiers(92), 7); // Shift + Alt + Control
-        assert_eq!(cell_coordinate(0), 0);
-        assert_eq!(cell_coordinate(1), 0);
-        assert_eq!(cell_coordinate(10), 9);
-        assert_eq!(cell_coordinate(u32::MAX), u16::MAX);
+    }
+
+    #[test]
+    fn mouse_coordinates_respect_the_source_content_boundary() {
+        assert_eq!(bounded_cell_coordinate(0, 10, false), Some(0));
+        assert_eq!(bounded_cell_coordinate(1, 10, false), Some(0));
+        assert_eq!(bounded_cell_coordinate(10, 10, false), Some(9));
+        assert_eq!(bounded_cell_coordinate(11, 10, false), None);
+        assert_eq!(bounded_cell_coordinate(11, 10, true), Some(9));
+        assert_eq!(bounded_cell_coordinate(1, 0, true), None);
+        assert_eq!(
+            bounded_cell_coordinate(u32::MAX, usize::MAX, true),
+            Some(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn primary_screen_reserves_a_stable_scrollbar_gutter() {
+        assert_eq!(source_viewport_size((80, 24), Some(false)), (79, 24));
+        assert_eq!(source_viewport_size((80, 24), Some(true)), (80, 24));
+        assert_eq!(source_viewport_size((80, 24), None), (80, 24));
+        assert_eq!(source_viewport_size((4, 24), Some(false)), (4, 24));
+        assert_eq!(source_viewport_size((5, 24), Some(false)), (4, 24));
     }
 
     #[test]
@@ -1820,7 +1981,11 @@ mod tests {
             "mouse_any_motion": true,
             "alternate_screen": true,
             "application_cursor": true,
-            "scroll": { "offset_from_bottom": 4 },
+            "scroll": {
+                "offset_from_bottom": 4,
+                "max_offset_from_bottom": 40,
+                "viewport_rows": 24,
+            },
         });
         let state = TerminalSessionState::from_value(&full);
         assert_eq!(state.mouse_reporting, Some(true));
@@ -1828,7 +1993,14 @@ mod tests {
         assert_eq!(state.mouse_any_motion, Some(true));
         assert_eq!(state.alternate_screen, Some(true));
         assert_eq!(state.application_cursor, Some(true));
-        assert!(state.scroll.is_some());
+        assert_eq!(
+            state.scroll,
+            Some(ScrollInfo {
+                offset_from_bottom: 4,
+                max_offset_from_bottom: 40,
+                viewport_rows: 24,
+            })
+        );
 
         // Null, missing, and a wrong type all overwrite the corresponding
         // fields with unknown rather than retaining a stale remote route.
@@ -1837,9 +2009,13 @@ mod tests {
             "mouse_reporting": true,
             "mouse_pixel_reporting": "no",
             "mouse_any_motion": null,
+            "alternate_screen": false,
             "application_cursor": 1,
+            "scroll": { "offset_from_bottom": 4 },
         }));
         assert_eq!(mouse_routing(&malformed), MouseRouting::Unknown);
+        assert_eq!(malformed.alternate_screen, Some(false));
+        assert_eq!(malformed.scroll, None);
     }
 
     #[test]

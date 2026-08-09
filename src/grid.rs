@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
+use crate::scroll::{scrollbar_thumb, ScrollInfo, ScrollbarThumb};
+
 /// Terminal display width of a char (CJK/Hangul are 2 columns).
 fn cw(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
@@ -436,6 +438,18 @@ pub struct Renderer {
     status_text: String,
 }
 
+fn scrollbar_glyph(thumb: Option<ScrollbarThumb>, row: usize) -> Option<&'static str> {
+    let thumb = thumb?;
+    if row >= thumb.top && row - thumb.top < thumb.len {
+        // Match Herdr's focused-pane symbols. The host terminal supplies the
+        // actual palette, so the track is dimmed instead of guessing Herdr's
+        // configured overlay colors.
+        Some("\x1b[0m▐")
+    } else {
+        Some("\x1b[0;2m▕")
+    }
+}
+
 impl Renderer {
     pub fn new() -> Renderer {
         Renderer::default()
@@ -453,11 +467,12 @@ impl Renderer {
     /// Build the ANSI to paint the grid without a selection overlay.
     #[cfg(test)]
     pub fn paint(&mut self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
-        self.paint_with_selection(grid, out_cols, out_rows, None)
+        self.paint_with_selection_and_scrollbar(grid, out_cols, out_rows, None, None)
     }
 
     /// Build the ANSI to paint the grid into an out_cols × out_rows terminal.
     /// Bottom-anchored window: agent TUIs live at the bottom of the screen.
+    #[allow(dead_code)] // compatibility entry point; pane mode now supplies scroll state
     pub fn paint_with_selection(
         &mut self,
         grid: &Grid,
@@ -465,6 +480,26 @@ impl Renderer {
         out_rows: usize,
         selection: Option<&Selection>,
     ) -> String {
+        self.paint_with_selection_and_scrollbar(grid, out_cols, out_rows, selection, None)
+    }
+
+    /// Build the ANSI for the grid, selection, and source Herdr scrollbar.
+    ///
+    /// A source frame contains only the terminal grid; Herdr's native
+    /// scrollbar occupies a separate column. Recreate it only when the local
+    /// pane has a real spare column. Hiding the bar is preferable to silently
+    /// replacing the source application's rightmost cell.
+    pub fn paint_with_selection_and_scrollbar(
+        &mut self,
+        grid: &Grid,
+        out_cols: usize,
+        out_rows: usize,
+        selection: Option<&Selection>,
+        scroll: Option<ScrollInfo>,
+    ) -> String {
+        let scrollbar = scroll
+            .filter(|metrics| metrics.max_offset_from_bottom > 0 && grid.width < out_cols)
+            .and_then(|metrics| scrollbar_thumb(metrics, out_rows));
         let offset_r = grid.viewport_row_offset(out_rows);
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         // paint every local row (missing rows blank-fill), or the pane stays
@@ -527,6 +562,16 @@ impl Renderer {
             } else {
                 format!("{line}\x1b[0m\x1b[K")
             };
+            // The scrollbar spans the complete pane, including a status row.
+            // Including its glyph in the cached row makes a moved or removed
+            // bar repaint exactly the affected rows; the base row's EL clears
+            // the old gutter cell when scroll metrics disappear.
+            let painted = match scrollbar_glyph(scrollbar, r) {
+                Some(glyph) if out_cols > 0 => {
+                    format!("{painted}\x1b[{};{}H{glyph}\x1b[0m", r + 1, out_cols)
+                }
+                _ => painted,
+            };
             if self.last_rows.get(r).map(|p| p.as_deref()) != Some(Some(painted.as_str())) {
                 let _ = write!(out, "\x1b[{};1H", r + 1);
                 out.push_str(&painted);
@@ -536,12 +581,18 @@ impl Renderer {
         let cr = grid.cursor_row as isize - offset_r as isize;
         if grid.cursor_visible && cr >= 0 && (cr as usize) < out_rows && self.status_text.is_empty()
         {
-            let _ = write!(
-                out,
-                "\x1b[{};{}H\x1b[?25h",
-                cr + 1,
-                grid.cursor_col.min(out_cols.saturating_sub(1)) + 1
-            );
+            // The decoded grid is the content boundary even when no thumb is
+            // visible yet (the stable primary-screen gutter exists before the
+            // first scrollback line) or scroll metadata is unavailable.
+            let content_cols = out_cols.min(grid.width);
+            if content_cols > 0 {
+                let _ = write!(
+                    out,
+                    "\x1b[{};{}H\x1b[?25h",
+                    cr + 1,
+                    grid.cursor_col.min(content_cols - 1) + 1
+                );
+            }
         }
         out.push_str("\x1b[?2026l");
         out
@@ -856,6 +907,136 @@ mod tests {
         assert!(
             !out.contains("한 B"),
             "wide spacer was painted as text: {out:?}"
+        );
+    }
+
+    fn scroll_info(offset_from_bottom: u64) -> ScrollInfo {
+        ScrollInfo {
+            offset_from_bottom,
+            max_offset_from_bottom: 8,
+            viewport_rows: 2,
+        }
+    }
+
+    #[test]
+    fn renderer_combines_selection_and_scrollbar() {
+        let mut grid = Grid::new();
+        grid.resize(4, 2);
+        grid.apply("\x1b[1;1H\x1b[31mabcd");
+        let selection = Selection::range(GridPoint::new(0, 1), GridPoint::new(0, 2));
+        let mut renderer = Renderer::new();
+
+        let out = renderer.paint_with_selection_and_scrollbar(
+            &grid,
+            5,
+            2,
+            Some(&selection),
+            Some(scroll_info(8)),
+        );
+
+        assert!(out.contains("\x1b[7mbc"), "selection was lost: {out:?}");
+        assert!(
+            out.contains("\x1b[1;5H\x1b[0m▐\x1b[0m"),
+            "scrollbar thumb was not painted in the spare column: {out:?}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_spans_every_row_including_status() {
+        let mut grid = Grid::new();
+        grid.resize(4, 3);
+        let mut renderer = Renderer::new();
+        renderer.status("syncing");
+
+        let out =
+            renderer.paint_with_selection_and_scrollbar(&grid, 5, 3, None, Some(scroll_info(8)));
+
+        assert!(out.contains("\x1b[1;5H\x1b[0m▐"), "top thumb: {out:?}");
+        assert!(out.contains("\x1b[2;5H\x1b[0;2m▕"), "middle track: {out:?}");
+        assert!(
+            out.contains("\x1b[3;5H\x1b[0;2m▕"),
+            "status-row track: {out:?}"
+        );
+        assert!(out.contains("syncing"), "status text was lost: {out:?}");
+    }
+
+    #[test]
+    fn scrollbar_never_overwrites_full_width_source_content() {
+        let mut grid = Grid::new();
+        grid.resize(5, 1);
+        grid.apply("\x1b[1;1Habcde");
+        let mut renderer = Renderer::new();
+
+        let out =
+            renderer.paint_with_selection_and_scrollbar(&grid, 5, 1, None, Some(scroll_info(8)));
+
+        assert!(out.contains("abcde"), "last source cell was lost: {out:?}");
+        assert!(
+            !out.contains('▐'),
+            "thumb overwrote source content: {out:?}"
+        );
+        assert!(
+            !out.contains('▕'),
+            "track overwrote source content: {out:?}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_removal_clears_every_stale_gutter_cell() {
+        let mut grid = Grid::new();
+        grid.resize(4, 2);
+        let mut renderer = Renderer::new();
+        renderer.paint_with_selection_and_scrollbar(&grid, 5, 2, None, Some(scroll_info(8)));
+
+        let cleared = renderer.paint_with_selection_and_scrollbar(&grid, 5, 2, None, None);
+        assert!(!cleared.contains('▐'), "stale thumb survived: {cleared:?}");
+        assert!(!cleared.contains('▕'), "stale track survived: {cleared:?}");
+        assert!(
+            cleared.contains("\x1b[1;1H") && cleared.contains("\x1b[2;1H"),
+            "rows containing the old bar were not repainted: {cleared:?}"
+        );
+        assert!(
+            cleared.matches("\x1b[K").count() >= 2,
+            "row clears did not erase the old gutter: {cleared:?}"
+        );
+
+        let unchanged = renderer.paint_with_selection_and_scrollbar(&grid, 5, 2, None, None);
+        assert!(
+            !unchanged.contains("\x1b[K") && !unchanged.contains('▐') && !unchanged.contains('▕'),
+            "cleared rows were not cached: {unchanged:?}"
+        );
+    }
+
+    #[test]
+    fn visible_cursor_stays_out_of_scrollbar_gutter() {
+        let mut grid = Grid::new();
+        grid.resize(4, 2);
+        // After painting the last source cell, the decoded cursor is one cell
+        // beyond the grid. It must clamp to source column four, not the gutter.
+        grid.apply("\x1b[1;4Hx\x1b[?25h");
+        let mut renderer = Renderer::new();
+
+        let out =
+            renderer.paint_with_selection_and_scrollbar(&grid, 5, 2, None, Some(scroll_info(8)));
+
+        assert!(
+            out.ends_with("\x1b[1;4H\x1b[?25h\x1b[?2026l"),
+            "cursor entered the fifth-column gutter: {out:?}"
+        );
+
+        let without_history = renderer.paint_with_selection_and_scrollbar(
+            &grid,
+            5,
+            2,
+            None,
+            Some(ScrollInfo {
+                max_offset_from_bottom: 0,
+                ..scroll_info(0)
+            }),
+        );
+        assert!(
+            without_history.ends_with("\x1b[1;4H\x1b[?25h\x1b[?2026l"),
+            "cursor entered the stable empty gutter: {without_history:?}"
         );
     }
 }

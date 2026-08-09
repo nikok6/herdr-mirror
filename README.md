@@ -27,9 +27,10 @@ A remote can be another machine over **ssh**, or a **container** on this one
 
 - **Both ends**: herdr with the `terminal session` streams — preview build
   `2026-06-30` or newer (`herdr channel set preview`), until the next stable.
-- **Native mouse routing**: a herdr build whose terminal-session stream emits
-  `terminal.state` and accepts `terminal.mouse`. Older builds stay usable for
-  local selection, but mouse-aware remote apps need this capability.
+- **Native mouse and scrollbar state**: a herdr build whose terminal-session
+  stream emits `terminal.state` and accepts `terminal.mouse`. Older builds stay
+  usable for local selection, but mouse-aware remote apps and the mirrored
+  source scrollbar need this capability.
 - **Local machine**: macOS or Linux on x86_64/aarch64 — install fetches the
   prebuilt binary from Releases (dev installs via `herdr plugin link` build
   from source with `cargo build --release`).
@@ -83,6 +84,7 @@ of showing a tiny default-sized window. Type and your keystrokes go to the
 remote, tmux-style; the mouse wheel scrolls remote scrollback. Because the
 wrapper must capture the wheel in control mode, it also owns text selection:
 drag normally to highlight the visible remote text and copy it on release.
+When the source has scrollback, the right-edge scrollbar tracks its position.
 
 **Watch-only** — for a machine with its own display or a human sitting at it,
 set `always_control = false` (globally or per host). Its mirrors become
@@ -367,8 +369,9 @@ rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
   so a selection crossing visual rows copies a newline between those rows. If
   the selected characters repaint during a drag, the selection is cancelled
   instead of silently copying different text.
-- **No remote scrollbar yet**: wheel scrolling reaches the source pane, but the
-  streamed view does not currently draw the source pane's scroll position.
+- **The remote scrollbar is display-only**: wheel scrolling reaches the source
+  pane and the thumb tracks its position, but clicking or dragging the bar is
+  not supported yet.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real
