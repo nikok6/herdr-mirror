@@ -57,8 +57,6 @@ pub struct Args {
     pub session: Option<String>,
     /// auto-release control after this much input idle; 0 disables
     pub control_idle_secs: u64,
-    /// --cols/--rows are the remote pane's real size (plus margin), use as-is
-    pub size_fixed: bool,
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
@@ -89,7 +87,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         dump: false,
         session: None,
         control_idle_secs: 3600,
-        size_fixed: false,
         always_control: false,
         ctl_path: None,
         container: None,
@@ -107,11 +104,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--remote-bin" => args.remote_bin = Some(next("--remote-bin")?),
             "--cols" => {
                 args.cols = next("--cols")?.parse().map_err(|_| err("--cols must be a number"))?;
-                args.size_fixed = true;
             }
             "--rows" => {
                 args.rows = next("--rows")?.parse().map_err(|_| err("--rows must be a number"))?;
-                args.size_fixed = true;
             }
             "--session" => args.session = Some(next("--session")?),
             "--control-idle" => {
@@ -322,6 +317,22 @@ const HERDR_NO_CLIENT_LAYOUT: (usize, usize) = (80, 24);
 /// resize. It self-heals the moment a client attaches.
 fn size_is_trusted((cols, rows): (usize, usize)) -> bool {
     cols > HERDR_NO_CLIENT_LAYOUT.0 || rows > HERDR_NO_CLIENT_LAYOUT.1
+}
+
+/// Size to request for an observe stream. Split out from `App::observe_size` so
+/// the floor is testable.
+///
+/// `--cols/--rows` are a floor, never an exact request. As a floor they still do
+/// their original job: the request must be >= the remote PTY size or the server
+/// clips its bottom rows away, and the daemon's numbers already carry a margin.
+/// As an exact request they are wrong — the daemon samples the *remote* pane's
+/// rect when it spawns the streamer, and a headless remote reports the no-client
+/// placeholder, so the numbers are small. Control then resizes the remote pty to
+/// this pane and nothing shrinks it back on release, so asking for the daemon's
+/// numbers again would stream a crop of a screen that has since grown, painted
+/// into the corner of a much larger pane.
+fn observe_size_for(args: &Args, term: (usize, usize)) -> (usize, usize) {
+    (args.cols.max(term.0), args.rows.max(term.1))
 }
 
 /// Mode to open with. Split out from `run` so the composition is testable.
@@ -617,13 +628,7 @@ impl App {
     }
 
     fn observe_size(&self) -> (usize, usize) {
-        // must request >= the remote PTY size or the server clips its bottom
-        // rows; daemon-passed sizes already include a margin
-        if self.args.size_fixed {
-            return (self.args.cols, self.args.rows);
-        }
-        let (c, r) = if self.tty { term_size() } else { (0, 0) };
-        (self.args.cols.max(c), self.args.rows.max(r))
+        observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) })
     }
 
     /// Stop the child (clean release first for control) — never leave an
@@ -1134,6 +1139,24 @@ mod tests {
     }
 
     #[test]
+    fn observe_size_treats_daemon_sizes_as_a_floor() {
+        // what the daemon spawns a streamer with for a headless remote: the
+        // no-client placeholder rect plus its margin
+        let argv: Vec<String> = ["work", "w1:p1", "--cols", "70", "--rows", "31"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_args(&argv).unwrap();
+        // control has already resized the remote pty to this pane, and release
+        // does not shrink it back — observing at 70x31 would stream a crop
+        assert_eq!(observe_size_for(&a, (314, 92)), (314, 92));
+        // a pane smaller than the remote still gets the daemon's margin
+        assert_eq!(observe_size_for(&a, (40, 20)), (70, 31));
+        // --dump has no tty: exactly what was asked for
+        assert_eq!(observe_size_for(&a, (0, 0)), (70, 31));
+    }
+
+    #[test]
     fn arg_parsing() {
         let argv: Vec<String> =
             ["work", "w9:p1", "--remote-bin", "/opt/herdr", "--cols", "176", "--rows", "66"]
@@ -1145,7 +1168,6 @@ mod tests {
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!((a.cols, a.rows), (176, 66));
-        assert!(a.size_fixed);
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
     }
