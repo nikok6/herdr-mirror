@@ -18,6 +18,10 @@ fn cw(ch: char) -> usize {
 pub struct Cell {
     /// Rc: runs of cells share one SGR allocation
     pub sgr: Rc<str>,
+    /// OSC 8 target URI, when this cell sits inside a hyperlink. Carried
+    /// per-cell for the same reason as `sgr`: the renderer repaints arbitrary
+    /// rows in isolation, so it cannot rely on stream order to know the state.
+    pub link: Option<Rc<str>>,
     pub ch: char,
 }
 
@@ -61,6 +65,7 @@ impl Grid {
         let mut row = 0usize;
         let mut col = 0usize;
         let mut sgr: Rc<str> = Rc::from("");
+        let mut link: Option<Rc<str>> = None;
         let mut i = 0usize;
         while i < chars.len() {
             if chars[i] == '\x1b' {
@@ -82,6 +87,11 @@ impl Grid {
                     continue;
                 }
                 if let Some(len) = parse_osc(&chars[i..]) {
+                    // OSC is presentation-free apart from OSC 8, which carries
+                    // the hyperlink a click needs; everything else still drops.
+                    if let Some(uri) = parse_osc8(&chars[i..i + len]) {
+                        link = uri;
+                    }
                     i += len;
                     continue;
                 }
@@ -93,7 +103,7 @@ impl Grid {
                 let ch = if ch == '\t' { ' ' } else { ch };
                 let w = cw(ch);
                 if row < self.height && col < self.width {
-                    self.rows[row][col] = Some(Cell { sgr: sgr.clone(), ch });
+                    self.rows[row][col] = Some(Cell { sgr: sgr.clone(), link: link.clone(), ch });
                     // wide char spans two columns: clear any stale cell in the
                     // spacer slot so delta frames cannot leave mixed glyphs
                     if w == 2 && col + 1 < self.width {
@@ -179,6 +189,19 @@ fn parse_osc(chars: &[char]) -> Option<usize> {
     None
 }
 
+/// OSC 8 hyperlink: ESC ] 8 ; params ; URI (BEL | ESC \). `params` (the
+/// optional `id=` and friends) is ignored — it only affects hover grouping.
+///
+/// Returns None when `seq` is some other OSC, `Some(None)` for the closing
+/// form (empty URI), and `Some(Some(uri))` to open a link.
+fn parse_osc8(seq: &[char]) -> Option<Option<Rc<str>>> {
+    let body: String = seq.iter().collect();
+    let body = body.strip_prefix("\x1b]")?;
+    let body = body.strip_suffix('\x07').or_else(|| body.strip_suffix("\x1b\\"))?;
+    let (_params, uri) = body.strip_prefix("8;")?.split_once(';')?;
+    Some((!uri.is_empty()).then(|| Rc::from(uri)))
+}
+
 // ---------------------------------------------------------------------------
 // renderer: paints a window of the grid onto the local terminal
 
@@ -219,6 +242,9 @@ impl Renderer {
             let cells = grid.rows.get(r + offset_r).unwrap_or(&empty);
             let mut line = String::new();
             let mut prev_sgr: Option<&str> = None;
+            // No link is open at the start of a row: every row is repainted from
+            // its own CUP, so hyperlink state never carries in from the row above.
+            let mut prev_link: Option<&str> = None;
             let limit = out_cols.min(grid.width);
             let mut c = 0usize;
             while c < limit {
@@ -227,6 +253,16 @@ impl Renderer {
                 if prev_sgr != Some(sgr) {
                     line.push_str(if sgr.is_empty() { "\x1b[0m" } else { sgr });
                     prev_sgr = Some(sgr);
+                }
+                let link = cell.and_then(|c| c.link.as_deref());
+                if prev_link != link {
+                    match link {
+                        Some(uri) => {
+                            let _ = write!(line, "\x1b]8;;{uri}\x1b\\");
+                        }
+                        None => line.push_str("\x1b]8;;\x1b\\"),
+                    }
+                    prev_link = link;
                 }
                 let ch = cell.map(|c| c.ch).unwrap_or(' ');
                 let w = cw(ch);
@@ -240,6 +276,11 @@ impl Renderer {
                 // wide char occupies two columns: skip its spacer cell so the
                 // painted columns stay aligned with the grid (Hangul/CJK fix)
                 c += w;
+            }
+            // A link left open would swallow everything painted after this row,
+            // including the next row's CUP-anchored content and the status bar.
+            if prev_link.is_some() {
+                line.push_str("\x1b]8;;\x1b\\");
             }
             let is_status_row = r == out_rows - 1 && !self.status_text.is_empty();
             let painted = if is_status_row {
@@ -423,5 +464,55 @@ mod tests {
         // unchanged rows are not repainted
         let out3 = r.paint(&g, 5, 3);
         assert!(!out3.contains("last"));
+    }
+
+    const LINK: &str = "\x1b]8;;https://example.com/x\x1b\\";
+    const UNLINK: &str = "\x1b]8;;\x1b\\";
+
+    #[test]
+    fn osc8_is_captured_on_cells_and_repainted() {
+        let mut g = Grid::new();
+        g.resize(8, 2);
+        g.apply(&format!("\x1b[1;1H{LINK}PR\x1b[1;3H{UNLINK}ok"));
+        // the link rides the cells it covers, and only those
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link.as_deref(), Some("https://example.com/x"));
+        assert_eq!(g.rows[0][1].as_ref().unwrap().link.as_deref(), Some("https://example.com/x"));
+        assert_eq!(g.rows[0][3].as_ref().unwrap().link, None);
+        // and survives the repaint, which is the whole point
+        let out = Renderer::new().paint(&g, 8, 2);
+        assert!(out.contains(LINK), "open sequence missing: {out:?}");
+        assert!(out.contains(UNLINK), "close sequence missing: {out:?}");
+    }
+
+    #[test]
+    fn osc8_params_are_ignored_and_bel_terminates() {
+        // the `id=` form with a BEL terminator is equally valid
+        let mut g = Grid::new();
+        g.resize(4, 1);
+        g.apply("\x1b[1;1H\x1b]8;id=7;https://example.com/y\x07hi");
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link.as_deref(), Some("https://example.com/y"));
+    }
+
+    #[test]
+    fn non_hyperlink_osc_still_skipped() {
+        // OSC 0 (window title) must neither print nor be mistaken for a link
+        let mut g = Grid::new();
+        g.resize(4, 1);
+        g.apply("\x1b[1;1H\x1b]0;some title\x07hi");
+        assert_eq!(g.text_lines(), vec!["hi"]);
+        assert_eq!(g.rows[0][0].as_ref().unwrap().link, None);
+    }
+
+    #[test]
+    fn open_link_cannot_leak_past_the_row() {
+        // a link still open at the right edge would swallow the next row's
+        // content, which the terminal paints from a fresh CUP
+        let mut g = Grid::new();
+        g.resize(2, 2);
+        g.apply(&format!("\x1b[1;1H{LINK}ab\x1b[2;1H{UNLINK}cd"));
+        let out = Renderer::new().paint(&g, 2, 2);
+        let row2 = out.split("\x1b[2;1H").nth(1).expect("row 2 painted");
+        assert!(!row2.contains("\x1b]8;;https"), "link leaked into row 2: {out:?}");
+        assert_eq!(out.matches(UNLINK).count(), 1, "expected exactly one close: {out:?}");
     }
 }
