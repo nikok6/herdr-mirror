@@ -359,7 +359,9 @@ pub(crate) fn cmd_for_pane(
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
-    let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
+    let ctl_path = crate::remote::control_path(state_dir, &host.name)
+        .display()
+        .to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![

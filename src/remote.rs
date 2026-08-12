@@ -122,18 +122,44 @@ pub struct RemoteHost {
     log: Logger,
 }
 
+fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    // macOS reserves one byte of sockaddr_un's 104-byte path for NUL. OpenSSH
+    // temporarily adds a 17-byte suffix beside the four-byte .ctl filename.
+    const MAX_SOCKET_PATH_BYTES: usize = 103;
+    const CONTROL_SOCKET_OVERHEAD: usize = 21;
+
+    let directory_bytes = state_dir.as_os_str().as_bytes().len() + 1;
+    let budget = MAX_SOCKET_PATH_BYTES.saturating_sub(directory_bytes + CONTROL_SOCKET_OVERHEAD);
+    if host_name.len() <= budget {
+        return host_name.into();
+    }
+
+    let mut end = budget.min(host_name.len());
+    while !host_name.is_char_boundary(end) {
+        end -= 1;
+    }
+    host_name[..end].trim_end_matches('-').into()
+}
+
+pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
+    state_dir.join(format!("{}.ctl", socket_stem(state_dir, host_name)))
+}
+
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
+        let stem = socket_stem(state_dir, &cfg.name);
         RemoteHost {
-            ctl_path: state_dir.join(format!("{}.ctl", cfg.name)),
-            fwd_sock: state_dir.join(format!("{}-api.sock", cfg.name)),
+            ctl_path: state_dir.join(format!("{stem}.ctl")),
+            fwd_sock: state_dir.join(format!("{stem}-api.sock")),
             transport_hint: cfg.api_transport,
             cfg: cfg.clone(),
             forwarded: false,
             container: None,
             relay: None,
             exec_relay: None,
-            exec_sock: state_dir.join(format!("{}-api-exec.sock", cfg.name)),
+            exec_sock: state_dir.join(format!("{stem}-api-exec.sock")),
             last_api_transport: None,
             log: Logger::new(state_dir, false),
         }
@@ -512,6 +538,38 @@ mod tests {
             "herdr-mirror-{name}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    fn ssh_host(name: &str) -> HostConfig {
+        HostConfig {
+            name: name.into(),
+            target: format!("{name}.example.com"),
+            kind: crate::config::HostKind::Ssh,
+            docker_bin: "docker".into(),
+            prefix: name.into(),
+            remote_bin: None,
+            api_transport: ApiTransport::Auto,
+            always_control: true,
+        }
+    }
+
+    #[test]
+    fn long_host_names_use_truncated_socket_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
+        let name = "remote-development-environment-with-a-very-long-name";
+        let remote = RemoteHost::new(&ssh_host(name), &state_dir);
+        let budget = 103 - state_dir.as_os_str().as_bytes().len() - 1 - 21;
+        let expected_stem = &name[..budget];
+
+        assert_eq!(
+            remote.ctl_path.file_name().unwrap().to_string_lossy(),
+            format!("{expected_stem}.ctl")
+        );
+        assert!(remote.ctl_path.as_os_str().len() + 17 <= 103);
+        assert!(remote.fwd_sock.as_os_str().len() <= 103);
+        assert!(remote.exec_sock.as_os_str().len() <= 103);
     }
 
     #[test]
