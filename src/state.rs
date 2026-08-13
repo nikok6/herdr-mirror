@@ -86,6 +86,12 @@ pub struct HostState {
     /// permanent winner and revert the other side's drag.
     #[serde(default)]
     pub ratios: BTreeMap<String, f64>,
+    /// user hid this host's mirrors via `hide`: converge freezes (no tombstone,
+    /// no recreate) until `show` clears it. Distinct from tombstone, which means
+    /// "closed, don't come back until restore" — hide means "still watching,
+    /// just out of the way."
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
@@ -141,5 +147,18 @@ mod tests {
         assert!(out.contains("rootTabLocalId"));
         // absent options stay absent
         assert!(!out.contains("\"reported\":null"));
+    }
+
+    /// Pre-hide state files have no `hidden` key at all — must default false,
+    /// not fail to parse.
+    #[test]
+    fn hidden_defaults_false_and_round_trips() {
+        let state: HostState = serde_json::from_str(r#"{"workspaces":{}}"#).unwrap();
+        assert!(!state.hidden);
+
+        let hidden = HostState { hidden: true, ..Default::default() };
+        let out = serde_json::to_string(&hidden).unwrap();
+        let reparsed: HostState = serde_json::from_str(&out).unwrap();
+        assert!(reparsed.hidden);
     }
 }
