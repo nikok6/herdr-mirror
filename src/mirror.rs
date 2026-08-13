@@ -354,6 +354,7 @@ pub(crate) fn cmd_for_pane(
         .unwrap_or_else(|_| "herdr-mirror".into());
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
+    let session = host.session.clone();
     let always_control = host.always_control;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
@@ -372,6 +373,9 @@ pub(crate) fn cmd_for_pane(
         // defaults to the same resolution so the argv stays short
         if let Some(bin) = &remote_bin {
             argv.extend(["--remote-bin".into(), bin.clone()]);
+        }
+        if let Some(session) = &session {
+            argv.extend(["--session".into(), session.clone()]);
         }
         if always_control {
             argv.push("--always-control".into());
@@ -1509,6 +1513,7 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: "vps".into(),
             remote_bin: None,
+            session: None,
             always_control: true,
             api_transport: crate::config::ApiTransport::Auto,
         }
@@ -1636,6 +1641,29 @@ mod tests {
                 "/state/vps.ctl",
             ]
         );
+    }
+
+    #[test]
+    fn ssh_pane_argv_carries_remote_session() {
+        let mut host = ssh_host();
+        host.session = Some("work".into());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--session",
+                "work",
+                "--always-control",
+                "--ctl-path",
+                "/state/vps.ctl",
+            ]
+        );
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.session.as_deref(), Some("work"));
     }
 
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the

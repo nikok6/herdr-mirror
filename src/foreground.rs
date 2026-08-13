@@ -47,12 +47,13 @@ pub fn classify(json: &str) -> Option<bool> {
 pub async fn poll(
     ssh_target: &str,
     remote_bin: Option<&str>,
+    session: Option<&str>,
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
 ) -> Option<bool> {
     // same expression as the observe session (configured path or PATH auto)
-    let bin = crate::config::remote_bin_expr(remote_bin);
+    let bin = crate::config::remote_herdr_expr(remote_bin, session);
     let cmd = format!("exec {} pane process-info --pane {}", bin, sh_quote(pane));
     let mut sc = match container {
         Some(ct) => {

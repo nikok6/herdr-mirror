@@ -49,7 +49,7 @@ pub struct Args {
     pub ssh_target: String,
     pub pane_target: String,
     /// Configured remote herdr path. `None` = auto-resolve on the remote
-    /// (PATH, then `~/.local/bin/herdr`). See `config::remote_bin_expr`.
+    /// (PATH, then `~/.local/bin/herdr`). See `config::remote_herdr_expr`.
     pub remote_bin: Option<String>,
     pub cols: usize,
     pub rows: usize,
@@ -200,19 +200,16 @@ pub(crate) fn sh_quote(s: &str) -> String {
 }
 
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
-    let session_flag = args
-        .session
-        .as_ref()
-        .map(|s| format!(" --session {}", sh_quote(s)))
-        .unwrap_or_default();
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
-    // config::remote_bin_expr).
-    let bin = crate::config::remote_bin_expr(args.remote_bin.as_deref());
+    // config::remote_herdr_expr).
+    let bin = crate::config::remote_herdr_expr(
+        args.remote_bin.as_deref(),
+        args.session.as_deref(),
+    );
     let cmd = format!(
-        "exec {}{} terminal session {} {} --cols {} --rows {}",
+        "exec {} terminal session {} {} --cols {} --rows {}",
         bin,
-        session_flag,
         mode.as_str(),
         sh_quote(&args.pane_target),
         cols,
@@ -557,6 +554,7 @@ impl App {
         let tx = self.tx.clone();
         let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
+        let session = self.args.session.clone();
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
@@ -564,6 +562,7 @@ impl App {
             let v = crate::foreground::poll(
                 &ssh,
                 bin.as_deref(),
+                session.as_deref(),
                 &pane,
                 ctl.as_deref(),
                 container.as_ref(),

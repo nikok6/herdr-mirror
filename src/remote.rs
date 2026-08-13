@@ -250,7 +250,10 @@ impl RemoteHost {
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
-        let bin = crate::config::remote_bin_expr(self.cfg.remote_bin.as_deref());
+        let bin = crate::config::remote_herdr_expr(
+            self.cfg.remote_bin.as_deref(),
+            self.cfg.session.as_deref(),
+        );
         let out = self.exec(&format!("exec {} status --json", bin), 15000).await?;
         #[derive(Deserialize)]
         struct Client {

@@ -7,13 +7,15 @@ use serde::Deserialize;
 
 use crate::util::{err, Result};
 
-/// Shell expression for `exec <expr> ...` on the remote.
+/// Shell expression for `exec <expr> <command> ...` on the remote.
 ///
 /// A configured path is used as-is (unquoted so remote-shell `~` expands).
 /// When unset, `herdr` is resolved via PATH, falling back to
-/// `~/.local/bin/herdr` if `command -v` finds nothing.
-pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
-    match remote_bin {
+/// `~/.local/bin/herdr` if `command -v` finds nothing. A configured session is
+/// added as Herdr's global `--session` option so every remote command selects
+/// the same server.
+pub fn remote_herdr_expr(remote_bin: Option<&str>, session: Option<&str>) -> String {
+    let bin = match remote_bin {
         Some(b) if !b.is_empty() => b.to_string(),
         // The `$(...)` substitution must run under a POSIX sh, never the remote
         // login shell: `ssh host cmd` hands the string to that shell, and fish
@@ -24,7 +26,15 @@ pub fn remote_bin_expr(remote_bin: Option<&str>) -> String {
         // substitution prevent word-splitting if the resolved path contains
         // spaces; ~ still expands inside the unquoted `echo` arg.
         _ => "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr".into(),
+    };
+    match session {
+        Some(session) => format!("{bin} --session {}", shell_quote(session)),
+        None => bin,
     }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// How to reach a host. `Ssh` is the default and the only kind that existed
@@ -87,8 +97,10 @@ pub struct HostConfig {
     pub docker_bin: String,
     pub prefix: String,
     /// Remote herdr binary. `None` = auto-resolve on the remote: PATH first
-    /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_bin_expr`.
+    /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_herdr_expr`.
     pub remote_bin: Option<String>,
+    /// Herdr session name on the remote. `None` selects the default session.
+    pub session: Option<String>,
     /// ssh hosts only; see `ApiTransport`. Default `Auto`.
     pub api_transport: ApiTransport,
     /// keep each mirror pane in control (writable, no idle release, and sized to
@@ -154,6 +166,7 @@ struct RawHost {
     docker_bin: Option<String>,
     prefix: Option<String>,
     remote_bin: Option<String>,
+    session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
     api_transport: Option<String>,
@@ -271,6 +284,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
+            session: h.session.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
@@ -323,6 +337,7 @@ mod tests {
         assert_eq!(h.name, "work");
         assert_eq!(h.prefix, "work");
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
+        assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
     }
 
@@ -347,6 +362,7 @@ mod tests {
             "autostart = false\npoll_seconds = 30\ndefault_host = \"vps\"\n\
              [hosts.vps]\ntarget = \"ssh://niko@203.0.113.7:2222\"\nprefix = \"v\"\n\
              remote_bin = \"/opt/herdr\"\n\
+             session = \"work\"\n\
              [hosts.off]\ntarget = \"x\"\nenabled = false\n",
         )
         .unwrap();
@@ -355,6 +371,7 @@ mod tests {
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.hosts[0].prefix, "v");
         assert_eq!(c.hosts[0].remote_bin.as_deref(), Some("/opt/herdr"));
+        assert_eq!(c.hosts[0].session.as_deref(), Some("work"));
         assert_eq!(c.default_host().unwrap().name, "vps");
     }
 
@@ -387,15 +404,23 @@ mod tests {
         assert_eq!(c.hosts[0].kind, HostKind::Ssh);
         assert_eq!(c.hosts[0].target, "work");
         assert_eq!(c.hosts[0].remote_bin, None);
+        assert_eq!(c.hosts[0].session, None);
     }
 
     #[test]
-    fn remote_bin_expr_configured_vs_auto() {
-        assert_eq!(remote_bin_expr(Some("/opt/herdr")), "/opt/herdr");
-        assert_eq!(remote_bin_expr(Some("~/.local/bin/herdr")), "~/.local/bin/herdr");
+    fn remote_herdr_expr_configured_vs_auto_and_session() {
+        assert_eq!(remote_herdr_expr(Some("/opt/herdr"), None), "/opt/herdr");
+        assert_eq!(
+            remote_herdr_expr(Some("~/.local/bin/herdr"), Some("work")),
+            "~/.local/bin/herdr --session 'work'"
+        );
         let auto = "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr";
-        assert_eq!(remote_bin_expr(None), auto);
-        assert_eq!(remote_bin_expr(Some("")), auto);
+        assert_eq!(remote_herdr_expr(None, None), auto);
+        assert_eq!(remote_herdr_expr(Some(""), None), auto);
+        assert_eq!(
+            remote_herdr_expr(None, Some("team's")),
+            format!("{auto} --session 'team'\\''s'")
+        );
     }
 
     #[test]
