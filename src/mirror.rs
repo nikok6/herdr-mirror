@@ -649,6 +649,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     let (remote_snap, local_snap) =
         tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
 
+    // hidden: the remote is still polled above (health/status keeps working),
+    // but every local reconciliation below is frozen — `hide` already closed
+    // the local mirrors itself (see mirror::teardown), so touching state here
+    // would tombstone them as if the user had closed them for good.
+    if state.hidden {
+        return Ok(());
+    }
+
     let mut local_ws_ids: HashSet<String> =
         local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
     let local_tab_ids: HashSet<&str> = local_snap.tabs.iter().map(|t| t.tab_id.as_str()).collect();

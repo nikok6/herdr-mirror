@@ -379,3 +379,68 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+/// Host for `hide`/`show`: an explicit name is looked up directly (same
+/// unknown-host error shape as `remote-actions`); omitted, it falls back to
+/// the invocation context like `remote-tab`/`remote-split` do, so a key bound
+/// inside a mirror workspace hides/shows whichever connection it's pressed in.
+async fn resolve_host(env: &Env, host_arg: Option<&str>) -> Result<HostConfig> {
+    let config = load_config(&env.config_search)?;
+    if let Some(name) = host_arg {
+        return config.hosts.iter().find(|h| h.name == name).cloned().ok_or_else(|| {
+            let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
+            err(format!(
+                "unknown host {name:?} (configured: {})",
+                if known.is_empty() { "none".into() } else { known.join(", ") }
+            ))
+        });
+    }
+    let ctx = invocation_context();
+    resolve_context(env, &config.hosts, &ctx).map(|r| r.host).ok_or_else(|| {
+        err("no host given and not invoked from inside a mirror workspace — pass one: herdr-mirror hide <host>")
+    })
+}
+
+pub async fn hide_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "hide", hide(&env, host_arg).await).await
+}
+
+pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "show", show(&env, host_arg).await).await
+}
+
+/// Close a host's mirrors locally without touching the remote or tombstoning
+/// them — reuses `mirror::teardown`'s self-close wipe, then marks the host
+/// `hidden` so the daemon's next converge doesn't just recreate them.
+async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    let local = crate::api::ApiClient::connect(&env.local_socket).await?;
+    let log = crate::util::Logger::new(&env.state_dir, false);
+    crate::mirror::teardown(&local, &env.state_dir, &host.name, &log, None).await?;
+    let state = crate::state::HostState { hidden: true, ..Default::default() };
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    println!("hid {} — remote keeps running; `herdr-mirror show {}` brings it back", host.name, host.name);
+    Ok(())
+}
+
+/// Clear `hidden` and nudge the daemon so its next converge recreates the
+/// mirrors fresh (the old local ids are gone — `hide` closed them — so this is
+/// a cold recreate, same as a first connect, not a resume).
+async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    let mut state = crate::state::load_state(&env.state_dir, &host.name);
+    if !state.hidden {
+        println!("{} is not hidden", host.name);
+        return Ok(());
+    }
+    state.hidden = false;
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!("showing {} — daemon syncing now", host.name);
+        }
+        None => println!("showing {} — mirrors reappear when the daemon starts", host.name),
+    }
+    Ok(())
+}
