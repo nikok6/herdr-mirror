@@ -122,11 +122,51 @@ pub struct RemoteHost {
     log: Logger,
 }
 
+/// FNV-1a, truncated to 8 hex chars.
+///
+/// NOT `DefaultHasher`: this value lands in a path the daemon and every
+/// streamer must derive identically, and it has to survive a toolchain
+/// upgrade. std's hasher is explicitly unstable across Rust releases, so a
+/// bump would silently move every long-named host's socket and orphan its live
+/// ControlMaster. FNV-1a is a published algorithm, so the crate's output is
+/// fixed by spec rather than by implementation detail. Not a security boundary
+/// — it only has to separate a user's own host names, and `socket_stem_hash_is_stable`
+/// pins the exact value so a future swap cannot move anyone's sockets unnoticed.
+///
+/// Hashes the raw bytes rather than going through `Hash for str`, which appends
+/// a terminator byte and would give a different (still stable, but arbitrary)
+/// value.
+fn short_hash(s: &str) -> String {
+    use std::hash::Hasher;
+
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(s.as_bytes());
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// Filename stem shared by a host's three sockets, bounded so the longest one
+/// still fits sockaddr_un.
+///
+/// Truncation alone is not enough: two hosts sharing a long prefix (exactly the
+/// naming style that overflows the limit in the first place) would collide, and
+/// a collision is silent and dangerous rather than loud. `ensure_master` probes
+/// the ControlPath before creating a master, so host B would find host A's live
+/// master and run every ssh command — including remote-invoke plugin actions —
+/// on the wrong machine; the docker relay would unlink the other host's live
+/// socket and take over the path. So anything truncated carries a hash of the
+/// FULL name.
+///
+/// Names that already fit are returned verbatim, which is what keeps existing
+/// installs on byte-identical paths across this upgrade (no orphaned masters,
+/// no migration). Only names that were already too long to work at all move.
 fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
     use std::os::unix::ffi::OsStrExt;
 
-    // macOS reserves one byte of sockaddr_un's 104-byte path for NUL. OpenSSH
-    // temporarily adds a 17-byte suffix beside the four-byte .ctl filename.
+    // macOS reserves one byte of sockaddr_un's 104-byte path for NUL; Linux
+    // allows 108, and we deliberately apply the tighter bound on both so a
+    // hosts.toml is portable. Overhead is the worst case across the three
+    // suffixes (`-api-exec.sock`, 14) plus OpenSSH's mux temp suffix on the
+    // ControlPath (a dot and 11 chars); 21 keeps a little slack.
     const MAX_SOCKET_PATH_BYTES: usize = 103;
     const CONTROL_SOCKET_OVERHEAD: usize = 21;
 
@@ -136,11 +176,22 @@ fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
         return host_name.into();
     }
 
-    let mut end = budget.min(host_name.len());
+    // Degrade in defined steps rather than collapsing to a shared stem: prefix
+    // plus hash while both fit, then hash alone. Below that even the hash can't
+    // fit, which means the state dir path itself is too long for any socket —
+    // return the hash anyway so hosts stay distinct and let the bind fail
+    // loudly, rather than handing every host one shared path.
+    let hash = short_hash(host_name);
+    let keep = budget.saturating_sub(hash.len() + 1);
+    let mut end = keep.min(host_name.len());
     while !host_name.is_char_boundary(end) {
         end -= 1;
     }
-    host_name[..end].trim_end_matches('-').into()
+    let prefix = host_name[..end].trim_end_matches('-');
+    if prefix.is_empty() {
+        return hash;
+    }
+    format!("{prefix}-{hash}")
 }
 
 pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> PathBuf {
@@ -555,21 +606,84 @@ mod tests {
 
     #[test]
     fn long_host_names_use_truncated_socket_paths() {
-        use std::os::unix::ffi::OsStrExt;
-
         let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
         let name = "remote-development-environment-with-a-very-long-name";
         let remote = RemoteHost::new(&ssh_host(name), &state_dir);
-        let budget = 103 - state_dir.as_os_str().as_bytes().len() - 1 - 21;
-        let expected_stem = &name[..budget];
+        let stem = socket_stem(&state_dir, name);
 
+        assert!(stem.len() < name.len(), "long name should have been shortened");
+        assert!(name.starts_with(stem.split('-').next().unwrap()), "readable prefix kept");
         assert_eq!(
             remote.ctl_path.file_name().unwrap().to_string_lossy(),
-            format!("{expected_stem}.ctl")
+            format!("{stem}.ctl")
         );
+        // the ControlPath must survive OpenSSH's mux temp suffix on top
         assert!(remote.ctl_path.as_os_str().len() + 17 <= 103);
         assert!(remote.fwd_sock.as_os_str().len() <= 103);
         assert!(remote.exec_sock.as_os_str().len() <= 103);
+    }
+
+    #[test]
+    fn truncated_stems_never_collide_across_hosts() {
+        // The regression this guards: pure truncation gave these one shared
+        // stem, so `-O check` found the other host's live master and every ssh
+        // command — remote-invoke included — ran on the wrong machine, while
+        // the docker relay unlinked the other host's live socket.
+        let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
+        let a = "prod-us-east-1-application-server-cluster-node-alpha";
+        let b = "prod-us-east-1-application-server-cluster-node-beta";
+
+        // these differ only *past* the cut, so plain truncation collided
+        let budget = 103 - state_dir.as_os_str().len() - 1 - 21;
+        assert_eq!(a[..budget], b[..budget], "names must be identical up to the cut");
+
+        assert_ne!(
+            socket_stem(&state_dir, a),
+            socket_stem(&state_dir, b),
+            "distinct hosts must not share a socket stem"
+        );
+        assert_ne!(
+            RemoteHost::new(&ssh_host(a), &state_dir).ctl_path,
+            RemoteHost::new(&ssh_host(b), &state_dir).ctl_path
+        );
+    }
+
+    #[test]
+    fn socket_stem_hash_is_stable() {
+        // Golden values. These bytes are baked into live socket paths, so a
+        // change here silently relocates every long-named host's ControlMaster.
+        // If a hashing swap ever moves them, this must fail first.
+        assert_eq!(short_hash("vps"), "4f02d738");
+        assert_eq!(short_hash("prod-us-east-1-application-server-cluster-node-alpha"), "cbd62d65");
+    }
+
+    #[test]
+    fn short_host_names_keep_their_exact_path() {
+        // existing installs must not move to a new socket on upgrade, which
+        // would orphan a live ControlMaster
+        let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
+        assert_eq!(socket_stem(&state_dir, "vps"), "vps");
+        assert_eq!(socket_stem(&state_dir, "work"), "work");
+        assert_eq!(
+            control_path(&state_dir, "vps"),
+            state_dir.join("vps.ctl"),
+            "path derivation must match what pre-upgrade daemons used"
+        );
+    }
+
+    #[test]
+    fn socket_stem_survives_multibyte_names_and_a_tiny_budget() {
+        let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
+        // truncation must land on a char boundary, never split a code point
+        let name = "höst-nàme-with-ünicode-and-a-very-long-tail-that-overflows";
+        let stem = socket_stem(&state_dir, name);
+        assert!(stem.is_char_boundary(stem.len()));
+
+        // a state dir long enough to eat the whole budget still yields distinct
+        // stems rather than one shared path
+        let deep = PathBuf::from("/Users/example/".to_string() + &"d".repeat(80));
+        assert_ne!(socket_stem(&deep, "alpha-host-name"), socket_stem(&deep, "beta-host-name"));
+        assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
     }
 
     #[test]

@@ -13,6 +13,7 @@ toml = { version = "0.8", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 unicode-width = "0.2"
+fnv = "1.0.7"
 
 [profile.release]
 lto = true
