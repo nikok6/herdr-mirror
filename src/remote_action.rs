@@ -444,3 +444,49 @@ async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+pub async fn remote_tab_for_cmd(env: Env, host_arg: &str) -> Result<()> {
+    let what = format!("remote-tab-for {host_arg}");
+    report_failure(&env, &what, remote_tab_for(&env, host_arg).await).await
+}
+
+/// `remote-tab-for <host>`: a new terminal on a NAMED connection, unlike
+/// `remote-tab` which only knows the connection you're currently focused in
+/// (via `resolve_context`). Needs the host's existing mirror workspace id —
+/// there's no "focused pane" to read cwd/target from here, so this always
+/// targets that workspace's default cwd rather than inheriting one.
+async fn remote_tab_for(env: &Env, host_arg: &str) -> Result<()> {
+    let host = resolve_host(env, Some(host_arg)).await?;
+    let state = crate::state::load_state(&env.state_dir, &host.name);
+    let live: Vec<(&String, &crate::state::WsEntry)> =
+        state.workspaces.iter().filter(|(_, e)| !e.is_tombstoned()).collect();
+    let (ws_rid, _) = match live.as_slice() {
+        [] => {
+            return Err(err(format!(
+                "{}: no mirrored workspace yet — run `herdr-mirror start` (or `show {}` if hidden) and retry",
+                host.name, host.name
+            )))
+        }
+        [one] => *one,
+        many => {
+            let ids: Vec<&str> = many.iter().map(|(rid, _)| rid.as_str()).collect();
+            return Err(err(format!(
+                "{} mirrors {} workspaces — ambiguous which gets the new tab: {}",
+                host.name,
+                many.len(),
+                ids.join(", ")
+            )));
+        }
+    };
+
+    let mut remote = RemoteHost::new(&host, &env.state_dir);
+    let (api, _status) = remote.connect_api().await?;
+    let res: Value =
+        api.request("tab.create", json!({ "workspace_id": ws_rid, "focus": false })).await?;
+    println!(
+        "created tab {} in {}: {ws_rid}; mirror follows shortly",
+        res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?"),
+        host.name
+    );
+    Ok(())
+}
