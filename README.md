@@ -112,6 +112,23 @@ action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
 errors rather than splitting locally, which would desync the mirrored layout.
 
+**New terminal on a named connection** — `remote-tab` only knows the
+connection you're currently focused in. To always target one specific
+connection regardless of focus (e.g. a key that opens a new terminal on
+`work` from anywhere), use `herdr-mirror remote-tab-for <host>` directly —
+plugin actions take no per-invocation arguments, so this isn't a `mirror.*`
+action; bind it as a raw shell command instead:
+
+```toml
+[[keys.command]]
+key = "prefix+alt+w"
+type = "shell"
+command = "~/.local/bin/herdr-mirror remote-tab-for work"
+```
+
+Errors if `work` isn't configured, isn't mirroring yet (`start` it first), or
+mirrors more than one remote workspace (ambiguous — names one to fix).
+
 **Invoke any remote plugin** — locally bound keys never reach a mirror pane's
 stdin, so remote plugins can't be driven by their own bindings. `remote-invoke
 <plugin>.<action>` runs the action on the mirrored host behind your focused

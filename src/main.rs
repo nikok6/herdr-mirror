@@ -6,6 +6,7 @@
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror hide|show [host]       # toggle a connection's mirrors out of view
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
+//   herdr-mirror remote-tab-for <host>  # new terminal on a named connection
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
 //   herdr-mirror bind|unbind ...                    # keybinding setup
@@ -93,6 +94,12 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
+        "remote-tab-for" => {
+            let host = rest
+                .get(1)
+                .ok_or_else(|| util::err("usage: herdr-mirror remote-tab-for <host>"))?;
+            rt.block_on(remote_action::remote_tab_for_cmd(Env::resolve()?, host))
+        }
         "remote-split" => rt.block_on(remote_action::run_cmd(
             Env::resolve()?,
             "split",
@@ -119,7 +126,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|remote-workspace|remote-tab|remote-tab-for|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }
