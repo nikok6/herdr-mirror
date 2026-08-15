@@ -551,8 +551,54 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
 // the wrapper state machine
 
 const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
+
+/// Rung used once the remote pane is known to be gone. Deliberately still a
+/// retry and not a stop: the daemon owns mirror lifecycle and reaps a pane
+/// whose remote has been absent for two converge polls, so the streamer's job
+/// here is to wait quietly for that rather than to decide it is finished. It
+/// also keeps "gone" recoverable, which it sometimes is — a remote herdr
+/// restarting renumbers pane ids while session restore runs.
+const GONE_BACKOFF_MS: u64 = 60_000;
+
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+
+/// Is this failure "the pane we stream is gone", as opposed to any other
+/// failure that happens to mention something missing?
+///
+/// Matches herdr's whole sentence (`headless.rs`: "terminal target {t} not
+/// found") with OUR target in it, rather than loose substrings. That keeps it
+/// off the remote-bin resolver's `exec: …/herdr: not found`, which means herdr
+/// is absent on that host — a different problem with a different fix — and
+/// stops a target being confused with one that merely shares its prefix
+/// (`w1:p1` vs `w1:p10`, both real ids in herdr's base-32 alphabet).
+///
+/// Note the pane dying *underneath* a live stream reports differently
+/// ("terminal attach ended: terminal {term_id} not found", carrying herdr's
+/// internal terminal id, not ours). That deliberately does not match: the next
+/// attempt asks for the pane target and gets the canonical sentence a second
+/// later, so this fires one cycle behind rather than being loosened.
+fn target_gone(reason: &str, pane_target: &str) -> bool {
+    if pane_target.is_empty() {
+        return false;
+    }
+    reason
+        .to_ascii_lowercase()
+        .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
+}
+
+/// Delay before the next attempt, and the ladder position to keep.
+///
+/// Pure so the rung and the ladder-resume are testable without a live pane.
+/// A gone target does NOT consume a rung: if the pane comes back and later
+/// fails transiently, that failure should start where the fast ladder left
+/// off rather than at the top.
+fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
+    if gone {
+        return (GONE_BACKOFF_MS, idx);
+    }
+    (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
+}
 
 struct App {
     args: Args,
@@ -783,14 +829,33 @@ impl App {
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        let delay = BACKOFF[self.backoff_idx.min(BACKOFF.len() - 1)];
-        self.backoff_idx += 1;
-        let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-        self.renderer
-            .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+        // Only slow down once we are back in observe. In control the existing
+        // quick-failure fallback needs its fast retries to reach two failures
+        // and drop the pane to observe within seconds; a 60s rung there would
+        // leave an always_control pane stuck in control for a minute.
+        let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
+        let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
+        self.backoff_idx = idx;
+
+        if gone {
+            // Repainted every cycle on purpose: handle_frame paints herdr's
+            // raw close reason before us on each attempt, so saying this once
+            // would leave the misleading "terminal closed" line on screen from
+            // the second cycle onward. The renderer diffs rows, so an
+            // unchanged line costs one row write a minute.
+            self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
+            // and nothing may expire it out from under us: the control→observe
+            // fallback sets a 1.5s hint just before this path runs
+            self.hint_clear_at = None;
+        } else {
+            let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
+            self.renderer
+                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+        }
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
     }
+
 
     fn switch_mode(&mut self, m: Mode) {
         // already settled or scheduled — don't restart. Without this guard,
@@ -1584,4 +1649,61 @@ mod tests {
         };
         assert_eq!(body, b"caf\xe9", "0xE9 must not become U+FFFD");
     }
+
+    #[test]
+    fn target_gone_matches_only_this_pane_being_gone() {
+        // the real sentence, captured from herdr against a missing pane
+        assert!(target_gone(
+            "terminal session observe failed: terminal target w9Z:p99 not found",
+            "w9Z:p99"
+        ));
+        assert!(target_gone(
+            "terminal session control failed: terminal target w1:p1 not found",
+            "w1:p1"
+        ));
+
+        // the false positive that matters most: herdr absent on the remote.
+        // The auto-resolver execs `$(command -v herdr || echo ~/.local/bin/herdr)`,
+        // so a host without herdr fails with a shell not-found — a different
+        // problem that a slow rung would wrongly paper over.
+        assert!(!target_gone("sh: 1: exec: /home/u/.local/bin/herdr: not found", "w9Z:p99"));
+
+        // a target that merely shares our prefix: p1 and p10 are both real ids
+        assert!(!target_gone(
+            "terminal session observe failed: terminal target w1:p10 not found",
+            "w1:p1"
+        ));
+        // ...and another pane's disappearance is not ours
+        assert!(!target_gone(
+            "terminal session observe failed: terminal target w1:p4 not found",
+            "w9Z:p99"
+        ));
+
+        // ordinary transients stay on the fast ladder
+        assert!(!target_gone("api timeout: session.snapshot", "w9Z:p99"));
+        assert!(!target_gone("ssh timeout", "w9Z:p99"));
+        assert!(!target_gone("", "w9Z:p99"));
+        // an empty target must not turn `contains` into "matches everything"
+        assert!(!target_gone("terminal target w1:p1 not found", ""));
+    }
+
+    #[test]
+    fn a_gone_target_slows_down_without_consuming_the_ladder() {
+        // the fix: 10s forever becomes one attempt a minute
+        assert_eq!(reconnect_delay(true, 0), (GONE_BACKOFF_MS, 0));
+        assert_eq!(reconnect_delay(true, 3), (GONE_BACKOFF_MS, 3));
+
+        // the fast ladder is unchanged and still clamps at its last rung
+        assert_eq!(reconnect_delay(false, 0), (1000, 1));
+        assert_eq!(reconnect_delay(false, 1), (2000, 2));
+        assert_eq!(reconnect_delay(false, 3), (10000, 4));
+        assert_eq!(reconnect_delay(false, 99), (10000, 100));
+
+        // a gone spell must not burn rungs: a transient afterwards resumes
+        // where the ladder was, rather than restarting at 1s
+        let (_, idx) = reconnect_delay(false, 0);
+        let (_, idx) = reconnect_delay(true, idx);
+        assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
 }
