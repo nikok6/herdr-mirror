@@ -125,7 +125,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     if positional.len() != 2 {
         return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--dump]",
+            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--cols N --rows N] [--dump]",
         ));
     }
     args.container = match (container_name, container_folder) {

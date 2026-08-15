@@ -358,7 +358,14 @@ impl RemoteHost {
         let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
         let mut status = RemoteStatus { socket, supported: false, reason: None };
         if !running {
-            status.reason = Some("remote herdr server is not running".into());
+            // Name the session, or this reads as "that machine's herdr is
+            // down" while the default session is running perfectly and only
+            // the configured one is stopped — which is the common way to get
+            // here once `session` is in play (a typo, or `herdr session stop`).
+            status.reason = Some(match &self.cfg.session {
+                Some(name) => format!("remote herdr session {name:?} is not running"),
+                None => "remote herdr server is not running".into(),
+            });
             return Ok(status);
         }
         match version_supported(&version) {
@@ -602,6 +609,7 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: name.into(),
             remote_bin: None,
+            session: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

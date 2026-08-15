@@ -50,8 +50,7 @@ Then create the config at `~/.config/herdr-mirror/hosts.toml`:
 
 ```toml
 [hosts.work]
-target = "work"         # anything ssh accepts: alias, user@host, ssh://host:2222
-session = "project"     # optional: same target as `herdr --session project`
+target = "work"        # anything ssh accepts: alias, user@host, ssh://host:2222
 ```
 
 That's it — the daemon autostarts when you focus a workspace, so within a few
@@ -275,7 +274,6 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
-# session = "work"                    # Herdr session name on this host
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
