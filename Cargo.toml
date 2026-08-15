@@ -1,6 +1,6 @@
 [package]
 name = "herdr-mirror"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
@@ -13,6 +13,7 @@ toml = { version = "0.8", features = ["preserve_order"] }
 base64 = "0.22"
 libc = "0.2"
 unicode-width = "0.2"
+fnv = "1.0.7"
 
 [profile.release]
 lto = true
