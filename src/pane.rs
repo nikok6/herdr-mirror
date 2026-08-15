@@ -181,6 +181,7 @@ enum Msg {
     /// Some(false)=TUI, None=poll failed (keep last value)
     Foreground(Option<bool>),
     Paste(crate::paste::Outcome),
+    Drop(crate::paste::DropResult),
 }
 
 struct Session {
@@ -462,6 +463,85 @@ fn contains_wheel_press(bytes: &[u8]) -> bool {
     false
 }
 
+/// Cap on a partially-received bracketed paste. Past this we stop waiting for
+/// a terminator and flush what we have: a huge paste is still forwarded, it
+/// just loses the drop treatment rather than buffering without bound.
+const MAX_PASTE_BYTES: usize = 1024 * 1024;
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Input held back while an upload is in flight (see `route_input`).
+enum Queued {
+    Raw(Vec<u8>),
+    Body(Vec<u8>),
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PasteSplit {
+    /// a paste has begun but not finished; nothing to do yet
+    Pending,
+    /// no paste involved: forward as-is
+    Passthrough(Vec<u8>),
+    Complete { before: Vec<u8>, body: Vec<u8>, after: Vec<u8> },
+}
+
+fn find_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Longest suffix of `hay` that is a *proper* prefix of `needle`, so a marker
+/// straddling two reads is held rather than forwarded in pieces.
+fn trailing_partial(hay: &[u8], needle: &[u8]) -> usize {
+    (1..needle.len().min(hay.len()) + 1)
+        .rev()
+        .find(|&n| n < needle.len() && hay[hay.len() - n..] == needle[..n])
+        .unwrap_or(0)
+}
+
+/// Pull the next complete bracketed paste out of `buf` + `chunk`.
+///
+/// Pure so the framing can be table-tested without a pane: every interesting
+/// case (split reads, a START with no END, bytes either side, several pastes
+/// in one read, the oversize flush) lives here rather than in the event loop.
+pub(crate) fn split_paste(buf: &mut Vec<u8>, chunk: Vec<u8>) -> PasteSplit {
+    // fast path for ordinary typing: nothing buffered and no marker starting
+    if buf.is_empty()
+        && find_seq(&chunk, PASTE_START).is_none()
+        && trailing_partial(&chunk, PASTE_START) == 0
+    {
+        return PasteSplit::Passthrough(chunk);
+    }
+    buf.extend_from_slice(&chunk);
+
+    // a paste that never terminates must not buffer without bound
+    if buf.len() > MAX_PASTE_BYTES {
+        return PasteSplit::Passthrough(std::mem::take(buf));
+    }
+
+    let Some(start) = find_seq(buf, PASTE_START) else {
+        // hold only a possible partial marker; release everything before it
+        let keep = trailing_partial(buf, PASTE_START);
+        let cut = buf.len() - keep;
+        if cut == 0 {
+            return PasteSplit::Pending;
+        }
+        let tail = buf.split_off(cut);
+        let head = std::mem::replace(buf, tail);
+        return PasteSplit::Passthrough(head);
+    };
+    let Some(end) = find_seq(&buf[start..], PASTE_END).map(|i| start + i) else {
+        return PasteSplit::Pending;
+    };
+
+    let all = std::mem::take(buf);
+    PasteSplit::Complete {
+        before: all[..start].to_vec(),
+        body: all[start + PASTE_START.len()..end].to_vec(),
+        after: all[end + PASTE_END.len()..].to_vec(),
+    }
+}
+
 fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
@@ -515,6 +595,13 @@ struct App {
     /// to match the remote's so forwarded arrows arrive in the form it expects
     app_cursor_keys: bool,
     paste_inflight: bool,
+    /// partially-received bracketed paste (see `intercept_paste`)
+    paste_buf: Vec<u8>,
+    /// input held back while an upload is in flight, flushed in order after
+    paste_queue: Vec<Queued>,
+    /// the payload that started the in-flight upload, so it can be forwarded
+    /// unchanged when every path turns out to exist on the remote already
+    paste_original: Option<Vec<u8>>,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -553,6 +640,15 @@ impl App {
         self.renderer.status(text);
         self.paint();
         self.hint_clear_at = Some(Instant::now() + Duration::from_millis(1500));
+    }
+
+    /// A hint with no expiry, for work whose duration we don't know: an upload
+    /// can outlast the usual 1.5s and the pane would otherwise look idle while
+    /// it is busy. Whoever set it replaces it when the work resolves.
+    fn hint_sticky(&mut self, text: &str) {
+        self.renderer.status(text);
+        self.paint();
+        self.hint_clear_at = None;
     }
 
     /// Kick a background poll of the remote pane's foreground process, throttled
@@ -784,7 +880,110 @@ impl App {
         }
     }
 
-    async fn handle_stdin(&mut self, buf: Vec<u8>) {
+    /// Drain every complete paste in this chunk, in order.
+    ///
+    /// Deliberately a loop, not a one-shot: two drops land in a single read
+    /// with nothing between them (a drop carries no terminator at all — which
+    /// is precisely why `run` asks for DECSET 2004), so handling only the
+    /// first would silently swallow the second, and leave its markers in the
+    /// tail to be forwarded raw at the remote.
+    async fn handle_stdin(&mut self, chunk: Vec<u8>) {
+        let mut chunk = chunk;
+        loop {
+            match split_paste(&mut self.paste_buf, chunk) {
+                PasteSplit::Pending => return,
+                PasteSplit::Passthrough(bytes) => return self.route_input(bytes).await,
+                PasteSplit::Complete { before, body, after } => {
+                    self.route_input(before).await;
+                    self.route_paste_body(body).await;
+                    if after.is_empty() {
+                        return;
+                    }
+                    chunk = after;
+                }
+            }
+        }
+    }
+
+    /// Ordinary input, held back while an upload is in flight so the pasted
+    /// remote paths cannot be overtaken by whatever was typed after them.
+    async fn route_input(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.paste_inflight {
+            self.paste_queue.push(Queued::Raw(bytes));
+            return;
+        }
+        self.handle_stdin_inner(bytes).await;
+    }
+
+    /// A complete paste body, markers already stripped. A file drop is
+    /// uploaded; anything else is forwarded verbatim as if it had been typed.
+    async fn route_paste_body(&mut self, body: Vec<u8>) {
+        if self.paste_inflight {
+            self.paste_queue.push(Queued::Body(body));
+            return;
+        }
+        // lossy only for the probe; the forward path keeps the original bytes
+        let Some(paths) = crate::paste::dropped_paths(&String::from_utf8_lossy(&body)) else {
+            self.handle_stdin_inner(body).await;
+            return;
+        };
+
+        self.paste_inflight = true;
+        self.paste_original = Some(body);
+        self.hint_sticky(&format!("uploading {} file(s)…", paths.len()));
+        let tx = self.tx.clone();
+        let ssh = self.args.ssh_target.clone();
+        let ctl = self.args.ctl_path.clone();
+        let container = self.args.container.clone();
+        tokio::spawn(async move {
+            let result =
+                crate::paste::files_to_remote(&paths, &ssh, ctl.as_deref(), container.as_ref())
+                    .await;
+            let _ = tx.send(Msg::Drop(result)).await;
+        });
+    }
+
+    async fn handle_drop(&mut self, result: crate::paste::DropResult) {
+        self.paste_inflight = false;
+        let original = self.paste_original.take();
+        if let Some(text) = &result.text {
+            self.deliver_input(crate::paste::bracketed(text)).await;
+            self.hint(&format!("→ {text}"));
+        } else if result.unchanged {
+            // every path already exists over there, so the user meant those
+            // files: forward what they actually dropped
+            if let Some(body) = original {
+                self.handle_stdin_inner(body).await;
+            }
+        }
+        if let Some(e) = result.error {
+            self.hint(&format!("drop failed: {e}"));
+        }
+        self.drain_paste_queue().await;
+    }
+
+    /// Flush input held during an upload. Stops if a queued drop starts a new
+    /// upload, leaving the remainder queued behind it so order is preserved.
+    async fn drain_paste_queue(&mut self) {
+        let mut items = std::mem::take(&mut self.paste_queue).into_iter();
+        while let Some(item) = items.next() {
+            match item {
+                Queued::Raw(b) => self.handle_stdin_inner(b).await,
+                Queued::Body(b) => {
+                    self.route_paste_body(b).await;
+                    if self.paste_inflight {
+                        self.paste_queue.extend(items);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
         if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
             self.paste_inflight = true;
             let tx = self.tx.clone();
@@ -915,7 +1114,7 @@ impl App {
             crate::paste::Outcome::NoImage => self.deliver_input(vec![0x16]).await,
             crate::paste::Outcome::Pasted(path) => {
                 self.deliver_input(crate::paste::bracketed(&path)).await;
-                self.hint(&format!("image → {path}"));
+                self.hint(&format!("→ {path}"));
             }
             crate::paste::Outcome::Failed(e) => {
                 self.hint(&format!("image paste failed: {e}"));
@@ -956,7 +1155,11 @@ pub async fn run(args: Args) -> Result<()> {
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
+        // 2004 (bracketed paste) is asked for purely to get framing: herdr
+        // only wraps a paste when the pane's app has enabled it, and a file
+        // drop otherwise arrives as bare text with no terminator at all. See
+        // `intercept_paste`; the markers never reach the remote.
+        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
         RawMode::enable()
     } else {
         None
@@ -1010,6 +1213,9 @@ pub async fn run(args: Args) -> Result<()> {
         // moves it if the remote turns out to be a TUI
         app_cursor_keys: false,
         paste_inflight: false,
+        paste_buf: Vec::new(),
+        paste_queue: Vec::new(),
+        paste_original: None,
     };
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
@@ -1069,6 +1275,7 @@ pub async fn run(args: Args) -> Result<()> {
                         app.sync_cursor_key_mode();
                     },
                     Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
+                    Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
             _ = sigwinch.recv() => {
@@ -1137,7 +1344,7 @@ pub async fn run(args: Args) -> Result<()> {
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
         // would misencode arrows for whatever runs there next
-        write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
+        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?1049l");
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -1265,5 +1472,116 @@ mod tests {
         // allowed to impose a size we cannot vouch for.
         assert!(!size_is_trusted((44, 16)));
         assert!(!size_is_trusted((49, 23)));
+    }
+
+    // --- paste framing -----------------------------------------------------
+    // The bugs these pin were all real: a one-shot version dropped the second
+    // drop in a read, leaked markers from the tail, and corrupted non-UTF-8.
+
+    const S: &[u8] = b"\x1b[200~";
+    const E: &[u8] = b"\x1b[201~";
+
+    fn split(buf: &mut Vec<u8>, chunk: &[u8]) -> PasteSplit {
+        split_paste(buf, chunk.to_vec())
+    }
+
+    fn seq(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[test]
+    fn ordinary_typing_passes_straight_through() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, b"a"), PasteSplit::Passthrough(b"a".to_vec()));
+        assert_eq!(split(&mut buf, b"\x1b[A"), PasteSplit::Passthrough(b"\x1b[A".to_vec()));
+        assert!(buf.is_empty(), "typing must not buffer");
+    }
+
+    #[test]
+    fn paste_split_across_reads_reassembles() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, &seq(&[S, b"he"])), PasteSplit::Pending);
+        assert_eq!(split(&mut buf, b"llo"), PasteSplit::Pending);
+        assert_eq!(
+            split(&mut buf, E),
+            PasteSplit::Complete { before: vec![], body: b"hello".to_vec(), after: vec![] }
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn start_marker_split_across_reads_is_not_leaked() {
+        // the 6-byte introducer straddling a read boundary must be held, not
+        // forwarded in pieces (which would print ESC[20 at the remote)
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, b"\x1b[20"), PasteSplit::Pending);
+        assert_eq!(
+            split(&mut buf, &seq(&[b"0~/tmp/a.png", E])),
+            PasteSplit::Complete { before: vec![], body: b"/tmp/a.png".to_vec(), after: vec![] }
+        );
+    }
+
+    #[test]
+    fn bytes_around_the_markers_are_preserved() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split(&mut buf, &seq(&[b"pre", S, b"mid", E, b"post"])),
+            PasteSplit::Complete {
+                before: b"pre".to_vec(),
+                body: b"mid".to_vec(),
+                after: b"post".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn two_pastes_in_one_read_are_drained_in_order() {
+        // the regression: only the first was handled and the rest discarded,
+        // so a second drop vanished and its markers reached the remote raw
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { body, after, .. } =
+            split(&mut buf, &seq(&[S, b"one", E, S, b"two", E]))
+        else {
+            panic!("expected first paste")
+        };
+        assert_eq!(body, b"one");
+        assert_eq!(
+            split(&mut buf, &after),
+            PasteSplit::Complete { before: vec![], body: b"two".to_vec(), after: vec![] },
+            "feeding the tail back must yield the second paste"
+        );
+    }
+
+    #[test]
+    fn keystroke_after_a_paste_survives() {
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { after, .. } = split(&mut buf, &seq(&[S, b"/tmp/a", E, b"\r"]))
+        else {
+            panic!("expected paste")
+        };
+        assert_eq!(after, b"\r", "the trailing keystroke must not be eaten");
+    }
+
+    #[test]
+    fn unterminated_paste_flushes_at_the_cap_without_duplicating() {
+        let mut buf = Vec::new();
+        assert_eq!(split(&mut buf, S), PasteSplit::Pending);
+        let big = vec![b'x'; MAX_PASTE_BYTES + 1];
+        let PasteSplit::Passthrough(out) = split(&mut buf, &big) else {
+            panic!("expected a flush")
+        };
+        assert_eq!(out.len(), S.len() + big.len(), "every byte exactly once");
+        assert!(buf.is_empty(), "buffer must not keep a copy");
+    }
+
+    #[test]
+    fn non_utf8_paste_body_is_forwarded_byte_exact() {
+        // the body is only lossily decoded to probe for paths; what gets
+        // forwarded must be the original bytes
+        let mut buf = Vec::new();
+        let PasteSplit::Complete { body, .. } = split(&mut buf, &seq(&[S, b"caf\xe9", E])) else {
+            panic!("expected paste")
+        };
+        assert_eq!(body, b"caf\xe9", "0xE9 must not become U+FFFD");
     }
 }
