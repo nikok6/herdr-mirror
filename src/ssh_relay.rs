@@ -22,6 +22,7 @@
 // a small python3 stdio↔unix bridge (see `python_bridge_command`) — chosen
 // once per host by `detect_relay_command` and reused for every connection.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -30,7 +31,10 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(not(unix))]
+use tokio::net::{TcpListener as UnixListener, TcpStream as UnixStream};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -159,22 +163,29 @@ struct ExecTarget {
 impl ExecTarget {
     fn relay_child(&self) -> Result<tokio::process::Child> {
         let mut cmd = Command::new("ssh");
-        cmd.args([
-            "-S",
-            &self.ctl_path.display().to_string(),
-            "-o",
-            "BatchMode=yes",
-            &self.ssh_target,
-            &self.relay_cmd.cmd,
-        ]);
+        #[cfg(windows)]
+        {
+            cmd.args([
+                "-o",
+                "BatchMode=yes",
+                &self.ssh_target,
+                &self.relay_cmd.cmd,
+            ]);
+        }
+        #[cfg(not(windows))]
+        {
+            cmd.args([
+                "-S",
+                &self.ctl_path.display().to_string(),
+                "-o",
+                "BatchMode=yes",
+                &self.ssh_target,
+                &self.relay_cmd.cmd,
+            ]);
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // kept, not nulled: an sshd that killed the channel, or a relay
-            // command that can't open the socket, is otherwise indistinguishable
-            // from a clean close and the real reason is lost
             .stderr(Stdio::piped())
-            // if we drop the connection the child must die rather than linger
-            // holding an exec channel open on the ControlMaster
             .kill_on_drop(true);
         cmd.spawn().map_err(|e| err(format!("ssh exec (relay) failed: {e}")))
     }
@@ -187,7 +198,7 @@ impl ExecTarget {
 /// Structurally identical to `docker::serve_relay` — see that function's
 /// comments for the accept-loop and shutdown reasoning, which apply unchanged
 /// here.
-pub fn serve_relay(
+pub async fn serve_relay(
     ctl_path: PathBuf,
     ssh_target: String,
     relay_cmd: RelayCommand,
@@ -199,11 +210,23 @@ pub fn serve_relay(
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    #[cfg(unix)]
     let listener = UnixListener::bind(&local_sock)
         .map_err(|e| err(format!("cannot bind {}: {e}", local_sock.display())))?;
+    #[cfg(not(unix))]
+    let (listener, path) = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| err(format!("cannot bind tcp listener: {e}")))?;
+        let addr = l.local_addr().map_err(|e| err(format!("cannot get tcp addr: {e}")))?;
+        std::fs::write(&local_sock, addr.to_string())
+            .map_err(|e| err(format!("cannot write tcp addr to {}: {e}", local_sock.display())))?;
+        (l, local_sock.clone())
+    };
     // anyone who can connect here drives the remote herdr API unauthenticated,
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(&local_sock, std::fs::Permissions::from_mode(0o600)) {
         log.log(&format!("relay: cannot restrict {}: {e}", local_sock.display()));
     }
@@ -264,6 +287,7 @@ impl Drop for RelayHandle {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.task.abort();
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -274,7 +298,7 @@ async fn pump(target: &ExecTarget, stream: UnixStream, shutdown: watch::Receiver
     let mut cin = child.stdin.take().ok_or_else(|| err("relay: no child stdin"))?;
     let mut cout = child.stdout.take().ok_or_else(|| err("relay: no child stdout"))?;
     let mut cerr = child.stderr.take().ok_or_else(|| err("relay: no child stderr"))?;
-    let (mut lr, mut lw) = stream.into_split();
+    let (mut lr, mut lw) = tokio::io::split(stream);
 
     // Client → remote. Finishing means the client half-closed after sending
     // its request, which is NOT the end of the exchange: forward the EOF and
@@ -426,10 +450,14 @@ mod tests {
         let relay_cmd =
             RelayCommand { cmd: python_bridge_command(&sock), tool: "python3" };
         let handle = serve_relay(ctl_path.clone(), ssh_target.clone(), relay_cmd, local_sock.clone(), Logger::new(&dir, false))
+            .await
             .unwrap();
 
-        let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+        }
 
         let api = crate::api::ApiClient::connect(&handle.path).await.expect("ping through exec relay");
         eprintln!("ping ok");
