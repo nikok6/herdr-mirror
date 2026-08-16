@@ -363,8 +363,8 @@ pub(crate) fn cmd_for_pane(
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = crate::remote::control_path(state_dir, &host.name)
-        .display()
-        .to_string();
+        .to_string_lossy()
+        .replace('\\', "/");
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -423,6 +423,11 @@ pub(crate) fn cmd_for_pane(
 /// single-quote for a POSIX shell command line
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(windows)]
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Reconcile one mirrored tab's geometry: exchange panes into the arrangement
@@ -575,9 +580,16 @@ pub(crate) async fn spawn_streamer_pane(
     argv: &[String],
     log: &Logger,
 ) {
+#[cfg(unix)]
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
+    );
+    #[cfg(windows)]
+    let line = format!(
+        "\"{}\" {}\r\n",
+        argv[0].replace('/', "\\"),
+        argv[1..].iter().map(|a| format!("\"{}\"", a.replace('"', "\"\""))).collect::<Vec<_>>().join(" ")
     );
     if let Err(e) = local
         .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))

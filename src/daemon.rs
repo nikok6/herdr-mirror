@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -567,28 +568,45 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         closes.clone(),
     )));
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut poll = tokio::time::interval(Duration::from_secs(config.poll_seconds.max(5)));
     poll.tick().await; // consume the immediate first tick (initial sync already runs)
 
-    loop {
-        tokio::select! {
-            _ = poll.tick() => {
-                for p in &pokers {
-                    let _ = p.try_send(());
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigusr1 = signal(SignalKind::user_defined1())?;
+
+        loop {
+            tokio::select! {
+                _ = poll.tick() => {
+                    for p in &pokers {
+                        let _ = p.try_send(());
+                    }
                 }
-            }
-            _ = sigusr1.recv() => {
-                // restore pokes us instead of converging itself — single writer
-                log.log("sync poke received");
-                for p in &pokers {
-                    let _ = p.try_send(());
+                _ = sigusr1.recv() => {
+                    // restore pokes us instead of converging itself — single writer
+                    log.log("sync poke received");
+                    for p in &pokers {
+                        let _ = p.try_send(());
+                    }
                 }
+                _ = sigterm.recv() => break,
+                _ = sigint.recv() => break,
             }
-            _ = sigterm.recv() => break,
-            _ = sigint.recv() => break,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        loop {
+            tokio::select! {
+                _ = poll.tick() => {
+                    for p in &pokers {
+                        let _ = p.try_send(());
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => break,
+            }
         }
     }
 
@@ -618,14 +636,17 @@ pub async fn cmd_run(env: Env) -> Result<()> {
 pub fn cmd_start(env: &Env) -> Result<()> {
     // flock + parent-written pidfile: two racing starts (focus hook) must not
     // both see "not running" and spawn duplicate daemons
-    use std::os::fd::AsRawFd;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(env.state_dir.join("daemon.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(err("cannot lock daemon.lock"));
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(env.state_dir.join("daemon.lock"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(err("cannot lock daemon.lock"));
+        }
     }
     if running_pid(env).is_some() {
         println!("mirror daemon already running");
@@ -637,15 +658,27 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .append(true)
         .open(env.state_dir.join("daemon.log"))?;
     let log2 = log.try_clone()?;
-    use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new(exe)
-        .arg("daemon")
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(log2)
-        .env("HERDR_MIRROR_DETACHED", "1")
-        .process_group(0)
-        .spawn()?;
+        .env("HERDR_MIRROR_DETACHED", "1");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = cmd.spawn()?;
     fs::write(pid_path(env), child.id().to_string())?;
     println!("mirror daemon started (pid {})", child.id());
     Ok(())
@@ -657,7 +690,10 @@ pub fn cmd_pause(env: &Env) {
     match running_pid(env) {
         None => println!("mirror daemon already stopped; paused (won't autostart until you run start)"),
         Some(pid) => {
+            #[cfg(unix)]
             unsafe { libc::kill(pid, libc::SIGTERM) };
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
             println!("paused mirror daemon (pid {pid}); mirrors stay, resume with start");
         }
     }
@@ -795,6 +831,7 @@ pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>
     }
     match running_pid(env) {
         Some(pid) => {
+            #[cfg(unix)]
             unsafe { libc::kill(pid, libc::SIGUSR1) };
             println!("restored {cleared} mirror(s) — daemon syncing now");
         }
@@ -806,7 +843,10 @@ pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>
 pub async fn cmd_teardown(env: Env) -> Result<()> {
     let log = Logger::new(&env.state_dir, true);
     if let Some(pid) = running_pid(&env) {
+        #[cfg(unix)]
         unsafe { libc::kill(pid, libc::SIGTERM) };
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     set_paused(&env, true); // torn down stays down until an explicit start
