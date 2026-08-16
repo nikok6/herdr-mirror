@@ -210,13 +210,19 @@ pub fn dropped_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
         match ch {
-            // the escape is the terminal's, not the shell's: the next char is
-            // literal whatever it is. A trailing lone backslash is kept rather
-            // than rejecting the payload, matching herdr's unescape.
-            '\\' => match chars.next() {
-                Some(next) => current.push(next),
-                None => current.push('\\'),
-            },
+            // the escape is the terminal's, not the shell's: on unix the next char is
+            // literal whatever it is. On Windows backslash is path separator unless escaping space/quote.
+            '\\' => {
+                #[cfg(unix)]
+                match chars.next() {
+                    Some(next) => current.push(next),
+                    None => current.push('\\'),
+                }
+                #[cfg(not(unix))]
+                {
+                    current.push('\\');
+                }
+            }
             '\'' | '"' if quote.is_none() => quote = Some(ch),
             _ if Some(ch) == quote => quote = None,
             ' ' if quote.is_none() => {
@@ -391,6 +397,7 @@ mod tests {
     /// Real terminal output, captured by dragging onto a pane: absolute paths,
     /// single-space separated, spaces inside a name backslash-escaped, and
     /// notably NO trailing newline.
+    #[cfg(unix)]
     #[test]
     fn drop_payload_splits_on_unescaped_spaces_only() {
         let dir = std::env::temp_dir().join(format!("drop-test-{}", std::process::id()));
@@ -454,6 +461,7 @@ mod tests {
         assert_eq!(san(Some(&"z".repeat(40))).len(), 16);
     }
 
+    #[cfg(unix)]
     #[test]
     fn quoted_and_backslashed_drops_both_parse() {
         let dir = std::env::temp_dir().join(format!("drop-q-{}", std::process::id()));
