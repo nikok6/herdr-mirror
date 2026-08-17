@@ -614,6 +614,7 @@ mod tests {
             max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
+            agents_only: false,
         }
     }
 

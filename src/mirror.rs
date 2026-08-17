@@ -647,6 +647,28 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
+/// Does this remote workspace hold a live agent? The predicate behind
+/// `agents_only` (see HostConfig).
+///
+/// `agent_panes` is the remote's own agent list, filtered by
+/// `AgentInfo::has_agent`, so the filter and the status pushed onto the mirror
+/// row are derived from one snapshot and cannot disagree.
+///
+/// A workspace with no panes in the snapshot counts as agentless: a
+/// just-created remote workspace is a bare shell, and it becomes mirrorable the
+/// moment an agent appears in it. Unlike the nested-mirror guard, which treats
+/// "no panes" as "nothing to skip", the question here is presence, not absence.
+fn ws_has_agent(panes: &[&PaneInfo], agent_panes: &HashSet<&str>) -> bool {
+    panes.iter().any(|p| agent_panes.contains(p.pane_id.as_str()))
+}
+
+/// The remote's agent panes: its agent list filtered by `AgentInfo::has_agent`,
+/// so a sparse release row ("no agent here any more") never counts as one.
+/// Shared by the converge filter and its tests so both agree by construction.
+fn agent_pane_ids(agents: &[AgentInfo]) -> HashSet<&str> {
+    agents.iter().filter(|a| a.has_agent()).map(|a| a.pane_id.as_str()).collect()
+}
+
 // --- the converge pass ---
 
 /// Returns the post-converge state so callers don't re-read the state file.
@@ -812,9 +834,68 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
+    // agents_only: skip remote workspaces with no agent in any pane. Same shape
+    // as the nested-mirror guard above, from the same snapshot the agent
+    // statuses are pushed from.
+    let agent_panes = agent_pane_ids(&remote_snap.agents);
+    let mut agentless_ws_ids: HashSet<String> = HashSet::new();
+    if host.agents_only {
+        for rws in &remote_snap.workspaces {
+            let panes: &[&PaneInfo] =
+                panes_by_ws.get(rws.workspace_id.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !ws_has_agent(panes, &agent_panes) {
+                agentless_ws_ids.insert(rws.workspace_id.clone());
+            }
+        }
+    }
+
+    // 2b. mirrors whose workspace stopped qualifying (its agent exited) are
+    //     closed here, not by section 2: the remote workspace is still present,
+    //     so the absence sweep never fires for it.
+    //
+    //     Marked as our own close, so a filter decision can never be mistaken
+    //     for user intent and reach the remote via close_remote_on_local_close.
+    //     The entries are REMOVED rather than tombstoned, because a tombstone
+    //     means "the user closed this, never recreate" — it would hide the
+    //     workspace for good, including the next agent to start in it.
+    let reap: Vec<String> = state
+        .workspaces
+        .iter()
+        .filter(|(rid, e)| {
+            agentless_ws_ids.contains(rid.as_str())
+                && !e.is_tombstoned()
+                && local_ws_ids.contains(&e.local_id)
+        })
+        .map(|(rid, _)| rid.clone())
+        .collect();
+    if !reap.is_empty() {
+        let tab_ws: HashMap<&str, &str> =
+            remote_snap.tabs.iter().map(|t| (t.tab_id.as_str(), t.workspace_id.as_str())).collect();
+        for rid in reap {
+            let entry = state.workspaces.remove(&rid).unwrap();
+            log.log(&format!(
+                "remote workspace {rid} has no agent — closing mirror {} (agents_only)",
+                entry.local_id
+            ));
+            mark_self_close(deps, &entry.local_id);
+            if let Err(e) =
+                deps.local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await
+            {
+                log.log(&format!("close failed: {e}"));
+            }
+            local_ws_ids.remove(&entry.local_id);
+            // drop the tab/pane entries the closed workspace owned, so no stale
+            // mapping survives to be wired into a rebuilt mirror later
+            state.panes.retain(|prid, _| pane_ws.get(prid.as_str()).copied() != Some(rid.as_str()));
+            state.tabs.retain(|trid, _| tab_ws.get(trid.as_str()).copied() != Some(rid.as_str()));
+        }
+    }
+
     // 3. remote workspaces → ensure mirrors exist with the right label
     for rws in &remote_snap.workspaces {
-        if mirror_ws_ids.contains(&rws.workspace_id) {
+        if mirror_ws_ids.contains(&rws.workspace_id)
+            || agentless_ws_ids.contains(&rws.workspace_id)
+        {
             continue;
         }
         let label = format!("{}: {}", host.prefix, rws.label);
@@ -1526,10 +1607,73 @@ mod tests {
             remote_bin: None,
             session: None,
             always_control: true,
+            agents_only: false,
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
         }
+    }
+
+    fn pane(pane_id: &str, ws: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.into(),
+            tab_id: format!("{ws}:t1"),
+            workspace_id: ws.into(),
+            label: None,
+            cwd: None,
+            foreground_cwd: None,
+        }
+    }
+
+    fn agent_on(pane_id: &str) -> AgentInfo {
+        AgentInfo {
+            pane_id: pane_id.into(),
+            agent: Some("claude".into()),
+            agent_status: Some("idle".into()),
+            ..Default::default()
+        }
+    }
+
+    /// `agents_only` mirrors a workspace when ANY of its panes has an agent —
+    /// an agent beside two shells is still an agent workspace.
+    #[test]
+    fn ws_has_agent_needs_one_agent_pane() {
+        let panes = [pane("w1:p1", "w1"), pane("w1:p2", "w1"), pane("w1:p3", "w1")];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+        let agents = [agent_on("w1:p2")];
+        assert!(ws_has_agent(&refs, &agent_pane_ids(&agents)));
+
+        // the same panes with the agent living in a DIFFERENT workspace
+        let elsewhere = [agent_on("w9:p1")];
+        assert!(!ws_has_agent(&refs, &agent_pane_ids(&elsewhere)));
+    }
+
+    /// A workspace with no panes in the snapshot is agentless, not
+    /// "unclassifiable": a fresh remote workspace is a bare shell, and it
+    /// becomes mirrorable the moment an agent starts in it. Note this is the
+    /// opposite of the nested-mirror guard, which skips the empty case.
+    #[test]
+    fn a_paneless_workspace_has_no_agent() {
+        assert!(!ws_has_agent(&[], &agent_pane_ids(&[agent_on("w1:p1")])));
+    }
+
+    /// The agent list also carries release rows — `agent: null`,
+    /// `agent_status: "unknown"` — which `has_agent` rejects. If those counted,
+    /// a workspace whose agent just exited would keep its mirror forever.
+    #[test]
+    fn a_released_agent_row_does_not_qualify() {
+        let panes = [pane("w1:p1", "w1")];
+        let refs: Vec<&PaneInfo> = panes.iter().collect();
+
+        let released =
+            [AgentInfo { pane_id: "w1:p1".into(), agent_status: Some("unknown".into()), ..Default::default() }];
+        assert!(agent_pane_ids(&released).is_empty());
+        assert!(!ws_has_agent(&refs, &agent_pane_ids(&released)));
+
+        // a status alone still counts, even with no agent kind reported
+        let status_only =
+            [AgentInfo { pane_id: "w1:p1".into(), agent_status: Some("working".into()), ..Default::default() }];
+        assert!(ws_has_agent(&refs, &agent_pane_ids(&status_only)));
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {
