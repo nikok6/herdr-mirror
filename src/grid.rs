@@ -10,8 +10,19 @@ use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
 /// Terminal display width of a char (CJK/Hangul are 2 columns).
-fn cw(ch: char) -> usize {
+pub(crate) fn cw(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+}
+
+/// First grid row shown in an `out_rows`-tall pane. The window is
+/// bottom-anchored because agent TUIs draw at the bottom of the screen.
+///
+/// Every painter has to agree on this or its output lands on the wrong row, so
+/// the renderer, the prediction overlay and the selection overlay all call here
+/// rather than each keeping the formula.
+pub fn window_offset(grid: &Grid, out_rows: usize) -> usize {
+    let bottom = grid.content_bottom.max(grid.cursor_row);
+    (bottom + 1).saturating_sub(out_rows)
 }
 
 #[derive(Clone, PartialEq)]
@@ -128,6 +139,70 @@ impl Grid {
             .unwrap_or(0);
     }
 
+    /// Char at a grid coordinate, blank when the cell was never painted.
+    pub fn ch_at(&self, row: usize, col: usize) -> char {
+        self.rows.get(row).and_then(|r| r.get(col)).and_then(|c| c.as_ref()).map(|c| c.ch).unwrap_or(' ')
+    }
+
+    /// OSC 8 target on a cell, when it sits inside a hyperlink.
+    pub fn link_at(&self, row: usize, col: usize) -> Option<&str> {
+        self.rows.get(row)?.get(col)?.as_ref()?.link.as_deref()
+    }
+
+    /// Is this cell the blank spacer that follows a double-width char?
+    ///
+    /// `apply` clears the cell after a wide char (see the `w == 2` branch), so a
+    /// `None` alone does not distinguish "never painted" from "second half of
+    /// 한". The cell to the left settles it.
+    pub fn is_spacer(&self, row: usize, col: usize) -> bool {
+        let occupied = self.rows.get(row).and_then(|r| r.get(col)).is_some_and(|c| c.is_some());
+        if occupied || col == 0 {
+            return false;
+        }
+        self.rows
+            .get(row)
+            .and_then(|r| r.get(col - 1))
+            .and_then(|c| c.as_ref())
+            .is_some_and(|c| cw(c.ch) == 2)
+    }
+
+    /// Column where the glyph covering `col` begins: `col` itself, unless that
+    /// is the spacer half of a wide char, in which case the cell to its left.
+    pub fn glyph_start(&self, row: usize, col: usize) -> usize {
+        if self.is_spacer(row, col) { col - 1 } else { col }
+    }
+
+    /// Text of a linear (reading-order) selection, both endpoints inclusive.
+    ///
+    /// Trailing blanks are trimmed per row for the same reason a terminal does
+    /// it: the grid is a fixed rectangle, so every row is padded out to `width`
+    /// and an untrimmed copy would paste a block of spaces after each line.
+    ///
+    /// Steps by display width rather than by column, which is what keeps a wide
+    /// char from being followed by its own spacer cell: `ch_at` reports that
+    /// cleared cell as a blank, so a per-column walk copies 한글 as "한 글".
+    pub fn selection_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (start, end) = if start <= end { (start, end) } else { (end, start) };
+        let last_col = self.width.saturating_sub(1);
+        let mut out = String::new();
+        for row in start.0..=end.0.min(self.height.saturating_sub(1)) {
+            if row > start.0 {
+                out.push('\n');
+            }
+            let from = if row == start.0 { self.glyph_start(row, start.1) } else { 0 };
+            let to = if row == end.0 { end.1.min(last_col) } else { last_col };
+            let mut line = String::new();
+            let mut c = from;
+            while c <= to && c < self.width {
+                let ch = self.ch_at(row, c);
+                line.push(ch);
+                c += cw(ch);
+            }
+            out.push_str(line.trim_end());
+        }
+        out
+    }
+
     pub fn text_lines(&self) -> Vec<String> {
         self.rows
             .iter()
@@ -233,16 +308,48 @@ impl Renderer {
         self.last_rows.clear();
     }
 
+    /// Force a repaint of a single screen row.
+    ///
+    /// Overlays paint outside the row cache, so the rows they covered have to be
+    /// redrawn to erase them. Doing that per row rather than through
+    /// `invalidate` matters during a drag: the highlight moves on every mouse
+    /// motion, and a full-pane repaint per cell crossed is a lot of ANSI for a
+    /// change that touches two or three rows.
+    pub fn invalidate_row(&mut self, row: usize) {
+        if let Some(slot) = self.last_rows.get_mut(row) {
+            *slot = None;
+        }
+    }
+
     pub fn status(&mut self, text: &str) {
         self.status_text = text.to_string();
         self.last_rows.pop(); // force bottom row repaint
     }
 
+    /// Does the bottom row currently belong to the status line rather than to
+    /// the grid? Overlays must leave that row alone or they paint over the hint.
+    pub fn status_rows(&self) -> usize {
+        usize::from(!self.status_text.is_empty())
+    }
+
+    /// Where the cursor should end up once everything else has been painted.
+    ///
+    /// Emitted last by `paint`, but overlays are appended after it, so anything
+    /// that draws on top has to re-issue this or the cursor is left wherever the
+    /// overlay stopped writing.
+    pub fn cursor_park(&self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
+        let offset_r = window_offset(grid, out_rows);
+        let cr = grid.cursor_row as isize - offset_r as isize;
+        if !grid.cursor_visible || cr < 0 || cr as usize >= out_rows || !self.status_text.is_empty() {
+            return String::new();
+        }
+        format!("\x1b[{};{}H\x1b[?25h", cr + 1, grid.cursor_col.min(out_cols.saturating_sub(1)) + 1)
+    }
+
     /// Build the ANSI to paint the grid into an out_cols × out_rows terminal.
     /// Bottom-anchored window: agent TUIs live at the bottom of the screen.
     pub fn paint(&mut self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
-        let bottom = grid.content_bottom.max(grid.cursor_row);
-        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let offset_r = window_offset(grid, out_rows);
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         // paint every local row (missing rows blank-fill), or the pane stays
         // blank before the first frame and the status row is unreachable
@@ -316,10 +423,7 @@ impl Renderer {
                 self.last_rows[r] = Some(painted);
             }
         }
-        let cr = grid.cursor_row as isize - offset_r as isize;
-        if grid.cursor_visible && cr >= 0 && (cr as usize) < out_rows && self.status_text.is_empty() {
-            let _ = write!(out, "\x1b[{};{}H\x1b[?25h", cr + 1, grid.cursor_col.min(out_cols.saturating_sub(1)) + 1);
-        }
+        out.push_str(&self.cursor_park(grid, out_cols, out_rows));
         out.push_str("\x1b[?2026l");
         out
     }
@@ -412,6 +516,31 @@ mod tests {
         let out = r.paint(&g, 10, 1);
         // without width handling this painted "한 글 !" and drifted right
         assert!(out.contains("한글!"), "got: {out:?}");
+    }
+
+    #[test]
+    fn selection_text_does_not_inject_spaces_after_wide_chars() {
+        // `apply` clears the cell after a wide char, and `ch_at` reports a
+        // cleared cell as a blank, so a per-column walk copies "한 글 !"
+        let mut g = Grid::new();
+        g.resize(10, 1);
+        g.apply("\x1b[1;1H한글!");
+        assert_eq!(g.selection_text((0, 0), (0, 4)), "한글!");
+        // and a start column on the spacer half still yields the whole glyph
+        assert_eq!(g.selection_text((0, 1), (0, 4)), "한글!");
+    }
+
+    #[test]
+    fn spacer_cells_are_distinguished_from_blanks() {
+        let mut g = Grid::new();
+        g.resize(6, 1);
+        g.apply("\x1b[1;1H한x");
+        assert!(g.is_spacer(0, 1), "cell after a wide char");
+        assert!(!g.is_spacer(0, 0), "the wide char itself");
+        assert!(!g.is_spacer(0, 3), "a genuinely blank cell after a narrow one");
+        assert!(!g.is_spacer(0, 0), "column 0 can never be a spacer");
+        assert_eq!(g.glyph_start(0, 1), 0);
+        assert_eq!(g.glyph_start(0, 2), 2);
     }
 
     #[test]

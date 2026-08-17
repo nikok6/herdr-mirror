@@ -24,6 +24,7 @@ mod paste;
 mod predict;
 mod remote;
 mod remote_action;
+mod select;
 mod ssh_relay;
 mod state;
 mod util;

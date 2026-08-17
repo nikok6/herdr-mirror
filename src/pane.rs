@@ -44,6 +44,7 @@ use tokio::time::Instant;
 use crate::util::{err, Result};
 use crate::grid::{Grid, Renderer};
 use crate::predict::Predictor;
+use crate::select::{Released, Select};
 
 // ---------------------------------------------------------------------------
 // args
@@ -463,8 +464,25 @@ enum MouseAction {
     Scroll { up: bool },
     /// click/drag on a remote TUI: forward the raw SGR sequence
     ForwardRaw,
+    /// left press/drag/release on a remote TUI: hand it to the local selection,
+    /// which defers the press and replays it if the gesture turns out to be a
+    /// click rather than a drag (see src/select.rs)
+    Select,
     /// click/drag at a shell (or unclassified): drop, keep mouse local
     Drop,
+}
+
+/// Which physical button an SGR code names, with the modifier and motion flags
+/// removed: 0/1/2 = left/middle/right, 4/5 = wheel up/down, 6/7 = wheel
+/// left/right, 8.. = extra buttons.
+///
+/// The button number is *not* contiguous in the wire encoding: it is the low two
+/// bits plus bit 6 (64) for the wheel set and bit 7 (128) for buttons 8-11,
+/// while bits 2-4 carry shift/alt/ctrl and bit 5 carries motion. Masking only
+/// the low two bits reads shift+wheel-up (68) as a left press, which is how the
+/// wheel ends up driving the selection.
+fn button_number(btn: u32) -> u32 {
+    (btn & 0b11) + if btn & 64 != 0 { 4 } else { 0 } + if btn & 128 != 0 { 8 } else { 0 }
 }
 
 /// Wheel always scrolls semantically, regardless of the foreground
@@ -472,15 +490,21 @@ enum MouseAction {
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
 /// that doesn't consume wheel events, like an agent CLI). Non-wheel
 /// clicks/drags keep the existing foreground-based routing.
+/// The left button routes through the selection for *every* remote TUI, not a
+/// list of ones known to ignore the mouse. That is only safe because the
+/// selection defers rather than steals: a gesture that never leaves its cell is
+/// replayed to the app as a click. Middle and right buttons have no selection
+/// meaning, so they forward untouched.
 fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
-    if press && (btn == 64 || btn == 65) {
-        MouseAction::Scroll { up: btn == 64 }
-    } else if btn == 66 || btn == 67 {
-        MouseAction::Drop
-    } else if remote_is_shell == Some(false) {
-        MouseAction::ForwardRaw
-    } else {
-        MouseAction::Drop
+    match button_number(btn) {
+        // wheel up/down. Matched on the button number, not on `btn == 64`, so a
+        // modified scroll still scrolls instead of falling through as a click.
+        b @ (4 | 5) if press => MouseAction::Scroll { up: b == 4 },
+        6 | 7 => MouseAction::Drop,
+        _ if remote_is_shell != Some(false) => MouseAction::Drop,
+        0 => MouseAction::Select,
+        // middle, right, wheel release and the extra buttons: unchanged
+        _ => MouseAction::ForwardRaw,
     }
 }
 
@@ -661,9 +685,15 @@ struct App {
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
     /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
-    /// Some(false)=TUI (forward clicks), None=unknown (fail safe to local).
-    /// Refreshed lazily on mouse activity via `herdr pane process-info`.
+    /// Some(false)=TUI (selection + deferred clicks), None=unknown (fail safe
+    /// to local). Refreshed lazily on mouse activity via `pane process-info`.
     remote_is_shell: Option<bool>,
+    /// local drag-selection, driven by the left button the remote app would
+    /// otherwise receive
+    select: Select,
+    /// screen rows the selection overlay covered on the last paint, so they can
+    /// be repainted when it moves away
+    last_select_rows: Option<(usize, usize)>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
     /// scheduled delayed re-poll to catch a foreground change the last input just
@@ -699,15 +729,38 @@ impl App {
         if !self.tty {
             return;
         }
+        let (cols, rows) = term_size();
+        // Overlays paint outside the renderer's per-row cache, so the rows they
+        // covered must be repainted or the old drawing survives underneath.
+        // Predictions are scattered, so they take the whole pane; a selection is
+        // a contiguous band, and during a drag it moves on every mouse motion,
+        // so it repaints only the rows it just left and the ones it now covers.
+        let reserved = self.renderer.status_rows();
         if self.predict.take_dirty() {
-            // cleared predictions may have left ghost chars — full repaint
             self.renderer.invalidate();
         }
-        let (cols, rows) = term_size();
+        if self.select.take_dirty() {
+            let now = self.select.painted_rows(&self.grid, rows, reserved);
+            for (top, bottom) in self.last_select_rows.into_iter().chain(now) {
+                for r in top..=bottom {
+                    self.renderer.invalidate_row(r);
+                }
+            }
+        }
+        self.last_select_rows = self.select.painted_rows(&self.grid, rows, reserved);
         let mut out = self.renderer.paint(&self.grid, cols, rows);
-        // inject the prediction overlay inside the synchronized-update block
-        let overlay = self.predict.overlay(&self.grid, cols, rows);
+        // inject the overlays inside the synchronized-update block. Selection
+        // goes last: it is the one the user is actively pointing at.
+        let mut overlay = self.predict.overlay(&self.grid, cols, rows);
+        let sel = self.select.overlay(&self.grid, cols, rows, reserved);
+        overlay.push_str(&sel);
         if !overlay.is_empty() {
+            // `paint` parks the cursor last; the overlays land after that, so
+            // re-park or the cursor is left wherever the highlight ended and is
+            // re-asserted there on every frame
+            if !sel.is_empty() {
+                overlay.push_str(&self.renderer.cursor_park(&self.grid, cols, rows));
+            }
             const SYNC_END: &str = "\x1b[?2026l";
             if let Some(pos) = out.rfind(SYNC_END) {
                 out.insert_str(pos, &overlay);
@@ -838,6 +891,9 @@ impl App {
         self.mode = m;
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
+        // the new session repaints from scratch, so a span from the old one
+        // points at text that no longer exists
+        self.select.clear();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
             Mode::Control => self.control_size(),
@@ -913,6 +969,9 @@ impl App {
         self.reconnect_at = None;
         self.switching_to = Some(m);
         self.stop_session();
+        // covers every route into a mode change that returns before the mouse
+        // loop: ctrl+\, the idle release, and taking control from Observe
+        self.select.clear();
         self.renderer.invalidate();
         // immediate feedback for the mode-switch gap (stop + 200ms + reconnect)
         self.renderer.status(if m == Mode::Control { "taking control…" } else { "releasing…" });
@@ -936,8 +995,18 @@ impl App {
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
         self.renderer.status("");
-        self.grid
-            .resize(frame.width.unwrap_or(self.grid.width), frame.height.unwrap_or(self.grid.height));
+        let (fw, fh) = (
+            frame.width.unwrap_or(self.grid.width),
+            frame.height.unwrap_or(self.grid.height),
+        );
+        // A reflow or a full redraw replaces every cell, so a selection anchored
+        // to grid coordinates would survive pointing at different text — and a
+        // release afterwards would copy whatever landed there, or nothing, while
+        // still showing a highlight that implies it worked.
+        if (fw, fh) != (self.grid.width, self.grid.height) || frame.full == Some(true) {
+            self.select.clear();
+        }
+        self.grid.resize(fw, fh);
         if frame.full == Some(true) {
             self.grid.clear();
         }
@@ -1174,10 +1243,45 @@ impl App {
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
+        let mut sel_changed = false;
+        let mut copy_span: Option<(crate::select::Pos, crate::select::Pos)> = None;
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
                 match mouse_action(self.remote_is_shell, btn, press) {
+                    // Without a tty there is no grab, so this is unreachable in
+                    // normal operation — but stdin could still be a pipe, and a
+                    // selection there would be sized against a phantom viewport
+                    // and would write OSC 52 into something that is not a
+                    // terminal. Forward instead, which is what `main` did.
+                    MouseAction::Select if !self.tty => {
+                        rest.extend_from_slice(&buf[i..i + len]);
+                    }
+                    MouseAction::Select => {
+                        let at = Select::locate(&self.grid, term_size().1, x, y);
+                        let raw = &buf[i..i + len];
+                        // motion flag (32) distinguishes a drag from the press
+                        // that started it; `press` is the M/m final byte
+                        match (press, btn & 32 != 0) {
+                            (true, false) => self.select.press(at, raw),
+                            (true, true) => self.select.drag(at),
+                            (false, _) => match self.select.release(at, raw) {
+                                // the clipboard holds one thing, so a second
+                                // gesture in the same read legitimately wins
+                                Released::Selection(span) => copy_span = Some(span),
+                                // it was a click: the app gets it at the release's
+                                // position in the stream, which is the point of
+                                // deferring it
+                                Released::Click(bytes) => rest.extend_from_slice(&bytes),
+                                Released::Nothing => {}
+                            },
+                        }
+                        sel_changed |= self.select.is_dirty();
+                    }
                     MouseAction::Scroll { up } => {
+                        // the viewport is about to move under the highlight,
+                        // which is anchored to grid rows: leaving it up would
+                        // paint reverse video over whatever scrolls into place
+                        sel_changed |= self.select.clear();
                         scrolls.push(json!({
                             "type": "terminal.scroll",
                             "direction": if up { "up" } else { "down" },
@@ -1200,13 +1304,37 @@ impl App {
         for s in scrolls {
             self.send(s).await;
         }
+        if let Some((start, end)) = copy_span {
+            let text = self.grid.selection_text(start, end);
+            match crate::select::osc52(&text) {
+                // no hint on success: herdr shows its own "copied to clipboard"
+                // toast when it takes the OSC 52, so ours would be a duplicate
+                Some(seq) => write_stdout(&seq),
+                // too big for herdr to accept. Worth saying, because this is the
+                // one path where nothing else reports: we never emit, so there
+                // is no clipboard write for herdr to toast about.
+                None if text.len() > 1024 => self.hint("selection too large to copy"),
+                // an all-blank drag: leave the clipboard alone rather than
+                // clearing it, and say nothing
+                None => {}
+            }
+        }
         if !rest.is_empty() {
+            // typing anywhere dismisses the highlight, the same as it would in a
+            // local pane — otherwise it hangs over text the agent has redrawn.
+            // `dismiss`, not `clear`: a press may have been buffered earlier in
+            // this very read, and cancelling it would eat the click.
+            sel_changed |= self.select.dismiss();
             let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
             self.send(msg).await;
             // optimistic local echo: draw the keystroke now, verify on frame
             if self.predict.on_input(&rest, &self.grid) {
                 self.paint();
+                sel_changed = false;
             }
+        }
+        if sel_changed {
+            self.paint();
         }
     }
 
@@ -1327,6 +1455,8 @@ pub async fn run(args: Args) -> Result<()> {
         hint_clear_at: None,
         predict: Predictor::new(),
         remote_is_shell: None,
+        select: Select::new(),
+        last_select_rows: None,
         fg_poll_at: None,
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
@@ -1391,6 +1521,12 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
+                        // a foreground change means the screen belongs to a
+                        // different program now, so the old highlight points at
+                        // text that is gone
+                        if v != app.remote_is_shell && app.select.clear() {
+                            app.paint();
+                        }
                         app.remote_is_shell = v;
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
@@ -1510,10 +1646,70 @@ mod tests {
         // unclassified/shell foreground: wheel still scrolls
         assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
         assert_eq!(mouse_action(Some(true), 65, true), MouseAction::Scroll { up: false });
-        // non-wheel clicks/drags keep the existing foreground-based routing
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::ForwardRaw); // TUI click
+        // the wheel never reaches the selection path at all, which is what
+        // keeps PR #54's scroll regression impossible here by construction
+        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Select);
         assert_eq!(mouse_action(Some(true), 0, true), MouseAction::Drop); // shell click
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
+    }
+
+    #[test]
+    fn every_remote_tui_routes_its_left_button_through_the_selection() {
+        // press, drag (motion bit 32) and release, with no list of apps: the
+        // selection defers the press, so this is safe even for a mouse TUI
+        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(false), 32, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(false), 0, false), MouseAction::Select);
+        // modifiers ride the same button: shift(4)/alt(8)/ctrl(16) still select
+        assert_eq!(mouse_action(Some(false), 4, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(false), 16 | 32, true), MouseAction::Select);
+        // middle and right have no selection meaning, so they forward as before
+        assert_eq!(mouse_action(Some(false), 1, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(false), 2, true), MouseAction::ForwardRaw);
+    }
+
+    #[test]
+    fn a_modified_wheel_still_scrolls_instead_of_becoming_a_click() {
+        // The button number is the low two bits PLUS bit 6, so shift+wheel-up is
+        // 68 and `btn & 0b11` reads it as a left press: the wheel then drives the
+        // selection, the scroll is lost, and a later left release replays the
+        // wheel bytes to the app as a click.
+        for mods in [4, 8, 16, 4 + 8, 4 + 16, 8 + 16, 4 + 8 + 16] {
+            assert_eq!(
+                mouse_action(Some(false), 64 + mods, true),
+                MouseAction::Scroll { up: true },
+                "shift/alt/ctrl + wheel-up (btn {})",
+                64 + mods
+            );
+            assert_eq!(
+                mouse_action(Some(false), 65 + mods, true),
+                MouseAction::Scroll { up: false },
+                "modified wheel-down (btn {})",
+                65 + mods
+            );
+        }
+        // horizontal wheel keeps dropping, modified or not
+        assert_eq!(mouse_action(Some(false), 66 + 16, true), MouseAction::Drop);
+        // buttons 8-11 carry bit 7, which the old mask also leaked
+        assert_eq!(mouse_action(Some(false), 128, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(false), 128 + 4, true), MouseAction::ForwardRaw);
+        // a wheel release is not a left release
+        assert_eq!(mouse_action(Some(false), 64, false), MouseAction::ForwardRaw);
+    }
+
+    #[test]
+    fn button_numbers_decode_the_split_encoding() {
+        assert_eq!(button_number(0), 0); // left
+        assert_eq!(button_number(32), 0); // left, dragging
+        assert_eq!(button_number(16 + 32), 0); // ctrl + left drag
+        assert_eq!(button_number(1), 1);
+        assert_eq!(button_number(2), 2);
+        assert_eq!(button_number(64), 4); // wheel up
+        assert_eq!(button_number(68), 4); // shift + wheel up
+        assert_eq!(button_number(65), 5);
+        assert_eq!(button_number(66), 6);
+        assert_eq!(button_number(128), 8);
+        assert_eq!(button_number(131), 11);
     }
 
     #[test]

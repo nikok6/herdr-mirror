@@ -268,8 +268,7 @@ impl Predictor {
         if !self.displaying() || self.pending.is_empty() {
             return String::new();
         }
-        let bottom = grid.content_bottom.max(grid.cursor_row);
-        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let offset_r = crate::grid::window_offset(grid, out_rows);
         let mut out = String::new();
         let mut last: Option<(usize, usize)> = None;
         for p in &self.pending {
