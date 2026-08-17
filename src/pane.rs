@@ -1030,7 +1030,16 @@ impl App {
     }
 
     /// A complete paste body, markers already stripped. A file drop is
-    /// uploaded; anything else is forwarded verbatim as if it had been typed.
+    /// uploaded; anything else is re-framed and forwarded as a paste.
+    ///
+    /// Re-framing is the whole point of getting here: the markers were only
+    /// stripped so a drop could be recognised, and an ordinary paste that
+    /// reaches the remote pty *without* them is not a paste any more — the
+    /// remote app reads every newline in it as Enter, so a multi-line paste
+    /// submits itself a line at a time (an agent's composer takes the first
+    /// line and runs it). `deliver_input`, not `handle_stdin_inner`: a paste
+    /// body is data, so its bytes must not be re-read as a Ctrl+V clipboard
+    /// request, as mouse sequences, or as locally predicted keystrokes.
     async fn route_paste_body(&mut self, body: Vec<u8>) {
         if self.paste_inflight {
             self.paste_queue.push(Queued::Body(body));
@@ -1038,7 +1047,7 @@ impl App {
         }
         // lossy only for the probe; the forward path keeps the original bytes
         let Some(paths) = crate::paste::dropped_paths(&String::from_utf8_lossy(&body)) else {
-            self.handle_stdin_inner(body).await;
+            self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
             return;
         };
 
@@ -1067,7 +1076,7 @@ impl App {
             // every path already exists over there, so the user meant those
             // files: forward what they actually dropped
             if let Some(body) = original {
-                self.handle_stdin_inner(body).await;
+                self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
             }
         }
         if let Some(e) = result.error {
@@ -1266,10 +1275,11 @@ pub async fn run(args: Args) -> Result<()> {
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
-        // 2004 (bracketed paste) is asked for purely to get framing: herdr
-        // only wraps a paste when the pane's app has enabled it, and a file
-        // drop otherwise arrives as bare text with no terminator at all. See
-        // `intercept_paste`; the markers never reach the remote.
+        // 2004 (bracketed paste) is asked for so herdr frames a paste for us:
+        // it only wraps one when the pane's app has enabled it, and a file
+        // drop otherwise arrives as bare text with no terminator at all. The
+        // framing is stripped only to recognise a drop and put back on the way
+        // out (`route_paste_body`), so the remote app still sees a paste.
         write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h");
         RawMode::enable()
     } else {
@@ -1734,6 +1744,23 @@ mod tests {
             panic!("expected paste")
         };
         assert_eq!(body, b"caf\xe9", "0xE9 must not become U+FFFD");
+    }
+
+    #[test]
+    fn a_stripped_paste_is_reframed_byte_exact() {
+        // what `route_paste_body` sends on: the framing comes off to recognise
+        // a drop and has to go back on, or the remote app reads the newlines in
+        // a multi-line paste as Enter and submits it a line at a time
+        let body = b"first line\nsecond line".to_vec();
+        let framed = crate::paste::bracketed_bytes(&body);
+        assert_eq!(framed, seq(&[S, &body, E]));
+
+        let mut buf = Vec::new();
+        assert_eq!(
+            split(&mut buf, &framed),
+            PasteSplit::Complete { before: vec![], body, after: vec![] },
+            "re-framing must be exactly what the splitter undoes"
+        );
     }
 
     #[test]

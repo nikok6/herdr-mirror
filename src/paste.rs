@@ -165,11 +165,25 @@ async fn remote_command(
     })
 }
 
-pub fn bracketed(path: &str) -> Vec<u8> {
-    let mut b: Vec<u8> = b"\x1b[200~".to_vec();
-    b.extend_from_slice(path.as_bytes());
+/// Frame `body` as a bracketed paste for the remote pty.
+///
+/// The markers are what tell the remote app "this arrived as a paste, not as
+/// keystrokes" — without them every newline in the body reads as Enter, so a
+/// multi-line paste submits itself a line at a time. herdr only wraps a paste
+/// when the pane's app has enabled DECSET 2004, and the streamer enables it
+/// (see `pane::run`), so a paste reaching us is framed and has to leave framed
+/// too. Both ends of the payload are ours, so this is the one place that knows
+/// the byte sequences besides `split_paste`.
+pub fn bracketed_bytes(body: &[u8]) -> Vec<u8> {
+    let mut b: Vec<u8> = Vec::with_capacity(body.len() + 12);
+    b.extend_from_slice(b"\x1b[200~");
+    b.extend_from_slice(body);
     b.extend_from_slice(b"\x1b[201~");
     b
+}
+
+pub fn bracketed(path: &str) -> Vec<u8> {
+    bracketed_bytes(path.as_bytes())
 }
 
 /// Cap per dropped file. Enforced on the READ, not just the stat, so a file
