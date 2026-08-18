@@ -445,14 +445,21 @@ async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
     }
 }
 
-async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
+fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
     let mut state = crate::state::load_state(&env.state_dir, &host.name);
     if !state.hidden {
-        println!("{} is not hidden", host.name);
-        return Ok(());
+        return Ok(false);
     }
     state.hidden = false;
     crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    Ok(true)
+}
+
+async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
+    if !clear_hidden(env, host)? {
+        println!("{} is not hidden", host.name);
+        return Ok(());
+    }
     nudge_daemon(env, &format!("showing {}", host.name));
     Ok(())
 }
@@ -461,10 +468,7 @@ async fn show_all(env: &Env) -> Result<()> {
     let config = load_config(&env.config_search)?;
     let mut shown = Vec::new();
     for host in &config.hosts {
-        let mut state = crate::state::load_state(&env.state_dir, &host.name);
-        if state.hidden {
-            state.hidden = false;
-            crate::state::save_state(&env.state_dir, &host.name, &state)?;
+        if clear_hidden(env, host)? {
             shown.push(host.name.clone());
         }
     }
