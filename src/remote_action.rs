@@ -409,25 +409,43 @@ pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
     report_failure(&env, "show", show(&env, host_arg).await).await
 }
 
-/// Close a host's mirrors locally without touching the remote or tombstoning
-/// them — reuses `mirror::teardown`'s self-close wipe, then marks the host
-/// `hidden` so the daemon's next converge doesn't just recreate them.
 async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     let host = resolve_host(env, host_arg).await?;
+    let mut state = crate::state::load_state(&env.state_dir, &host.name);
+    if state.hidden {
+        println!("{} is already hidden", host.name);
+        return Ok(());
+    }
+    let local_ids: Vec<String> = state.workspaces.values().map(|e| e.local_id.clone()).collect();
+    state.hidden = true;
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
     let local = crate::api::ApiClient::connect(&env.local_socket).await?;
-    let log = crate::util::Logger::new(&env.state_dir, false);
-    crate::mirror::teardown(&local, &env.state_dir, &host.name, &log, None).await?;
-    let state = crate::state::HostState { hidden: true, ..Default::default() };
+    for local_id in &local_ids {
+        let _ = local.request("workspace.close", json!({ "workspace_id": local_id })).await;
+    }
+    state.workspaces.clear();
+    state.panes.clear();
     crate::state::save_state(&env.state_dir, &host.name, &state)?;
     println!("hid {} — remote keeps running; `herdr-mirror show {}` brings it back", host.name, host.name);
     Ok(())
 }
 
-/// Clear `hidden` and nudge the daemon so its next converge recreates the
-/// mirrors fresh (the old local ids are gone — `hide` closed them — so this is
-/// a cold recreate, same as a first connect, not a resume).
 async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
-    let host = resolve_host(env, host_arg).await?;
+    let host = match host_arg {
+        Some(name) => Some(resolve_host(env, Some(name)).await?),
+        None => {
+            let config = load_config(&env.config_search)?;
+            let ctx = invocation_context();
+            resolve_context(env, &config.hosts, &ctx).map(|r| r.host)
+        }
+    };
+    match host {
+        Some(host) => show_one(env, &host).await,
+        None => show_all(env).await,
+    }
+}
+
+async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
     let mut state = crate::state::load_state(&env.state_dir, &host.name);
     if !state.hidden {
         println!("{} is not hidden", host.name);
@@ -435,58 +453,35 @@ async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
     }
     state.hidden = false;
     crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    nudge_daemon(env, &format!("showing {}", host.name));
+    Ok(())
+}
+
+async fn show_all(env: &Env) -> Result<()> {
+    let config = load_config(&env.config_search)?;
+    let mut shown = Vec::new();
+    for host in &config.hosts {
+        let mut state = crate::state::load_state(&env.state_dir, &host.name);
+        if state.hidden {
+            state.hidden = false;
+            crate::state::save_state(&env.state_dir, &host.name, &state)?;
+            shown.push(host.name.clone());
+        }
+    }
+    if shown.is_empty() {
+        println!("no hidden hosts");
+        return Ok(());
+    }
+    nudge_daemon(env, &format!("showing {}", shown.join(", ")));
+    Ok(())
+}
+
+fn nudge_daemon(env: &Env, prefix: &str) {
     match crate::daemon::running_pid(env) {
         Some(pid) => {
             unsafe { libc::kill(pid, libc::SIGUSR1) };
-            println!("showing {} — daemon syncing now", host.name);
+            println!("{prefix} — daemon syncing now");
         }
-        None => println!("showing {} — mirrors reappear when the daemon starts", host.name),
+        None => println!("{prefix} — mirrors reappear when the daemon starts"),
     }
-    Ok(())
-}
-
-pub async fn remote_tab_for_cmd(env: Env, host_arg: &str) -> Result<()> {
-    let what = format!("remote-tab-for {host_arg}");
-    report_failure(&env, &what, remote_tab_for(&env, host_arg).await).await
-}
-
-/// `remote-tab-for <host>`: a new terminal on a NAMED connection, unlike
-/// `remote-tab` which only knows the connection you're currently focused in
-/// (via `resolve_context`). Needs the host's existing mirror workspace id —
-/// there's no "focused pane" to read cwd/target from here, so this always
-/// targets that workspace's default cwd rather than inheriting one.
-async fn remote_tab_for(env: &Env, host_arg: &str) -> Result<()> {
-    let host = resolve_host(env, Some(host_arg)).await?;
-    let state = crate::state::load_state(&env.state_dir, &host.name);
-    let live: Vec<(&String, &crate::state::WsEntry)> =
-        state.workspaces.iter().filter(|(_, e)| !e.is_tombstoned()).collect();
-    let (ws_rid, _) = match live.as_slice() {
-        [] => {
-            return Err(err(format!(
-                "{}: no mirrored workspace yet — run `herdr-mirror start` (or `show {}` if hidden) and retry",
-                host.name, host.name
-            )))
-        }
-        [one] => *one,
-        many => {
-            let ids: Vec<&str> = many.iter().map(|(rid, _)| rid.as_str()).collect();
-            return Err(err(format!(
-                "{} mirrors {} workspaces — ambiguous which gets the new tab: {}",
-                host.name,
-                many.len(),
-                ids.join(", ")
-            )));
-        }
-    };
-
-    let mut remote = RemoteHost::new(&host, &env.state_dir);
-    let (api, _status) = remote.connect_api().await?;
-    let res: Value =
-        api.request("tab.create", json!({ "workspace_id": ws_rid, "focus": false })).await?;
-    println!(
-        "created tab {} in {}: {ws_rid}; mirror follows shortly",
-        res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?"),
-        host.name
-    );
-    Ok(())
 }
