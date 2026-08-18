@@ -651,8 +651,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // hidden: the remote is still polled above (health/status keeps working),
     // but every local reconciliation below is frozen — `hide` already closed
-    // the local mirrors itself (see mirror::teardown), so touching state here
-    // would tombstone them as if the user had closed them for good.
+    // the local mirrors itself (see remote_action::hide), so touching state
+    // here would tombstone them as if the user had closed them for good.
     if state.hidden {
         return Ok(());
     }

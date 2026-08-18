@@ -97,9 +97,11 @@ and resume with **start**. `teardown` closes all mirrors and clears state.
 touching the remote (unaffected by `close_remote_on_local_close`) and freezes
 that host so syncing doesn't just recreate them. **show** clears that and
 resyncs — a fresh recreate, not a resume, since the local objects are gone.
-With no host given, both act on the connection you invoked them from, same as
-the remote-create actions below; `herdr-mirror hide <host>` / `show <host>`
-name one explicitly. Unlike `teardown`, other hosts keep mirroring normally.
+With a host given (explicitly, or from the connection you invoked it from,
+same as the remote-create actions below), `herdr-mirror hide <host>` / `show
+<host>` act on that one. With no host and no invocation context, bare
+`herdr-mirror show` clears every hidden connection at once. Unlike
+`teardown`, other hosts keep mirroring normally.
 
 **Create on the remote** — four actions create objects on the remote host,
 inheriting the target host and cwd from the mirror you invoke them from (the
@@ -111,23 +113,6 @@ mirrors back within seconds.
 action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
 errors rather than splitting locally, which would desync the mirrored layout.
-
-**New terminal on a named connection** — `remote-tab` only knows the
-connection you're currently focused in. To always target one specific
-connection regardless of focus (e.g. a key that opens a new terminal on
-`work` from anywhere), use `herdr-mirror remote-tab-for <host>` directly —
-plugin actions take no per-invocation arguments, so this isn't a `mirror.*`
-action; bind it as a raw shell command instead:
-
-```toml
-[[keys.command]]
-key = "prefix+alt+w"
-type = "shell"
-command = "~/.local/bin/herdr-mirror remote-tab-for work"
-```
-
-Errors if `work` isn't configured, isn't mirroring yet (`start` it first), or
-mirrors more than one remote workspace (ambiguous — names one to fix).
 
 **Invoke any remote plugin** — locally bound keys never reach a mirror pane's
 stdin, so remote plugins can't be driven by their own bindings. `remote-invoke
