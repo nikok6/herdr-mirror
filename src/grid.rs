@@ -463,6 +463,21 @@ mod tests {
     }
 
     #[test]
+    fn clearing_status_restores_the_remote_cursor() {
+        let mut g = Grid::new();
+        g.resize(10, 2);
+        g.apply("\x1b[2;3H\x1b[?25h");
+        let mut r = Renderer::new();
+        r.status("connected");
+        let hidden = r.paint(&g, 10, 2);
+        assert!(!hidden.contains("\x1b[2;3H\x1b[?25h"));
+
+        r.status("");
+        let restored = r.paint(&g, 10, 2);
+        assert!(restored.contains("\x1b[2;3H\x1b[?25h"));
+    }
+
+    #[test]
     fn renderer_bottom_anchors_and_status() {
         let mut g = Grid::new();
         g.resize(5, 10);

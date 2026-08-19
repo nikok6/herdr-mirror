@@ -285,6 +285,11 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
                          # idle release, and sized to your local pane so the
                          # remote fills it (ideal for headless remotes). Set
                          # false for read-only mirrors that escalate on type.
+# takeover_on_reconnect = false
+                         # legacy Herdr only. Safe default: never evict an
+                         # unknown controller while recovering. Opting in
+                         # permits one takeover retry per pane per 60 seconds;
+                         # watch-only mirrors still never take over.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
@@ -299,6 +304,7 @@ target = "work"
 # max_rows = 58                      # always_control = false
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
+# takeover_on_reconnect = false      # per-host legacy override
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # api_transport = "auto"             # how to reach the remote API socket:
@@ -309,6 +315,15 @@ target = "work"
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
 ```
+
+Herdr protocol 21 peers automatically use a persisted, host-scoped controller
+identity plus a 20-second lease. The mirror sends heartbeats every two seconds,
+reconnects when acknowledgements stop, and safely replaces only its own stale
+claim. Older peers keep their released behavior; automatic takeover stays off
+unless explicitly enabled above. The controller identity lives in
+`~/.local/state/herdr-mirror/controller-id.json`; daemons sharing that state
+directory intentionally act as one controller, while a copied file regenerates
+when the machine identity changes.
 
 ## Devcontainer
 

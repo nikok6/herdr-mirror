@@ -11,21 +11,28 @@
 
 mod api;
 mod binding;
+mod child_supervisor;
 mod closes;
 mod config;
+mod controller_identity;
 mod daemon;
 mod docker;
 mod foreground;
+mod frame_stream;
 mod grid;
 mod layout_sync;
+mod liveness;
 mod mirror;
+mod ownership;
 mod pane;
 mod paste;
+mod pending_input;
 mod predict;
 mod remote;
 mod remote_action;
 mod ssh_relay;
 mod state;
+mod streamer_lock;
 mod util;
 
 use util::{Env, Result};

@@ -39,6 +39,38 @@ pub struct RemoteStatus {
     pub socket: String,
     pub supported: bool,
     pub reason: Option<String>,
+    pub client_protocol: Option<u32>,
+    pub server_protocol: Option<u32>,
+    pub compatible: bool,
+    pub terminal_session_reconnect: bool,
+}
+
+#[derive(Deserialize)]
+struct StatusClient {
+    version: Option<String>,
+    protocol: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct StatusServerCapabilities {
+    #[serde(default)]
+    terminal_session_reconnect_v1: bool,
+}
+
+#[derive(Deserialize)]
+struct StatusServer {
+    running: Option<bool>,
+    socket: Option<String>,
+    version: Option<String>,
+    protocol: Option<u32>,
+    compatible: Option<bool>,
+    capabilities: Option<StatusServerCapabilities>,
+}
+
+#[derive(Deserialize)]
+struct StatusJson {
+    client: Option<StatusClient>,
+    server: Option<StatusServer>,
 }
 
 struct SshOutput {
@@ -331,53 +363,10 @@ impl RemoteHost {
             self.cfg.remote_bin.as_deref(),
             self.cfg.session.as_deref(),
         );
-        let out = self.exec(&format!("exec {} status --json", bin), 15000).await?;
-        #[derive(Deserialize)]
-        struct Client {
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Server {
-            running: Option<bool>,
-            socket: Option<String>,
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct StatusJson {
-            client: Option<Client>,
-            server: Option<Server>,
-        }
-        let parsed: StatusJson = serde_json::from_str(&out)?;
-        let version = parsed
-            .server
-            .as_ref()
-            .and_then(|s| s.version.clone())
-            .or(parsed.client.and_then(|c| c.version))
-            .unwrap_or_else(|| "unknown".into());
-        let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
-        let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
-        let mut status = RemoteStatus { socket, supported: false, reason: None };
-        if !running {
-            // Name the session, or this reads as "that machine's herdr is
-            // down" while the default session is running perfectly and only
-            // the configured one is stopped — which is the common way to get
-            // here once `session` is in play (a typo, or `herdr session stop`).
-            status.reason = Some(match &self.cfg.session {
-                Some(name) => format!("remote herdr session {name:?} is not running"),
-                None => "remote herdr server is not running".into(),
-            });
-            return Ok(status);
-        }
-        match version_supported(&version) {
-            Some(true) => status.supported = true,
-            Some(false) => {
-                status.reason = Some(format!(
-                    "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
-                ))
-            }
-            None => status.reason = Some(format!("cannot parse remote version {version}")),
-        }
-        Ok(status)
+        let out = self
+            .exec(&format!("exec {} status --json", bin), 15000)
+            .await?;
+        parse_remote_status(&out, self.cfg.session.as_deref())
     }
 
     pub async fn forward_api(&mut self, remote_socket: &str) -> Result<PathBuf> {
@@ -570,6 +559,66 @@ fn nonempty(e: &str, code: i32) -> String {
     }
 }
 
+fn parse_remote_status(out: &str, session: Option<&str>) -> Result<RemoteStatus> {
+    let parsed: StatusJson = serde_json::from_str(out)?;
+    let client_protocol = parsed.client.as_ref().and_then(|client| client.protocol);
+    let server_protocol = parsed.server.as_ref().and_then(|server| server.protocol);
+    let version = parsed
+        .server
+        .as_ref()
+        .and_then(|server| server.version.clone())
+        .or_else(|| {
+            parsed
+                .client
+                .as_ref()
+                .and_then(|client| client.version.clone())
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let running = parsed.server.as_ref().and_then(|server| server.running) == Some(true);
+    let compatible = parsed.server.as_ref().and_then(|server| server.compatible) == Some(true);
+    let reconnect_capability = parsed
+        .server
+        .as_ref()
+        .and_then(|server| server.capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.terminal_session_reconnect_v1);
+    let terminal_session_reconnect = running
+        && compatible
+        && client_protocol == server_protocol
+        && client_protocol.is_some_and(|protocol| protocol >= 21)
+        && reconnect_capability;
+    let socket = parsed
+        .server
+        .as_ref()
+        .and_then(|server| server.socket.clone())
+        .unwrap_or_default();
+    let mut status = RemoteStatus {
+        socket,
+        supported: false,
+        reason: None,
+        client_protocol,
+        server_protocol,
+        compatible,
+        terminal_session_reconnect,
+    };
+    if !running {
+        status.reason = Some(match session {
+            Some(name) => format!("remote herdr session {name:?} is not running"),
+            None => "remote herdr server is not running".into(),
+        });
+        return Ok(status);
+    }
+    match version_supported(&version) {
+        Some(true) => status.supported = true,
+        Some(false) => {
+            status.reason = Some(format!(
+                "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
+            ));
+        }
+        None => status.reason = Some(format!("cannot parse remote version {version}")),
+    }
+    Ok(status)
+}
+
 /// `Some(true)` = supported, `Some(false)` = too old, `None` = unparseable.
 fn version_supported(version: &str) -> Option<bool> {
     let core = version.split(['-', '+']).next()?;
@@ -614,6 +663,7 @@ mod tests {
             max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
+            takeover_on_reconnect: false,
         }
     }
 
@@ -732,5 +782,32 @@ mod tests {
         assert_eq!(version_supported("0.7.1-preview.2026-07-04-aaaa"), Some(true));
         assert_eq!(version_supported("0.7.1-preview.2026-06-29-aaaa"), Some(false));
         assert_eq!(version_supported("garbage"), None);
+    }
+
+    #[test]
+    fn reconnect_capability_requires_compatible_protocol_21_on_both_sides() {
+        let capable = parse_remote_status(
+            r#"{
+                "client":{"version":"0.8.1","protocol":21},
+                "server":{"running":true,"version":"0.8.1","protocol":21,
+                    "compatible":true,"socket":"/tmp/herdr.sock",
+                    "capabilities":{"terminal_session_reconnect_v1":true}}
+            }"#,
+            None,
+        )
+        .unwrap();
+        assert!(capable.terminal_session_reconnect);
+
+        for json in [
+            r#"{"client":{"version":"0.8.1","protocol":20},"server":{"running":true,"version":"0.8.1","protocol":20,"compatible":true,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
+            r#"{"client":{"version":"0.8.1","protocol":21},"server":{"running":true,"version":"0.8.1","protocol":20,"compatible":false,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
+            r#"{"client":{"version":"0.8.1","protocol":21},"server":{"running":true,"version":"0.8.1","protocol":21,"compatible":true,"capabilities":{}}}"#,
+        ] {
+            assert!(
+                !parse_remote_status(json, None)
+                    .unwrap()
+                    .terminal_session_reconnect
+            );
+        }
     }
 }

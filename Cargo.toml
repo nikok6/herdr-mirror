@@ -14,6 +14,7 @@ base64 = "0.22"
 libc = "0.2"
 unicode-width = "0.2"
 fnv = "1.0.7"
+sha2 = "0.10"
 
 [profile.release]
 lto = true
