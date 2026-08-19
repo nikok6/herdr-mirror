@@ -456,6 +456,70 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
     None
 }
 
+/// Does `bytes` end partway through an SGR mouse report?
+///
+/// Stdin is a byte stream, not an event stream: the fixed-size reader can cut
+/// `ESC [ < btn ; col ; row M` at any byte. A cut report is not ordinary input;
+/// forwarding either fragment as `terminal.input` makes the remote herdr reset
+/// its scroll viewport before writing the garbage to the child.
+fn incomplete_mouse_prefix(bytes: &[u8]) -> bool {
+    if bytes.first() != Some(&0x1b) {
+        return false;
+    }
+    let mut i = 1;
+    for expected in [b'[', b'<'] {
+        if i == bytes.len() {
+            return true;
+        }
+        if bytes[i] != expected {
+            return false;
+        }
+        i += 1;
+    }
+    for field in 0..3 {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return true;
+        }
+        if i == start {
+            return false;
+        }
+        if field < 2 {
+            if bytes[i] != b';' {
+                return false;
+            }
+            i += 1;
+        } else {
+            // A present M/m completes the report; anything else invalidates it.
+            return false;
+        }
+    }
+    false
+}
+
+/// Return bytes safe to route now and retain a trailing partial mouse report.
+fn split_mouse_stream(pending: &mut Vec<u8>, chunk: Vec<u8>) -> Vec<u8> {
+    pending.extend_from_slice(&chunk);
+    let split_at = pending
+        .iter()
+        .enumerate()
+        .find_map(|(at, &b)| (b == 0x1b && incomplete_mouse_prefix(&pending[at..])).then_some(at));
+    match split_at {
+        Some(at) => {
+            let suffix = pending.split_off(at);
+            std::mem::replace(pending, suffix)
+        }
+        None => std::mem::take(pending),
+    }
+}
+
+/// A split pipe write is available immediately; this only needs to distinguish
+/// it from a standalone Escape key without making Escape feel sticky.
+const MOUSE_PREFIX_DELAY: Duration = Duration::from_millis(25);
+
 /// How a parsed mouse event should be routed while in control mode.
 #[derive(Debug, PartialEq, Eq)]
 enum MouseAction {
@@ -1284,11 +1348,34 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move {
             let mut stdin = tokio::io::stdin();
             let mut buf = [0u8; 1024];
+            let mut pending = Vec::new();
             loop {
-                match stdin.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                // Reassemble mouse reports here, before stdin competes with
+                // remote frames on the shared channel. If a normal Escape key
+                // is the whole read, release it after a short ambiguity delay.
+                let read = if pending.is_empty() {
+                    stdin.read(&mut buf).await
+                } else {
+                    match tokio::time::timeout(MOUSE_PREFIX_DELAY, stdin.read(&mut buf)).await {
+                        Ok(read) => read,
+                        Err(_) => {
+                            if tx.send(Msg::Stdin(std::mem::take(&mut pending))).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                };
+                match read {
+                    Ok(0) | Err(_) => {
+                        if !pending.is_empty() {
+                            let _ = tx.send(Msg::Stdin(std::mem::take(&mut pending))).await;
+                        }
+                        break;
+                    }
                     Ok(n) => {
-                        if tx.send(Msg::Stdin(buf[..n].to_vec())).await.is_err() {
+                        let ready = split_mouse_stream(&mut pending, buf[..n].to_vec());
+                        if !ready.is_empty() && tx.send(Msg::Stdin(ready)).await.is_err() {
                             break;
                         }
                     }
@@ -1518,6 +1605,34 @@ mod tests {
         assert!(!has_mouse_seq(b"plain text"));
     }
 
+    #[test]
+    fn mouse_stream_reassembles_every_split_point() {
+        let seq = b"\x1b[<64;10;5M";
+        for at in 1..seq.len() {
+            let mut pending = Vec::new();
+            assert!(split_mouse_stream(&mut pending, seq[..at].to_vec()).is_empty());
+            assert_eq!(split_mouse_stream(&mut pending, seq[at..].to_vec()), seq);
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
+    fn mouse_stream_does_not_forward_fragment_at_stdin_buffer_boundary() {
+        let seq = b"\x1b[<64;5;5M";
+        let burst = seq.repeat(120);
+        let mut pending = Vec::new();
+
+        // The real failure: the 1,024-byte stdin read ended four bytes into the
+        // next report. Those four bytes used to become terminal.input after the
+        // complete reports, resetting the remote viewport to the live bottom.
+        let first = split_mouse_stream(&mut pending, burst[..1024].to_vec());
+        assert_eq!(first, seq.repeat(102));
+        assert_eq!(pending, seq[..4]);
+
+        let second = split_mouse_stream(&mut pending, burst[1024..].to_vec());
+        assert_eq!([first, second].concat(), burst);
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn sh_quote_escapes_single_quotes() {
