@@ -12,6 +12,7 @@
 mod api;
 mod binding;
 mod child_supervisor;
+mod claim_token;
 mod closes;
 mod config;
 mod controller_identity;
@@ -94,7 +95,11 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "teardown" => rt.block_on(daemon::cmd_teardown(Env::resolve()?)),
         "pane" => {
             let args = pane::parse_args(&rest[1..])?;
-            rt.block_on(pane::run(args))
+            let state_dir = util::home_dir()
+                .join(".local")
+                .join("state")
+                .join("herdr-mirror");
+            rt.block_on(pane::run(args, state_dir))
         }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),

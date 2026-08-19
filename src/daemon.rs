@@ -217,10 +217,6 @@ async fn run_connected(
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
         terminal_session_reconnect: status.terminal_session_reconnect,
-        controller_id: status
-            .terminal_session_reconnect
-            .then(|| crate::controller_identity::controller_id(&ctx.env_state_dir, &ctx.host.name))
-            .transpose()?,
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -452,39 +448,42 @@ async fn heal_zombie_mirrors(
         // falls back to its default and the next converge reconciles.
         let mut remote_host = crate::remote::RemoteHost::new(h, state_dir);
         let reconnect = match remote_host.ensure_ready().await {
-            Ok(()) => remote_host.status().await.ok(),
-            Err(error) => {
-                log.log(&format!(
-                    "[{}] reconnect capability re-probe failed during streamer heal: {error}",
-                    h.name
-                ));
-                None
-            }
-        };
-        let terminal_session_reconnect = reconnect
-            .as_ref()
-            .is_some_and(|status| status.terminal_session_reconnect);
-        let controller_id = if terminal_session_reconnect {
-            match crate::controller_identity::controller_id(state_dir, &h.name) {
-                Ok(id) => Some(id),
+            Ok(()) => match remote_host.status().await {
+                Ok(status) => status,
                 Err(error) => {
                     log.log(&format!(
-                        "[{}] controller identity unavailable during streamer heal: {error}",
+                        "[{}] reconnect capability re-probe failed during streamer heal: {error}; deferring heal",
                         h.name
                     ));
-                    None
+                    let _ = pokers[i].try_send(());
+                    continue;
                 }
+            },
+            Err(error) => {
+                log.log(&format!(
+                    "[{}] reconnect capability re-probe failed during streamer heal: {error}; deferring heal",
+                    h.name
+                ));
+                let _ = pokers[i].try_send(());
+                continue;
             }
-        } else {
-            None
         };
-        let terminal_session_reconnect = terminal_session_reconnect && controller_id.is_some();
+        let terminal_session_reconnect = reconnect.terminal_session_reconnect;
+        if terminal_session_reconnect {
+            if let Err(error) = crate::controller_identity::controller_id(state_dir, &h.name) {
+                log.log(&format!(
+                    "[{}] controller identity unavailable during streamer heal: {error}; deferring heal",
+                    h.name
+                ));
+                let _ = pokers[i].try_send(());
+                continue;
+            }
+        }
         let cmd_for = crate::mirror::cmd_for_pane(
             h,
             state_dir,
             &HashMap::new(),
             terminal_session_reconnect,
-            controller_id.as_deref(),
         );
         for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
@@ -827,10 +826,6 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
             terminal_session_reconnect: status.terminal_session_reconnect,
-            controller_id: status
-                .terminal_session_reconnect
-                .then(|| crate::controller_identity::controller_id(&env.state_dir, &h.name))
-                .transpose()?,
         })
         .await?;
         state.remote_session = Some(crate::state::RemoteSessionStatus {

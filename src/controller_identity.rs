@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Once;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,8 @@ use sha2::{Digest, Sha256};
 use crate::util::{err, Result};
 
 const ID_FILE: &str = "controller-id.json";
+const MAX_IDENTITY_BYTES: u64 = 1024;
+static MISSING_MACHINE_WARNING: Once = Once::new();
 
 #[derive(Deserialize, Serialize)]
 struct StoredIdentity {
@@ -42,7 +45,7 @@ fn load_or_create(state_dir: &Path, machine: Option<String>) -> Result<StoredIde
         return Err(std::io::Error::last_os_error().into());
     }
     let path = state_dir.join(ID_FILE);
-    match fs::read_to_string(&path) {
+    match read_identity_file(&path) {
         Ok(text) => {
             let mut stored = parse(&text)?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -57,6 +60,8 @@ fn load_or_create(state_dir: &Path, machine: Option<String>) -> Result<StoredIde
             if stored.machine.is_none() && machine.is_some() {
                 stored.machine = machine;
                 write_atomic(&path, &stored)?;
+            } else if stored.machine.is_none() {
+                warn_missing_machine_fingerprint();
             }
             Ok(stored)
         }
@@ -65,11 +70,46 @@ fn load_or_create(state_dir: &Path, machine: Option<String>) -> Result<StoredIde
                 id: random_id()?,
                 machine,
             };
+            if created.machine.is_none() {
+                warn_missing_machine_fingerprint();
+            }
             write_atomic(&path, &created)?;
             Ok(created)
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_identity_file(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_IDENTITY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "controller identity file is oversized",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(MAX_IDENTITY_BYTES as usize);
+    file.take(MAX_IDENTITY_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "controller identity file is oversized",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "controller identity file is not UTF-8",
+        )
+    })
+}
+
+fn warn_missing_machine_fingerprint() {
+    MISSING_MACHINE_WARNING.call_once(|| {
+        eprintln!(
+            "herdr-mirror: machine fingerprint unavailable; controller identity copied to another machine may collide"
+        );
+    });
 }
 
 fn parse(text: &str) -> Result<StoredIdentity> {

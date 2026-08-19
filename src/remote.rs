@@ -584,7 +584,7 @@ fn parse_remote_status(out: &str, session: Option<&str>) -> Result<RemoteStatus>
     let terminal_session_reconnect = running
         && compatible
         && client_protocol == server_protocol
-        && client_protocol.is_some_and(|protocol| protocol >= 21)
+        && client_protocol.is_some_and(|protocol| protocol >= 22)
         && reconnect_capability;
     let socket = parsed
         .server
@@ -785,11 +785,11 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_capability_requires_compatible_protocol_21_on_both_sides() {
+    fn reconnect_capability_requires_compatible_protocol_22_on_both_sides() {
         let capable = parse_remote_status(
             r#"{
-                "client":{"version":"0.8.1","protocol":21},
-                "server":{"running":true,"version":"0.8.1","protocol":21,
+                "client":{"version":"0.8.2","protocol":22},
+                "server":{"running":true,"version":"0.8.2","protocol":22,
                     "compatible":true,"socket":"/tmp/herdr.sock",
                     "capabilities":{"terminal_session_reconnect_v1":true}}
             }"#,
@@ -800,8 +800,9 @@ mod tests {
 
         for json in [
             r#"{"client":{"version":"0.8.1","protocol":20},"server":{"running":true,"version":"0.8.1","protocol":20,"compatible":true,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
-            r#"{"client":{"version":"0.8.1","protocol":21},"server":{"running":true,"version":"0.8.1","protocol":20,"compatible":false,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
-            r#"{"client":{"version":"0.8.1","protocol":21},"server":{"running":true,"version":"0.8.1","protocol":21,"compatible":true,"capabilities":{}}}"#,
+            r#"{"client":{"version":"0.8.1","protocol":21},"server":{"running":true,"version":"0.8.1","protocol":21,"compatible":true,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
+            r#"{"client":{"version":"0.8.2","protocol":22},"server":{"running":true,"version":"0.8.1","protocol":21,"compatible":false,"capabilities":{"terminal_session_reconnect_v1":true}}}"#,
+            r#"{"client":{"version":"0.8.2","protocol":22},"server":{"running":true,"version":"0.8.2","protocol":22,"compatible":true,"capabilities":{}}}"#,
         ] {
             assert!(
                 !parse_remote_status(json, None)

@@ -316,14 +316,19 @@ target = "work"
 target = "ssh://niko@203.0.113.7:2222"
 ```
 
-Herdr protocol 21 peers automatically use a persisted, host-scoped controller
+Herdr protocol 22 peers automatically use a persisted, host-scoped controller
 identity plus a 20-second lease. The mirror sends heartbeats every two seconds,
-reconnects when acknowledgements stop, and safely replaces only its own stale
-claim. Older peers keep their released behavior; automatic takeover stays off
+reconnects when acknowledgements stop, persists Herdr's latest claim token per
+remote pane, and records a monotonic attempt generation before every dial. The
+token reclaims the exact stale connection; the generation rejects delayed old
+dials and still recovers when a newer ready record was lost. Priority control output and full-frame resync keep a slow or
+blocked stream from looking healthy while its display is stale. Older peers keep their released behavior; automatic takeover stays off
 unless explicitly enabled above. The controller identity lives in
 `~/.local/state/herdr-mirror/controller-id.json`; daemons sharing that state
 directory intentionally act as one controller, while a copied file regenerates
 when the machine identity changes.
+Per-pane claim tokens and duplicate-streamer locks live beside it under the
+same state directory; stale lock artifacts are collected during acquisition.
 
 ## Devcontainer
 

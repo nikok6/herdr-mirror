@@ -73,7 +73,7 @@ pub struct Args {
     /// Daemon-computed cross-process key. Recomputed and verified by pane mode.
     pub streamer_key: Option<String>,
     pub terminal_reconnect: bool,
-    pub controller_id: Option<String>,
+    controller_id: Option<String>,
     /// upper bound on the size control asks the remote for. `None` = uncapped
     /// (fill the local pane). Set by the daemon from per-host config; observe
     /// is never capped, since it doesn't resize anything.
@@ -144,7 +144,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--controller-scope" => args.controller_scope = Some(next("--controller-scope")?),
             "--streamer-key" => args.streamer_key = Some(next("--streamer-key")?),
             "--terminal-reconnect" => args.terminal_reconnect = true,
-            "--controller-id" => args.controller_id = Some(next("--controller-id")?),
             // 0 is unset here for the same reason config treats it that way:
             // a zero cap would ask the remote for a zero-column terminal, which
             // herdr rejects outright, killing the session twice over and
@@ -218,6 +217,7 @@ struct Frame {
     code: Option<String>,
     index: Option<usize>,
     total_bytes: Option<usize>,
+    claim_token: Option<u64>,
 }
 
 enum Msg {
@@ -238,13 +238,21 @@ struct Session {
     supervisor: crate::child_supervisor::ChildSupervisor,
 }
 
+#[derive(Clone, Copy)]
+struct ReconnectClaim {
+    token: Option<u64>,
+    generation: u64,
+}
+
 impl Session {
     async fn stop(mut self, release: bool) {
         if release && self.mode == Mode::Control {
-            let _ = self
-                .stdin
-                .write_all(b"{\"type\":\"terminal.release\"}\n")
-                .await;
+            let _ = tokio::time::timeout(
+                SESSION_WRITE_TIMEOUT,
+                self.stdin
+                    .write_all(b"{\"type\":\"terminal.release\"}\n"),
+            )
+            .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.supervisor.cancel_and_wait().await;
@@ -260,11 +268,12 @@ fn spawn_session(
     args: &Args,
     mode: Mode,
     takeover: bool,
-    cols: usize,
-    rows: usize,
+    reconnect_claim: Option<ReconnectClaim>,
+    size: (usize, usize),
     gen: u64,
     tx: mpsc::Sender<Msg>,
 ) -> Result<Session> {
+    let (cols, rows) = size;
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -286,6 +295,14 @@ fn spawn_session(
             if let Some(controller_id) = &args.controller_id {
                 cmd.push_str(" --controller-id ");
                 cmd.push_str(&sh_quote(controller_id));
+                if let Some(claim) = reconnect_claim {
+                    if let Some(claim_token) = claim.token {
+                        cmd.push_str(" --replace-claim-token ");
+                        cmd.push_str(&claim_token.to_string());
+                    }
+                    cmd.push_str(" --controller-generation ");
+                    cmd.push_str(&claim.generation.to_string());
+                }
             }
         }
     }
@@ -676,6 +693,9 @@ const GONE_BACKOFF_MS: u64 = 60_000;
 
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+const WAKE_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const WAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Is this failure "the pane we stream is gone", as opposed to any other
 /// failure that happens to mention something missing?
@@ -701,6 +721,16 @@ fn target_gone(reason: &str, pane_target: &str) -> bool {
         .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
 }
 
+fn reconnect_flags_unsupported(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    ["--controller-id", "--lease-ms", "--replace-claim-token"]
+        .iter()
+        .any(|flag| reason.contains(flag))
+        && ["unknown", "unexpected", "unrecognized"]
+            .iter()
+            .any(|word| reason.contains(word))
+}
+
 /// Delay before the next attempt, and the ladder position to keep.
 ///
 /// Pure so the rung and the ladder-resume are testable without a live pane.
@@ -712,6 +742,22 @@ fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
         return (GONE_BACKOFF_MS, idx);
     }
     (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
+}
+
+fn control_input_needs_buffer(
+    switching_to: Option<Mode>,
+    session_present: bool,
+    session_ready: bool,
+) -> bool {
+    switching_to == Some(Mode::Control) || !session_present || !session_ready
+}
+
+fn bound_reconnect_delay(delay_ms: u64, wake_retry_until: Option<Instant>, now: Instant) -> u64 {
+    if wake_retry_until.is_some_and(|deadline| now < deadline) {
+        delay_ms.min(WAKE_RETRY_DELAY.as_millis() as u64)
+    } else {
+        delay_ms
+    }
 }
 
 struct App {
@@ -730,16 +776,21 @@ struct App {
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
+    wake_retry_until: Option<Instant>,
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
     takeover_policy: crate::ownership::LegacyTakeoverPolicy,
     next_control_takeover: bool,
     session_ready: bool,
+    claim_token: Option<u64>,
+    claim_token_key: String,
+    state_dir: std::path::PathBuf,
     heartbeat_status_visible: bool,
     ownership_hint: Option<String>,
     frame_assembler: crate::frame_stream::FrameAssembler,
     frame_resync_pending: bool,
+    last_frame_seq: Option<u64>,
     liveness: crate::liveness::Liveness,
     pending_input: crate::pending_input::PendingInput,
     last_input: Instant,
@@ -916,9 +967,14 @@ impl App {
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        self.reconnect_at = None;
+        self.switching_to = None;
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
+        self.frame_assembler = crate::frame_stream::FrameAssembler::default();
         self.frame_resync_pending = false;
+        self.last_frame_seq = None;
+        self.liveness.disconnected();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
             Mode::Control => self.control_size(),
@@ -928,12 +984,26 @@ impl App {
         }
         self.next_gen += 1;
         let takeover = m == Mode::Control && std::mem::take(&mut self.next_control_takeover);
+        let reconnect_claim = if m == Mode::Control && self.args.terminal_reconnect {
+            match crate::claim_token::next_generation(&self.state_dir, &self.claim_token_key) {
+                Ok(generation) => Some(ReconnectClaim {
+                    token: self.claim_token,
+                    generation,
+                }),
+                Err(error) => {
+                    self.schedule_reconnect(m, &format!("cannot allocate controller generation: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         match spawn_session(
             &self.args,
             m,
             takeover,
-            cols,
-            rows,
+            reconnect_claim,
+            (cols, rows),
             self.next_gen,
             self.tx.clone(),
         ) {
@@ -965,12 +1035,16 @@ impl App {
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
+        if self.args.dump && !reason.is_empty() {
+            eprintln!("herdr-mirror: {m:?} session reconnecting: {reason}");
+        }
         // Only slow down once we are back in observe. In control the existing
         // quick-failure fallback needs its fast retries to reach two failures
         // and drop the pane to observe within seconds; a 60s rung there would
         // leave an always_control pane stuck in control for a minute.
         let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
         let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
+        let delay = bound_reconnect_delay(delay, self.wake_retry_until, Instant::now());
         self.backoff_idx = idx;
 
         if gone {
@@ -1010,11 +1084,21 @@ impl App {
         self.switch_at = Some(Instant::now() + SWITCH_GAP);
     }
 
-    async fn mark_session_ready(&mut self) {
+    async fn mark_session_ready(&mut self, claim_token: Option<u64>) {
         if self.session_ready {
             return;
         }
         self.session_ready = true;
+        if self.mode == Mode::Control {
+            self.claim_token = claim_token.or(self.claim_token);
+            if let Some(token) = claim_token {
+                if let Err(error) =
+                    crate::claim_token::save(&self.state_dir, &self.claim_token_key, token)
+                {
+                    eprintln!("herdr-mirror: cannot persist terminal claim token: {error}");
+                }
+            }
+        }
         let now = Instant::now();
         self.liveness.ready(now, std::time::SystemTime::now());
         if self.args.terminal_reconnect {
@@ -1033,7 +1117,11 @@ impl App {
                 let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })
                     .to_string()
                     + "\n";
-                let _ = session.stdin.write_all(line.as_bytes()).await;
+                let _ = tokio::time::timeout(
+                    SESSION_WRITE_TIMEOUT,
+                    session.stdin.write_all(line.as_bytes()),
+                )
+                .await;
             }
         }
         if drained.dropped_bytes > 0 {
@@ -1082,7 +1170,7 @@ impl App {
             return; // stale frame from a replaced session
         }
         match frame.kind.as_str() {
-            "terminal.ready" => self.mark_session_ready().await,
+            "terminal.ready" => self.mark_session_ready(frame.claim_token).await,
             "terminal.heartbeat_ack"
                 if frame
                     .nonce
@@ -1139,7 +1227,16 @@ impl App {
                     .and_then(|seq| self.frame_assembler.finish(seq));
                 match result {
                     Ok(complete) => {
-                        self.mark_session_ready().await;
+                        if !complete.full
+                            && self
+                                .last_frame_seq
+                                .is_some_and(|last| complete.seq != last.saturating_add(1))
+                        {
+                            self.request_frame_resync().await;
+                            return;
+                        }
+                        self.last_frame_seq = Some(complete.seq);
+                        self.mark_session_ready(frame.claim_token).await;
                         self.apply_terminal_frame(
                             Some(complete.seq),
                             complete.full,
@@ -1159,7 +1256,16 @@ impl App {
                 else {
                     return;
                 };
-                self.mark_session_ready().await;
+                if !frame.full.unwrap_or(false)
+                    && frame.seq.zip(self.last_frame_seq).is_some_and(|(seq, last)| {
+                        seq != last.saturating_add(1)
+                    })
+                {
+                    self.request_frame_resync().await;
+                    return;
+                }
+                self.last_frame_seq = frame.seq.or(self.last_frame_seq);
+                self.mark_session_ready(frame.claim_token).await;
                 self.apply_terminal_frame(
                     frame.seq,
                     frame.full.unwrap_or(false),
@@ -1187,8 +1293,23 @@ impl App {
             return; // an old child we already replaced/killed
         }
         self.session = None;
+        self.session_ready = false;
+        self.liveness.disconnected();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        if self.args.terminal_reconnect && reconnect_flags_unsupported(&reason_line) {
+            self.args.terminal_reconnect = false;
+            self.args.controller_id = None;
+            self.claim_token = None;
+            self.liveness.disable();
+            self.heartbeat_status_visible = false;
+            self.ownership_hint = Some(
+                "remote Herdr no longer supports reconnect leases — using safe legacy mode"
+                    .into(),
+            );
+            self.schedule_reconnect(exited_mode, &reason_line);
+            return;
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
@@ -1220,28 +1341,44 @@ impl App {
                 }
                 return;
             }
-            self.control_failures = if uptime < QUICK_CONTROL_FAILURE {
-                self.control_failures + 1
-            } else {
-                0
-            };
-            if self.control_failures >= 2 {
-                self.control_failures = 0;
-                self.control_sticky = true;
-                self.switch_mode(Mode::Observe);
-                let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
-                self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
-                return;
+            if !self.args.terminal_reconnect {
+                self.control_failures = if uptime < QUICK_CONTROL_FAILURE {
+                    self.control_failures + 1
+                } else {
+                    0
+                };
+                if self.control_failures >= 2 {
+                    self.control_failures = 0;
+                    self.control_sticky = true;
+                    self.switch_mode(Mode::Observe);
+                    let suffix = if reason_line.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({reason_line})")
+                    };
+                    self.hint(&format!(
+                        "control unavailable — viewing only{suffix}; type to retry"
+                    ));
+                    return;
+                }
             }
         }
         self.schedule_reconnect(exited_mode, &reason_line);
     }
 
-    async fn send(&mut self, msg: serde_json::Value) {
+    async fn send(&mut self, msg: serde_json::Value) -> bool {
         if let Some(s) = self.session.as_mut() {
             let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
+            return matches!(
+                tokio::time::timeout(
+                    SESSION_WRITE_TIMEOUT,
+                    s.stdin.write_all(line.as_bytes())
+                )
+                .await,
+                Ok(Ok(()))
+            );
         }
+        false
     }
 
     async fn request_frame_resync(&mut self) {
@@ -1259,6 +1396,7 @@ impl App {
         {
             Some(crate::liveness::Action::Heartbeat { nonce, wake_probe }) => {
                 if wake_probe {
+                    self.wake_retry_until = Some(Instant::now() + WAKE_RETRY_WINDOW);
                     self.heartbeat_status_visible = true;
                     self.renderer
                         .status("wake detected — probing terminal path…");
@@ -1435,7 +1573,11 @@ impl App {
             }
             return;
         }
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
+        if control_input_needs_buffer(
+            self.switching_to,
+            self.session.is_some(),
+            self.session_ready,
+        ) {
             // spinning up or awaiting reconnect: queue the keystroke (flushed
             // on connect) and, if in backoff, reconnect now
             self.pending_input.push(Instant::now(), buf);
@@ -1502,7 +1644,11 @@ impl App {
             return;
         }
         self.last_input = Instant::now();
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
+        if control_input_needs_buffer(
+            self.switching_to,
+            self.session.is_some(),
+            self.session_ready,
+        ) {
             self.pending_input.push(Instant::now(), buf);
             if let Some((_, m)) = self.reconnect_at {
                 self.reconnect_at = Some((Instant::now(), m));
@@ -1530,30 +1676,40 @@ impl App {
 // ---------------------------------------------------------------------------
 // main
 
-pub async fn run(args: Args) -> Result<()> {
+pub async fn run(mut args: Args, state_dir: std::path::PathBuf) -> Result<()> {
     // Claim the cross-process streamer slot before opening SSH. --dump is a
     // human diagnostic and deliberately does not participate in daemon healing.
+    let scope = args.controller_scope.as_deref().unwrap_or(&args.ssh_target);
+    let transport = if args.container.is_some() {
+        "docker"
+    } else {
+        "ssh"
+    };
+    let identity = crate::streamer_lock::StreamerIdentity {
+        transport,
+        controller_scope: scope,
+        target: &args.ssh_target,
+        session: args.session.as_deref(),
+        pane: &args.pane_target,
+    };
+    let computed = identity.key();
+    if args.terminal_reconnect {
+        args.controller_id = Some(crate::controller_identity::controller_id(&state_dir, scope)?);
+    }
+    let claim_token = if args.terminal_reconnect {
+        match crate::claim_token::load(&state_dir, &computed) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("herdr-mirror: ignoring invalid terminal claim token: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let _streamer_lock = if args.dump {
         None
     } else {
-        let state_dir = crate::util::home_dir()
-            .join(".local")
-            .join("state")
-            .join("herdr-mirror");
-        let scope = args.controller_scope.as_deref().unwrap_or(&args.ssh_target);
-        let transport = if args.container.is_some() {
-            "docker"
-        } else {
-            "ssh"
-        };
-        let identity = crate::streamer_lock::StreamerIdentity {
-            transport,
-            controller_scope: scope,
-            target: &args.ssh_target,
-            session: args.session.as_deref(),
-            pane: &args.pane_target,
-        };
-        let computed = identity.key();
         if args
             .streamer_key
             .as_deref()
@@ -1616,15 +1772,20 @@ pub async fn run(args: Args) -> Result<()> {
         next_gen: 0,
         backoff_idx: 0,
         reconnect_at: None,
+        wake_retry_until: None,
         control_failures: 0,
         control_sticky: false,
         takeover_policy: crate::ownership::LegacyTakeoverPolicy::default(),
         next_control_takeover: false,
         session_ready: false,
+        claim_token,
+        claim_token_key: computed,
+        state_dir,
         heartbeat_status_visible: false,
         ownership_hint: None,
         frame_assembler: crate::frame_stream::FrameAssembler::default(),
         frame_resync_pending: false,
+        last_frame_seq: None,
         liveness: crate::liveness::Liveness::new(
             terminal_reconnect,
             now,
@@ -2094,6 +2255,16 @@ mod tests {
     }
 
     #[test]
+    fn remote_downgrade_is_detected_only_from_reconnect_flag_rejection() {
+        assert!(reconnect_flags_unsupported(
+            "error: unexpected argument '--controller-id' found"
+        ));
+        assert!(reconnect_flags_unsupported("unknown option: --lease-ms"));
+        assert!(!reconnect_flags_unsupported("ssh: connection timed out"));
+        assert!(!reconnect_flags_unsupported("unknown host"));
+    }
+
+    #[test]
     fn a_gone_target_slows_down_without_consuming_the_ladder() {
         // the fix: 10s forever becomes one attempt a minute
         assert_eq!(reconnect_delay(true, 0), (GONE_BACKOFF_MS, 0));
@@ -2110,6 +2281,30 @@ mod tests {
         let (_, idx) = reconnect_delay(false, 0);
         let (_, idx) = reconnect_delay(true, idx);
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
+    #[test]
+    fn control_input_stays_buffered_until_the_candidate_is_ready() {
+        assert!(control_input_needs_buffer(None, true, false));
+        assert!(control_input_needs_buffer(Some(Mode::Control), true, true));
+        assert!(control_input_needs_buffer(None, false, false));
+        assert!(!control_input_needs_buffer(None, true, true));
+    }
+
+    #[test]
+    fn wake_recovery_caps_every_backoff_rung_for_thirty_seconds() {
+        let now = Instant::now();
+        let wake_retry_until = Some(now + WAKE_RETRY_WINDOW);
+        for delay in [1_000, 2_000, 5_000, 10_000, GONE_BACKOFF_MS] {
+            assert_eq!(
+                bound_reconnect_delay(delay, wake_retry_until, now),
+                1_000
+            );
+        }
+        assert_eq!(
+            bound_reconnect_delay(10_000, wake_retry_until, now + WAKE_RETRY_WINDOW),
+            10_000
+        );
     }
 
 }

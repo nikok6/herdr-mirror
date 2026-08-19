@@ -341,7 +341,6 @@ pub struct ConvergeDeps {
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
     pub terminal_session_reconnect: bool,
-    pub controller_id: Option<String>,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -351,7 +350,6 @@ pub(crate) fn cmd_for_pane(
     state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
     terminal_session_reconnect: bool,
-    controller_id: Option<&str>,
 ) -> impl Fn(&str) -> Vec<String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
@@ -372,7 +370,6 @@ pub(crate) fn cmd_for_pane(
         .display()
         .to_string();
     let sizes = sizes.clone();
-    let controller_id = controller_id.map(str::to_owned);
     move |pane_id: &str| {
         let transport = if kind.is_docker() { "docker" } else { "ssh" };
         let identity = crate::streamer_lock::StreamerIdentity {
@@ -392,9 +389,6 @@ pub(crate) fn cmd_for_pane(
         argv.extend(["--streamer-key".into(), identity.key()]);
         if terminal_session_reconnect {
             argv.push("--terminal-reconnect".into());
-            if let Some(controller_id) = &controller_id {
-                argv.extend(["--controller-id".into(), controller_id.clone()]);
-            }
         }
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
         // defaults to the same resolution so the argv stays short
@@ -710,7 +704,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         &deps.state_dir,
         &sizes,
         deps.terminal_session_reconnect,
-        deps.controller_id.as_deref(),
     );
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
@@ -1650,7 +1643,7 @@ mod tests {
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
-        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), false, None);
+        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), false);
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1683,7 +1676,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         );
         let argv = cmd("w1:p1");
         assert_eq!(
@@ -1714,7 +1706,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         );
         let argv = cmd("w1:p1");
         assert_eq!(
@@ -1739,19 +1730,18 @@ mod tests {
     }
 
     #[test]
-    fn protocol_21_capability_reaches_the_streamer() {
+    fn protocol_22_capability_reaches_the_streamer() {
         let host = ssh_host();
         let cmd = cmd_for_pane(
             &host,
             std::path::Path::new("/state"),
             &HashMap::new(),
             true,
-            Some("controller-123"),
         );
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).unwrap();
         assert!(parsed.terminal_reconnect);
-        assert_eq!(parsed.controller_id.as_deref(), Some("controller-123"));
+        assert!(!argv.iter().any(|arg| arg == "--controller-id"));
     }
 
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
@@ -1768,7 +1758,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         );
         let argv = cmd("w1:p1");
         assert_eq!(
@@ -1807,7 +1796,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         );
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
@@ -1828,7 +1816,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         );
         let argv = cmd("w1:p1");
         assert_eq!(
@@ -1858,7 +1845,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         )("w1:p1");
         assert!(!uncapped
             .iter()
@@ -1871,7 +1857,6 @@ mod tests {
             std::path::Path::new("/state"),
             &HashMap::new(),
             false,
-            None,
         )("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.max_cols, Some(212));

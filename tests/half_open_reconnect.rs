@@ -90,10 +90,9 @@ for line in sys.stdin:
             "w1:p1",
             "--dump",
             "--terminal-reconnect",
-            "--controller-id",
-            "test-controller",
         ])
         .env("PATH", path)
+        .env("HOME", &dir)
         .env("FAKE_SSH_COUNT", &counter)
         .env(
             "FAKE_SSH_FIRST_SILENT",
@@ -131,6 +130,10 @@ for line in sys.stdin:
         libc::kill(child.id() as i32, libc::SIGTERM);
     }
     let _ = child.wait();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    while child_process_count(0, Some(&fake_ssh)) != 0 && Instant::now() < cleanup_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     assert!(recovered, "mirror did not recover within {recovery_limit:?}");
     assert!(elapsed <= recovery_limit, "elapsed={elapsed:?}");
