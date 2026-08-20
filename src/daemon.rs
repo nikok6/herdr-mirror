@@ -197,7 +197,15 @@ async fn run_connected(
     // would otherwise be re-probed via streamlocal on every single reconnect
     // for the life of the daemon
     remote_host.hint_transport(*remembered_transport);
-    let (remote, _status) = remote_host.connect_api().await?;
+    let (remote, status) = remote_host.connect_api().await?;
+    ctx.log.log(&format!(
+        "[{}] herdr protocols client={:?} server={:?} compatible={} reconnect_v1={}",
+        ctx.host.name,
+        status.client_protocol,
+        status.server_protocol,
+        status.compatible,
+        status.terminal_session_reconnect
+    ));
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
     let deps = ConvergeDeps {
@@ -208,12 +216,20 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        terminal_session_reconnect: status.terminal_session_reconnect,
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
-    let state = converge(&deps).await?;
+    let mut state = converge(&deps).await?;
+    state.remote_session = Some(crate::state::RemoteSessionStatus {
+        client_protocol: status.client_protocol,
+        server_protocol: status.server_protocol,
+        compatible: status.compatible,
+        reconnect_v1: status.terminal_session_reconnect,
+    });
+    save_state(&ctx.env_state_dir, &ctx.host.name, &state)?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
@@ -430,7 +446,45 @@ async fn heal_zombie_mirrors(
         //
         // Sizes live in the remote layout, which we don't have here; the wrapper
         // falls back to its default and the next converge reconciles.
-        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
+        let mut remote_host = crate::remote::RemoteHost::new(h, state_dir);
+        let reconnect = match remote_host.ensure_ready().await {
+            Ok(()) => match remote_host.status().await {
+                Ok(status) => status,
+                Err(error) => {
+                    log.log(&format!(
+                        "[{}] reconnect capability re-probe failed during streamer heal: {error}; deferring heal",
+                        h.name
+                    ));
+                    let _ = pokers[i].try_send(());
+                    continue;
+                }
+            },
+            Err(error) => {
+                log.log(&format!(
+                    "[{}] reconnect capability re-probe failed during streamer heal: {error}; deferring heal",
+                    h.name
+                ));
+                let _ = pokers[i].try_send(());
+                continue;
+            }
+        };
+        let terminal_session_reconnect = reconnect.terminal_session_reconnect;
+        if terminal_session_reconnect {
+            if let Err(error) = crate::controller_identity::controller_id(state_dir, &h.name) {
+                log.log(&format!(
+                    "[{}] controller identity unavailable during streamer heal: {error}; deferring heal",
+                    h.name
+                ));
+                let _ = pokers[i].try_send(());
+                continue;
+            }
+        }
+        let cmd_for = crate::mirror::cmd_for_pane(
+            h,
+            state_dir,
+            &HashMap::new(),
+            terminal_session_reconnect,
+        );
         for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
@@ -716,7 +770,27 @@ pub fn cmd_status(env: &Env) -> Result<()> {
         let state = load_state(&env.state_dir, &h.name);
         let ws = state.workspaces.values().filter(|w| !w.is_tombstoned()).count();
         let panes = state.panes.values().filter(|p| !p.is_tombstoned()).count();
-        println!("host {} ({}): {ws} mirror workspaces, {panes} mirror panes", h.name, h.target);
+        println!(
+            "host {} ({}): {ws} mirror workspaces, {panes} mirror panes",
+            h.name, h.target
+        );
+        if let Some(remote) = &state.remote_session {
+            println!(
+                "  terminal reconnect: {} (client protocol {}, server protocol {}, compatible={})",
+                if remote.reconnect_v1 {
+                    "active"
+                } else {
+                    "legacy"
+                },
+                remote
+                    .client_protocol
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                remote
+                    .server_protocol
+                    .map_or_else(|| "unknown".into(), |value| value.to_string()),
+                remote.compatible
+            );
+        }
         let tombs: Vec<String> = state
             .workspaces
             .iter()
@@ -744,8 +818,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
-        let (remote, _status) = remote_host.connect_api().await?;
-        converge(&ConvergeDeps {
+        let (remote, status) = remote_host.connect_api().await?;
+        let mut state = converge(&ConvergeDeps {
             local: local.clone(),
             remote,
             host: h.clone(),
@@ -756,8 +830,16 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            terminal_session_reconnect: status.terminal_session_reconnect,
         })
         .await?;
+        state.remote_session = Some(crate::state::RemoteSessionStatus {
+            client_protocol: status.client_protocol,
+            server_protocol: status.server_protocol,
+            compatible: status.compatible,
+            reconnect_v1: status.terminal_session_reconnect,
+        });
+        save_state(&env.state_dir, &h.name, &state)?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
     }
     Ok(())

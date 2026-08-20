@@ -86,6 +86,16 @@ pub struct HostState {
     /// permanent winner and revert the other side's drag.
     #[serde(default)]
     pub ratios: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_session: Option<RemoteSessionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSessionStatus {
+    pub client_protocol: Option<u32>,
+    pub server_protocol: Option<u32>,
+    pub compatible: bool,
+    pub reconnect_v1: bool,
 }
 
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {

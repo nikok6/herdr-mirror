@@ -107,6 +107,10 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// Legacy Herdr only: permit one bounded automatic `--takeover` retry after
+    /// the exact existing-controller rejection. Safe default is false because
+    /// legacy controllers have no stable identity.
+    pub takeover_on_reconnect: bool,
     /// Cap the size control asks the remote for. `None` = uncapped: fill the
     /// local pane, which is right for a headless remote nobody looks at.
     /// Control is authoritative on the remote, so on a host with its own
@@ -158,6 +162,7 @@ struct RawConfig {
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
+    takeover_on_reconnect: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     // toml::Table (preserve_order) keeps declaration order — the first host
@@ -179,6 +184,7 @@ struct RawHost {
     session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    takeover_on_reconnect: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
@@ -261,6 +267,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_takeover_on_reconnect = raw.takeover_on_reconnect.unwrap_or(false);
     // 0 is treated as unset rather than "clamp to nothing", same as an empty
     // remote_bin: a cap that would starve the remote of every column is a typo,
     // not an instruction. Warn rather than dropping it silently — and say that
@@ -318,6 +325,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            takeover_on_reconnect: h
+                .takeover_on_reconnect
+                .unwrap_or(global_takeover_on_reconnect),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
@@ -388,6 +398,23 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn takeover_on_reconnect_is_safe_by_default_and_overridable_per_host() {
+        let c = parse_config(
+            "takeover_on_reconnect = true\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\ntakeover_on_reconnect = false\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert!(a.takeover_on_reconnect);
+        assert!(!b.takeover_on_reconnect);
+
+        let defaults = parse_config("[hosts.safe]\ntarget = \"safe\"\n").unwrap();
+        assert!(!defaults.hosts[0].takeover_on_reconnect);
     }
 
     #[test]

@@ -220,26 +220,8 @@ pub fn pid_alive(pid: i32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
-/// Pidfile a pane streamer writes at startup. The daemon starts streamers by
-/// TYPING `exec ...` into a fresh shell pane, and interactive shell startup
-/// can eat keystrokes (oh-my-zsh's update prompt swallows the leading `e` —
-/// and re-prompts in every new shell until answered, so it fails every spawn,
-/// not one in a fortnight). The pidfile is how the daemon can tell the exec
-/// took, and retype it when it didn't.
-pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
-    let sane = |s: &str| {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect::<String>()
-    };
-    state_dir.join("streamer-pids").join(format!("{}--{}.pid", sane(ssh_target), sane(pane_target)))
-}
-
-pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> bool {
-    fs::read_to_string(streamer_pid_path(state_dir, ssh_target, pane_target))
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .is_some_and(pid_alive)
+pub fn streamer_alive(state_dir: &Path, key: &str) -> bool {
+    crate::streamer_lock::is_held(state_dir, key)
 }
 
 /// Sleep until the earliest deadline; pend forever when none.

@@ -340,6 +340,7 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    pub terminal_session_reconnect: bool,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -348,14 +349,17 @@ pub(crate) fn cmd_for_pane(
     host: &HostConfig,
     state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
+    terminal_session_reconnect: bool,
 ) -> impl Fn(&str) -> Vec<String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
     let target = host.target.clone();
+    let controller_scope = host.name.clone();
     let remote_bin = host.remote_bin.clone();
     let session = host.session.clone();
     let always_control = host.always_control;
+    let takeover_on_reconnect = host.takeover_on_reconnect;
     let max_cols = host.max_cols;
     let max_rows = host.max_rows;
     let kind = host.kind.clone();
@@ -367,12 +371,25 @@ pub(crate) fn cmd_for_pane(
         .to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
+        let transport = if kind.is_docker() { "docker" } else { "ssh" };
+        let identity = crate::streamer_lock::StreamerIdentity {
+            transport,
+            controller_scope: &controller_scope,
+            target: &target,
+            session: session.as_deref(),
+            pane: pane_id,
+        };
         let mut argv = vec![
             exe.clone(),
             "pane".into(),
             target.clone(),
             pane_id.to_string(),
         ];
+        argv.extend(["--controller-scope".into(), controller_scope.clone()]);
+        argv.extend(["--streamer-key".into(), identity.key()]);
+        if terminal_session_reconnect {
+            argv.push("--terminal-reconnect".into());
+        }
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
         // defaults to the same resolution so the argv stays short
         if let Some(bin) = &remote_bin {
@@ -383,6 +400,9 @@ pub(crate) fn cmd_for_pane(
         }
         if always_control {
             argv.push("--always-control".into());
+        }
+        if takeover_on_reconnect {
+            argv.push("--takeover-on-reconnect".into());
         }
         // absent when uncapped, so the argv of an unconfigured host is unchanged
         if let Some(c) = max_cols {
@@ -594,7 +614,9 @@ pub(crate) async fn spawn_streamer_pane(
     // alive-check right before each resend keeps a late-starting streamer
     // from getting the line typed into its stdin (which would forward it to
     // the remote pane as text).
-    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
+    let Some(streamer_key) = argv
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--streamer-key").then(|| pair[1].clone()))
     else {
         return;
     };
@@ -603,11 +625,11 @@ pub(crate) async fn spawn_streamer_pane(
     tokio::spawn(async move {
         for wait_ms in [3000u64, 4000] {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+            if crate::util::streamer_alive(&state_dir, &streamer_key) {
                 return;
             }
             log.log(&format!(
-                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
+                "streamer not up in {pane_id} — shell startup likely ate the exec; retyping"
             ));
             if local
                 .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
@@ -618,9 +640,9 @@ pub(crate) async fn spawn_streamer_pane(
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+        if !crate::util::streamer_alive(&state_dir, &streamer_key) {
             log.log(&format!(
-                "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
+                "streamer still not up in {pane_id} after retries — pane left as a shell"
             ));
         }
     });
@@ -677,7 +699,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             sizes.insert(p.pane_id.clone(), p.rect.clone());
         }
     }
-    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes);
+    let cmd_for = cmd_for_pane(
+        &deps.host,
+        &deps.state_dir,
+        &sizes,
+        deps.terminal_session_reconnect,
+    );
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
     // 1. detect mirrors that are gone locally. Always tombstone (never remove)
@@ -1536,6 +1563,7 @@ mod tests {
             remote_bin: None,
             session: None,
             always_control: true,
+            takeover_on_reconnect: false,
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
@@ -1625,7 +1653,7 @@ mod tests {
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
-        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new());
+        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), false);
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1633,6 +1661,10 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--controller-scope",
+                "vps",
+                "--streamer-key",
+                "4e46992d9e2a167cf9842589c043624a32102a64fb5717ed985aaaa7faee06a7",
                 // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
                 "--always-control",
                 "--ctl-path",
@@ -1649,7 +1681,12 @@ mod tests {
     fn ssh_pane_argv_carries_explicit_remote_bin() {
         let mut host = ssh_host();
         host.remote_bin = Some("/opt/herdr".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        );
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1657,6 +1694,10 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--controller-scope",
+                "vps",
+                "--streamer-key",
+                "4e46992d9e2a167cf9842589c043624a32102a64fb5717ed985aaaa7faee06a7",
                 "--remote-bin",
                 "/opt/herdr",
                 "--always-control",
@@ -1670,7 +1711,12 @@ mod tests {
     fn ssh_pane_argv_carries_remote_session() {
         let mut host = ssh_host();
         host.session = Some("work".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        );
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1678,6 +1724,10 @@ mod tests {
                 "pane",
                 "vps",
                 "w1:p1",
+                "--controller-scope",
+                "vps",
+                "--streamer-key",
+                "bef6cd8e8cd0379c19d654391f3655b3a146d64b122ed5cf2a92a21dd9d04fdf",
                 "--session",
                 "work",
                 "--always-control",
@@ -1689,16 +1739,36 @@ mod tests {
         assert_eq!(parsed.session.as_deref(), Some("work"));
     }
 
+    #[test]
+    fn protocol_22_capability_reaches_the_streamer() {
+        let host = ssh_host();
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            true,
+        );
+        let argv = cmd("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).unwrap();
+        assert!(parsed.terminal_reconnect);
+        assert!(!argv.iter().any(|arg| arg == "--controller-id"));
+    }
+
     /// Docker hosts append their flags *after* the ssh-shaped prefix, so the
     /// two argv layouts share a stable head and only diverge at the tail.
     #[test]
-    fn docker_pane_argv_carries_container_and_no_identity_token() {
+    fn docker_pane_argv_carries_container_and_scoped_identity() {
         let mut host = ssh_host();
         host.name = "token".into();
         host.target = "/Users/n/proj".into();
         host.kind = crate::config::HostKind::DockerFolder("/Users/n/proj".into());
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        );
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1706,8 +1776,11 @@ mod tests {
                 "pane",
                 "/Users/n/proj",
                 "w1:p1",
+                "--controller-scope",
+                "token",
+                "--streamer-key",
+                "4cd82b069262aaf98c25f8dfb9f65f706bf4534c261e0ff92caed50b326ee087",
                 "--always-control",
-                // no identity token at all: healing asks herdr per pane
                 "--container-folder",
                 "/Users/n/proj",
                 "--docker-bin",
@@ -1728,7 +1801,12 @@ mod tests {
         // absolute path (GUI-launched daemons without /usr/local/bin on PATH)
         // would then silently get "cannot run docker".
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        );
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
@@ -1738,17 +1816,31 @@ mod tests {
         assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
     }
 
-    /// always_control is the only conditional flag; its absence must not
-    /// disturb the position of --ctl-path.
+    /// always_control remains conditional; scoped identity is always present.
     #[test]
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
         host.always_control = false;
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        );
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--controller-scope",
+                "vps",
+                "--streamer-key",
+                "4e46992d9e2a167cf9842589c043624a32102a64fb5717ed985aaaa7faee06a7",
+                "--ctl-path",
+                "/state/vps.ctl"
+            ]
         );
     }
 
@@ -1758,12 +1850,24 @@ mod tests {
     fn size_caps_reach_the_streamer_argv() {
         let mut host = ssh_host();
         host.always_control = false;
-        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
-        assert!(!uncapped.iter().any(|a| a == "--max-cols" || a == "--max-rows"));
+        let uncapped = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        )("w1:p1");
+        assert!(!uncapped
+            .iter()
+            .any(|a| a == "--max-cols" || a == "--max-rows"));
 
         host.max_cols = Some(212);
         host.max_rows = Some(58);
-        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let argv = cmd_for_pane(
+            &host,
+            std::path::Path::new("/state"),
+            &HashMap::new(),
+            false,
+        )("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.max_cols, Some(212));
         assert_eq!(parsed.max_rows, Some(58));

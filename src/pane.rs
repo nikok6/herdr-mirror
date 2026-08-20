@@ -64,6 +64,16 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// Legacy Herdr only: permit one bounded `--takeover` retry after the exact
+    /// existing-controller rejection. Defaults off.
+    pub takeover_on_reconnect: bool,
+    /// Stable configured host key used to derive controller ownership and
+    /// duplicate-streamer identity. Direct invocations default to ssh_target.
+    pub controller_scope: Option<String>,
+    /// Daemon-computed cross-process key. Recomputed and verified by pane mode.
+    pub streamer_key: Option<String>,
+    pub terminal_reconnect: bool,
+    controller_id: Option<String>,
     /// upper bound on the size control asks the remote for. `None` = uncapped
     /// (fill the local pane). Set by the daemon from per-host config; observe
     /// is never capped, since it doesn't resize anything.
@@ -97,6 +107,11 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         session: None,
         control_idle_secs: 3600,
         always_control: false,
+        takeover_on_reconnect: false,
+        controller_scope: None,
+        streamer_key: None,
+        terminal_reconnect: false,
+        controller_id: None,
         max_cols: None,
         max_rows: None,
         ctl_path: None,
@@ -125,6 +140,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--takeover-on-reconnect" => args.takeover_on_reconnect = true,
+            "--controller-scope" => args.controller_scope = Some(next("--controller-scope")?),
+            "--streamer-key" => args.streamer_key = Some(next("--streamer-key")?),
+            "--terminal-reconnect" => args.terminal_reconnect = true,
             // 0 is unset here for the same reason config treats it that way:
             // a zero cap would ask the remote for a zero-column terminal, which
             // herdr rejects outright, killing the session twice over and
@@ -194,6 +213,11 @@ struct Frame {
     height: Option<usize>,
     bytes: Option<String>,
     reason: Option<String>,
+    nonce: Option<u64>,
+    code: Option<String>,
+    index: Option<usize>,
+    total_bytes: Option<usize>,
+    claim_token: Option<u64>,
 }
 
 enum Msg {
@@ -210,8 +234,29 @@ enum Msg {
 struct Session {
     gen: u64,
     mode: Mode,
-    pid: i32,
     stdin: ChildStdin,
+    supervisor: crate::child_supervisor::ChildSupervisor,
+}
+
+#[derive(Clone, Copy)]
+struct ReconnectClaim {
+    token: Option<u64>,
+    generation: u64,
+}
+
+impl Session {
+    async fn stop(mut self, release: bool) {
+        if release && self.mode == Mode::Control {
+            let _ = tokio::time::timeout(
+                SESSION_WRITE_TIMEOUT,
+                self.stdin
+                    .write_all(b"{\"type\":\"terminal.release\"}\n"),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        self.supervisor.cancel_and_wait().await;
+    }
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
@@ -219,15 +264,21 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+fn spawn_session(
+    args: &Args,
+    mode: Mode,
+    takeover: bool,
+    reconnect_claim: Option<ReconnectClaim>,
+    size: (usize, usize),
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+) -> Result<Session> {
+    let (cols, rows) = size;
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
-    let bin = crate::config::remote_herdr_expr(
-        args.remote_bin.as_deref(),
-        args.session.as_deref(),
-    );
-    let cmd = format!(
+    let bin = crate::config::remote_herdr_expr(args.remote_bin.as_deref(), args.session.as_deref());
+    let mut cmd = format!(
         "exec {} terminal session {} {} --cols {} --rows {}",
         bin,
         mode.as_str(),
@@ -235,6 +286,26 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         cols,
         rows
     );
+    if mode == Mode::Control && takeover {
+        cmd.push_str(" --takeover");
+    }
+    if args.terminal_reconnect {
+        cmd.push_str(" --lease-ms 20000");
+        if mode == Mode::Control {
+            if let Some(controller_id) = &args.controller_id {
+                cmd.push_str(" --controller-id ");
+                cmd.push_str(&sh_quote(controller_id));
+                if let Some(claim) = reconnect_claim {
+                    if let Some(claim_token) = claim.token {
+                        cmd.push_str(" --replace-claim-token ");
+                        cmd.push_str(&claim_token.to_string());
+                    }
+                    cmd.push_str(" --controller-generation ");
+                    cmd.push_str(&claim.generation.to_string());
+                }
+            }
+        }
+    }
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
     let mut builder = match &args.container {
@@ -264,11 +335,12 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let pid = child.id().map(|p| p as i32).unwrap_or(0);
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
+    let (supervisor, mut exited) = crate::child_supervisor::ChildSupervisor::start(child);
     let started = Instant::now();
+    let structured = args.terminal_reconnect;
 
     tokio::spawn(async move {
         // ssh errors arrive on stderr; the server's failure reason arrives as
@@ -292,22 +364,45 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
             if frame.kind == "terminal.closed" {
-                if let Some(r) = &frame.reason {
-                    close_reason = r.clone();
-                }
+                close_reason = match (&frame.code, &frame.reason) {
+                    (Some(code), Some(reason)) => format!("{code}: {reason}"),
+                    (Some(code), None) => code.clone(),
+                    (None, Some(reason)) => reason.clone(),
+                    (None, None) => String::new(),
+                };
             }
             if tx.send(Msg::Frame { gen, frame }).await.is_err() {
                 break;
             }
         }
-        let _ = child.wait().await;
+        let _ = crate::child_supervisor::wait_for_exit(&mut exited).await;
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
-        let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let reason = if close_reason.is_empty() {
+            if tail.is_empty() && structured {
+                "transport_closed".to_owned()
+            } else {
+                tail
+            }
+        } else {
+            close_reason
+        };
+        let _ = tx
+            .send(Msg::SessionExit {
+                gen,
+                mode,
+                reason,
+                uptime: started.elapsed(),
+            })
+            .await;
     });
 
-    Ok(Session { gen, mode, pid, stdin })
+    Ok(Session {
+        gen,
+        mode,
+        stdin,
+        supervisor,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +693,9 @@ const GONE_BACKOFF_MS: u64 = 60_000;
 
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+const WAKE_RETRY_WINDOW: Duration = Duration::from_secs(30);
+const WAKE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Is this failure "the pane we stream is gone", as opposed to any other
 /// failure that happens to mention something missing?
@@ -623,6 +721,16 @@ fn target_gone(reason: &str, pane_target: &str) -> bool {
         .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
 }
 
+fn reconnect_flags_unsupported(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    ["--controller-id", "--lease-ms", "--replace-claim-token"]
+        .iter()
+        .any(|flag| reason.contains(flag))
+        && ["unknown", "unexpected", "unrecognized"]
+            .iter()
+            .any(|word| reason.contains(word))
+}
+
 /// Delay before the next attempt, and the ladder position to keep.
 ///
 /// Pure so the rung and the ladder-resume are testable without a live pane.
@@ -634,6 +742,22 @@ fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
         return (GONE_BACKOFF_MS, idx);
     }
     (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
+}
+
+fn control_input_needs_buffer(
+    switching_to: Option<Mode>,
+    session_present: bool,
+    session_ready: bool,
+) -> bool {
+    switching_to == Some(Mode::Control) || !session_present || !session_ready
+}
+
+fn bound_reconnect_delay(delay_ms: u64, wake_retry_until: Option<Instant>, now: Instant) -> u64 {
+    if wake_retry_until.is_some_and(|deadline| now < deadline) {
+        delay_ms.min(WAKE_RETRY_DELAY.as_millis() as u64)
+    } else {
+        delay_ms
+    }
 }
 
 struct App {
@@ -652,10 +776,23 @@ struct App {
 
     backoff_idx: usize,
     reconnect_at: Option<(Instant, Mode)>,
+    wake_retry_until: Option<Instant>,
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
-    pending_input: Vec<Vec<u8>>,
+    takeover_policy: crate::ownership::LegacyTakeoverPolicy,
+    next_control_takeover: bool,
+    session_ready: bool,
+    claim_token: Option<u64>,
+    claim_token_key: String,
+    state_dir: std::path::PathBuf,
+    heartbeat_status_visible: bool,
+    ownership_hint: Option<String>,
+    frame_assembler: crate::frame_stream::FrameAssembler,
+    frame_resync_pending: bool,
+    last_frame_seq: Option<u64>,
+    liveness: crate::liveness::Liveness,
+    pending_input: crate::pending_input::PendingInput,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
@@ -823,64 +960,91 @@ impl App {
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
     fn stop_session(&mut self) {
-        if let Some(mut s) = self.session.take() {
-            tokio::spawn(async move {
-                if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                unsafe { libc::kill(s.pid, libc::SIGTERM) };
-            });
+        if let Some(session) = self.session.take() {
+            tokio::spawn(session.stop(true));
         }
     }
 
     async fn connect(&mut self, m: Mode) {
         self.mode = m;
+        self.reconnect_at = None;
+        self.switching_to = None;
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
+        self.frame_assembler = crate::frame_stream::FrameAssembler::default();
+        self.frame_resync_pending = false;
+        self.last_frame_seq = None;
+        self.liveness.disconnected();
         let (cols, rows) = match m {
             Mode::Observe => self.observe_size(),
             Mode::Control => self.control_size(),
         };
-        if let Some(s) = self.session.take() {
-            unsafe { libc::kill(s.pid, libc::SIGTERM) };
+        if let Some(mut session) = self.session.take() {
+            session.supervisor.cancel_and_wait().await;
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
-            Ok(mut s) => {
+        let takeover = m == Mode::Control && std::mem::take(&mut self.next_control_takeover);
+        let reconnect_claim = if m == Mode::Control && self.args.terminal_reconnect {
+            match crate::claim_token::next_generation(&self.state_dir, &self.claim_token_key) {
+                Ok(generation) => Some(ReconnectClaim {
+                    token: self.claim_token,
+                    generation,
+                }),
+                Err(error) => {
+                    self.schedule_reconnect(m, &format!("cannot allocate controller generation: {error}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        match spawn_session(
+            &self.args,
+            m,
+            takeover,
+            reconnect_claim,
+            (cols, rows),
+            self.next_gen,
+            self.tx.clone(),
+        ) {
+            Ok(s) => {
+                self.session_ready = false;
+                self.heartbeat_status_visible = self.args.terminal_reconnect;
+                self.liveness
+                    .connected(Instant::now(), std::time::SystemTime::now());
                 if m == Mode::Control {
                     self.last_input = Instant::now();
-                    // keystrokes typed while the control session was spinning up
-                    for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
-                    }
-                } else {
-                    self.pending_input.clear();
                 }
                 self.session = Some(s);
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
-                self.renderer.status(
-                    if m == Mode::Control && !self.args.always_control {
-                        "CONTROL — ctrl+\\ to release"
-                    } else {
-                        ""
-                    },
-                );
+                let status = if self.args.terminal_reconnect {
+                    "connecting — waiting for terminal.ready"
+                } else if m == Mode::Observe {
+                    self.ownership_hint.as_deref().unwrap_or("")
+                } else if !self.args.always_control {
+                    "CONTROL — ctrl+\\ to release"
+                } else {
+                    ""
+                };
+                self.renderer.status(status);
             }
             Err(e) => self.schedule_reconnect(m, &e.to_string()),
         }
     }
 
     fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
+        if self.args.dump && !reason.is_empty() {
+            eprintln!("herdr-mirror: {m:?} session reconnecting: {reason}");
+        }
         // Only slow down once we are back in observe. In control the existing
         // quick-failure fallback needs its fast retries to reach two failures
         // and drop the pane to observe within seconds; a 60s rung there would
         // leave an always_control pane stuck in control for a minute.
         let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
         let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
+        let delay = bound_reconnect_delay(delay, self.wake_retry_until, Instant::now());
         self.backoff_idx = idx;
 
         if gone {
@@ -920,44 +1084,207 @@ impl App {
         self.switch_at = Some(Instant::now() + SWITCH_GAP);
     }
 
-    fn handle_frame(&mut self, gen: u64, frame: Frame) {
-        if self.session.as_ref().map(|s| s.gen) != Some(gen) {
-            return; // stale frame from a replaced session
+    async fn mark_session_ready(&mut self, claim_token: Option<u64>) {
+        if self.session_ready {
+            return;
         }
-        if frame.kind == "terminal.closed" {
-            let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
-            self.renderer.status(&format!("remote terminal closed{suffix}"));
+        self.session_ready = true;
+        if self.mode == Mode::Control {
+            self.claim_token = claim_token.or(self.claim_token);
+            if let Some(token) = claim_token {
+                if let Err(error) =
+                    crate::claim_token::save(&self.state_dir, &self.claim_token_key, token)
+                {
+                    eprintln!("herdr-mirror: cannot persist terminal claim token: {error}");
+                }
+            }
+        }
+        let now = Instant::now();
+        self.liveness.ready(now, std::time::SystemTime::now());
+        if self.args.terminal_reconnect {
+            self.heartbeat_status_visible = false;
+            self.renderer
+                .status(self.ownership_hint.as_deref().unwrap_or(""));
             self.paint();
+        }
+        if self.mode != Mode::Control {
             return;
         }
-        if frame.kind != "terminal.frame" {
-            return;
+        self.ownership_hint = None;
+        let drained = self.pending_input.drain_ready(now);
+        if let Some(session) = self.session.as_mut() {
+            for buf in drained.chunks {
+                let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })
+                    .to_string()
+                    + "\n";
+                let _ = tokio::time::timeout(
+                    SESSION_WRITE_TIMEOUT,
+                    session.stdin.write_all(line.as_bytes()),
+                )
+                .await;
+            }
         }
-        let Some(bytes) = &frame.bytes else { return };
+        if drained.dropped_bytes > 0 {
+            self.hint(&format!(
+                "dropped {} buffered input bytes after reconnect",
+                drained.dropped_bytes
+            ));
+        }
+    }
+
+    fn apply_terminal_frame(
+        &mut self,
+        seq: Option<u64>,
+        full: bool,
+        width: usize,
+        height: usize,
+        bytes: &[u8],
+    ) {
         self.backoff_idx = 0;
-        self.renderer.status("");
-        self.grid
-            .resize(frame.width.unwrap_or(self.grid.width), frame.height.unwrap_or(self.grid.height));
-        if frame.full == Some(true) {
+        self.renderer
+            .status(self.ownership_hint.as_deref().unwrap_or(""));
+        self.grid.resize(width, height);
+        if full {
             self.grid.clear();
         }
-        if let Ok(decoded) = B64.decode(bytes) {
-            self.grid.apply(&String::from_utf8_lossy(&decoded));
-            // reconcile predictive echo against the authoritative frame
-            self.predict.on_frame(&self.grid);
-        }
+        self.grid.apply(&String::from_utf8_lossy(bytes));
+        self.predict.on_frame(&self.grid);
         if self.args.dump {
-            let lines: Vec<String> = self.grid.text_lines().into_iter().filter(|l| !l.is_empty()).collect();
+            let lines: Vec<String> = self
+                .grid
+                .text_lines()
+                .into_iter()
+                .filter(|line| !line.is_empty())
+                .collect();
             println!(
-                "--- frame seq={:?} full={:?} {}x{} ---\n{}",
-                frame.seq,
-                frame.full,
-                frame.width.unwrap_or(0),
-                frame.height.unwrap_or(0),
+                "--- frame seq={seq:?} full={full:?} {width}x{height} ---\n{}",
                 lines.join("\n")
             );
         } else {
             self.paint();
+        }
+    }
+
+    async fn handle_frame(&mut self, gen: u64, frame: Frame) {
+        if self.session.as_ref().map(|s| s.gen) != Some(gen) {
+            return; // stale frame from a replaced session
+        }
+        match frame.kind.as_str() {
+            "terminal.ready" => self.mark_session_ready(frame.claim_token).await,
+            "terminal.heartbeat_ack"
+                if frame
+                    .nonce
+                    .is_some_and(|nonce| self.liveness.acknowledge(nonce, Instant::now()))
+                    && std::mem::take(&mut self.heartbeat_status_visible) =>
+            {
+                self.renderer
+                    .status(self.ownership_hint.as_deref().unwrap_or(""));
+                self.paint();
+            }
+            "terminal.heartbeat_ack" => {}
+            "terminal.frame.start" => {
+                let full = frame.full.unwrap_or(false);
+                if self
+                    .frame_assembler
+                    .start(
+                        frame.seq.unwrap_or(0),
+                        frame.width.unwrap_or(0),
+                        frame.height.unwrap_or(0),
+                        full,
+                        frame.total_bytes.unwrap_or(0),
+                    )
+                    .is_err()
+                {
+                    self.request_frame_resync().await;
+                } else if full {
+                    self.frame_resync_pending = false;
+                }
+            }
+            "terminal.frame.chunk" => {
+                let output_ack = frame.seq.zip(frame.index);
+                let result = match (frame.seq, frame.index, frame.bytes.as_deref()) {
+                    (Some(seq), Some(index), Some(bytes)) => {
+                        self.frame_assembler.chunk(seq, index, bytes)
+                    }
+                    _ => Err(err("malformed terminal frame chunk")),
+                };
+                if let Some((seq, index)) = output_ack {
+                    self.send(json!({
+                        "type": "terminal.output_ack",
+                        "seq": seq,
+                        "index": index,
+                    }))
+                    .await;
+                }
+                if result.is_err() {
+                    self.request_frame_resync().await;
+                }
+            }
+            "terminal.frame.end" => {
+                let result = frame
+                    .seq
+                    .ok_or_else(|| err("malformed terminal frame end"))
+                    .and_then(|seq| self.frame_assembler.finish(seq));
+                match result {
+                    Ok(complete) => {
+                        if !complete.full
+                            && self
+                                .last_frame_seq
+                                .is_some_and(|last| complete.seq != last.saturating_add(1))
+                        {
+                            self.request_frame_resync().await;
+                            return;
+                        }
+                        self.last_frame_seq = Some(complete.seq);
+                        self.mark_session_ready(frame.claim_token).await;
+                        self.apply_terminal_frame(
+                            Some(complete.seq),
+                            complete.full,
+                            complete.width,
+                            complete.height,
+                            &complete.bytes,
+                        );
+                    }
+                    Err(_) => self.request_frame_resync().await,
+                }
+            }
+            "terminal.frame" => {
+                let Some(bytes) = frame
+                    .bytes
+                    .as_deref()
+                    .and_then(|bytes| B64.decode(bytes).ok())
+                else {
+                    return;
+                };
+                if !frame.full.unwrap_or(false)
+                    && frame.seq.zip(self.last_frame_seq).is_some_and(|(seq, last)| {
+                        seq != last.saturating_add(1)
+                    })
+                {
+                    self.request_frame_resync().await;
+                    return;
+                }
+                self.last_frame_seq = frame.seq.or(self.last_frame_seq);
+                self.mark_session_ready(frame.claim_token).await;
+                self.apply_terminal_frame(
+                    frame.seq,
+                    frame.full.unwrap_or(false),
+                    frame.width.unwrap_or(self.grid.width),
+                    frame.height.unwrap_or(self.grid.height),
+                    &bytes,
+                );
+            }
+            "terminal.closed" => {
+                let detail = frame
+                    .code
+                    .as_deref()
+                    .or(frame.reason.as_deref())
+                    .unwrap_or("closed");
+                self.renderer
+                    .status(&format!("remote terminal closed: {detail}"));
+                self.paint();
+            }
+            _ => {}
         }
     }
 
@@ -966,28 +1293,131 @@ impl App {
             return; // an old child we already replaced/killed
         }
         self.session = None;
+        self.session_ready = false;
+        self.liveness.disconnected();
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        if self.args.terminal_reconnect && reconnect_flags_unsupported(&reason_line) {
+            self.args.terminal_reconnect = false;
+            self.args.controller_id = None;
+            self.claim_token = None;
+            self.liveness.disable();
+            self.heartbeat_status_visible = false;
+            self.ownership_hint = Some(
+                "remote Herdr no longer supports reconnect leases — using safe legacy mode"
+                    .into(),
+            );
+            self.schedule_reconnect(exited_mode, &reason_line);
+            return;
+        }
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
-            self.control_failures = if uptime < QUICK_CONTROL_FAILURE { self.control_failures + 1 } else { 0 };
-            if self.control_failures >= 2 {
-                self.control_failures = 0;
-                self.control_sticky = true;
-                self.switch_mode(Mode::Observe);
-                let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
-                self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
+            if let Some(decision) = self.takeover_policy.decide(
+                &reason_line,
+                self.args.always_control,
+                self.args.takeover_on_reconnect,
+                Instant::now(),
+            ) {
+                match decision {
+                    crate::ownership::CollisionDecision::RetryWithTakeover => {
+                        self.next_control_takeover = true;
+                        self.renderer.status("controller occupied — taking over…");
+                        self.paint();
+                        self.reconnect_at = Some((Instant::now() + SWITCH_GAP, Mode::Control));
+                    }
+                    crate::ownership::CollisionDecision::ObserveSticky => {
+                        self.control_failures = 0;
+                        self.control_sticky = true;
+                        self.ownership_hint = Some(
+                            if reason_line.ends_with(crate::ownership::TAKEN_OVER_REASON) {
+                                "control taken by another client — viewing only".into()
+                            } else {
+                                "control held elsewhere — viewing only; takeover is disabled".into()
+                            },
+                        );
+                        self.switch_mode(Mode::Observe);
+                    }
+                }
                 return;
+            }
+            if !self.args.terminal_reconnect {
+                self.control_failures = if uptime < QUICK_CONTROL_FAILURE {
+                    self.control_failures + 1
+                } else {
+                    0
+                };
+                if self.control_failures >= 2 {
+                    self.control_failures = 0;
+                    self.control_sticky = true;
+                    self.switch_mode(Mode::Observe);
+                    let suffix = if reason_line.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({reason_line})")
+                    };
+                    self.hint(&format!(
+                        "control unavailable — viewing only{suffix}; type to retry"
+                    ));
+                    return;
+                }
             }
         }
         self.schedule_reconnect(exited_mode, &reason_line);
     }
 
-    async fn send(&mut self, msg: serde_json::Value) {
+    async fn send(&mut self, msg: serde_json::Value) -> bool {
         if let Some(s) = self.session.as_mut() {
             let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
+            return matches!(
+                tokio::time::timeout(
+                    SESSION_WRITE_TIMEOUT,
+                    s.stdin.write_all(line.as_bytes())
+                )
+                .await,
+                Ok(Ok(()))
+            );
+        }
+        false
+    }
+
+    async fn request_frame_resync(&mut self) {
+        if self.frame_resync_pending {
+            return;
+        }
+        self.frame_resync_pending = true;
+        self.send(json!({ "type": "terminal.resync" })).await;
+    }
+
+    async fn poll_liveness(&mut self) {
+        match self
+            .liveness
+            .poll(Instant::now(), std::time::SystemTime::now())
+        {
+            Some(crate::liveness::Action::Heartbeat { nonce, wake_probe }) => {
+                if wake_probe {
+                    self.wake_retry_until = Some(Instant::now() + WAKE_RETRY_WINDOW);
+                    self.heartbeat_status_visible = true;
+                    self.renderer
+                        .status("wake detected — probing terminal path…");
+                    self.paint();
+                }
+                self.send(json!({
+                    "type": "terminal.heartbeat",
+                    "nonce": nonce,
+                }))
+                .await;
+            }
+            Some(crate::liveness::Action::Reconnect { waiting_for_ready }) => {
+                self.renderer.status(if waiting_for_ready {
+                    "terminal ready timeout — reconnecting…"
+                } else {
+                    "terminal heartbeat timeout — reconnecting…"
+                });
+                self.paint();
+                self.connect(self.mode).await;
+            }
+            None => {}
         }
     }
 
@@ -1135,7 +1565,8 @@ impl App {
             }
             // any keystroke takes control and is delivered once the session is up
             self.control_sticky = false;
-            self.pending_input.push(buf);
+            self.ownership_hint = None;
+            self.pending_input.push(Instant::now(), buf);
             self.switch_mode(Mode::Control);
             return;
         }
@@ -1151,10 +1582,14 @@ impl App {
             }
             return;
         }
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
+        if control_input_needs_buffer(
+            self.switching_to,
+            self.session.is_some(),
+            self.session_ready,
+        ) {
             // spinning up or awaiting reconnect: queue the keystroke (flushed
             // on connect) and, if in backoff, reconnect now
-            self.pending_input.push(buf);
+            self.pending_input.push(Instant::now(), buf);
             if let Some((_, m)) = self.reconnect_at {
                 self.reconnect_at = Some((Instant::now(), m));
             }
@@ -1213,13 +1648,17 @@ impl App {
     async fn deliver_input(&mut self, buf: Vec<u8>) {
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             self.control_sticky = false;
-            self.pending_input.push(buf);
+            self.pending_input.push(Instant::now(), buf);
             self.switch_mode(Mode::Control);
             return;
         }
         self.last_input = Instant::now();
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            self.pending_input.push(buf);
+        if control_input_needs_buffer(
+            self.switching_to,
+            self.session.is_some(),
+            self.session_ready,
+        ) {
+            self.pending_input.push(Instant::now(), buf);
             if let Some((_, m)) = self.reconnect_at {
                 self.reconnect_at = Some((Instant::now(), m));
             }
@@ -1246,30 +1685,51 @@ impl App {
 // ---------------------------------------------------------------------------
 // main
 
-/// Removes the streamer pidfile on any exit path out of `run` (stale files
-/// from a hard kill are harmless — the daemon checks the pid is alive).
-struct PidfileGuard(std::path::PathBuf);
-impl Drop for PidfileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+pub async fn run(mut args: Args, state_dir: std::path::PathBuf) -> Result<()> {
+    // Claim the cross-process streamer slot before opening SSH. --dump is a
+    // human diagnostic and deliberately does not participate in daemon healing.
+    let scope = args.controller_scope.as_deref().unwrap_or(&args.ssh_target);
+    let transport = if args.container.is_some() {
+        "docker"
+    } else {
+        "ssh"
+    };
+    let identity = crate::streamer_lock::StreamerIdentity {
+        transport,
+        controller_scope: scope,
+        target: &args.ssh_target,
+        session: args.session.as_deref(),
+        pane: &args.pane_target,
+    };
+    let computed = identity.key();
+    if args.terminal_reconnect {
+        args.controller_id = Some(crate::controller_identity::controller_id(&state_dir, scope)?);
     }
-}
-
-pub async fn run(args: Args) -> Result<()> {
-    // announce ourselves so the daemon can tell its typed `exec` took
-    // (see util::streamer_pid_path); --dump is a human diagnostic, not a
-    // daemon-spawned streamer, so it must not claim the slot
-    let _pidfile = (!args.dump).then(|| {
-        let state_dir =
-            crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
-        let path =
-            crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    let claim_token = if args.terminal_reconnect {
+        match crate::claim_token::load(&state_dir, &computed) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("herdr-mirror: ignoring invalid terminal claim token: {error}");
+                None
+            }
         }
-        let _ = std::fs::write(&path, std::process::id().to_string());
-        PidfileGuard(path)
-    });
+    } else {
+        None
+    };
+    let _streamer_lock = if args.dump {
+        None
+    } else {
+        if args
+            .streamer_key
+            .as_deref()
+            .is_some_and(|key| key != computed)
+        {
+            return Err(err("streamer key does not match pane identity"));
+        }
+        Some(crate::streamer_lock::StreamerLock::acquire(
+            &state_dir, &identity,
+        )?)
+    };
 
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let raw = if tty {
@@ -1307,6 +1767,8 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
+    let now = Instant::now();
+    let terminal_reconnect = args.terminal_reconnect;
     let mut app = App {
         args,
         tty,
@@ -1320,10 +1782,27 @@ pub async fn run(args: Args) -> Result<()> {
         next_gen: 0,
         backoff_idx: 0,
         reconnect_at: None,
+        wake_retry_until: None,
         control_failures: 0,
         control_sticky: false,
-        pending_input: Vec::new(),
-        last_input: Instant::now(),
+        takeover_policy: crate::ownership::LegacyTakeoverPolicy::default(),
+        next_control_takeover: false,
+        session_ready: false,
+        claim_token,
+        claim_token_key: computed,
+        state_dir,
+        heartbeat_status_visible: false,
+        ownership_hint: None,
+        frame_assembler: crate::frame_stream::FrameAssembler::default(),
+        frame_resync_pending: false,
+        last_frame_seq: None,
+        liveness: crate::liveness::Liveness::new(
+            terminal_reconnect,
+            now,
+            std::time::SystemTime::now(),
+        ),
+        pending_input: crate::pending_input::PendingInput::default(),
+        last_input: now,
         hint_clear_at: None,
         predict: Predictor::new(),
         remote_is_shell: None,
@@ -1366,6 +1845,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     loop {
+        // Every pane event comes back through this loop, so sleep/wake clock
+        // divergence is noticed immediately when any activity resumes. With no
+        // activity, the two-second heartbeat deadline is the upper bound.
+        app.poll_liveness().await;
         // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
         let idle_at = (app.mode == Mode::Control
             && app.switching_to.is_none()
@@ -1380,13 +1863,15 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.liveness.heartbeat_at(),
+            app.liveness.watchdog_at(),
         ]);
 
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     None => break,
-                    Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
+                    Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame).await,
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
@@ -1457,12 +1942,8 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     // clean shutdown: release control if held, kill the ssh child, restore tty
-    if let Some(mut s) = app.session.take() {
-        if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        unsafe { libc::kill(s.pid, libc::SIGTERM) };
+    if let Some(session) = app.session.take() {
+        session.stop(true).await;
     }
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
@@ -1801,6 +2282,16 @@ mod tests {
     }
 
     #[test]
+    fn remote_downgrade_is_detected_only_from_reconnect_flag_rejection() {
+        assert!(reconnect_flags_unsupported(
+            "error: unexpected argument '--controller-id' found"
+        ));
+        assert!(reconnect_flags_unsupported("unknown option: --lease-ms"));
+        assert!(!reconnect_flags_unsupported("ssh: connection timed out"));
+        assert!(!reconnect_flags_unsupported("unknown host"));
+    }
+
+    #[test]
     fn a_gone_target_slows_down_without_consuming_the_ladder() {
         // the fix: 10s forever becomes one attempt a minute
         assert_eq!(reconnect_delay(true, 0), (GONE_BACKOFF_MS, 0));
@@ -1817,6 +2308,30 @@ mod tests {
         let (_, idx) = reconnect_delay(false, 0);
         let (_, idx) = reconnect_delay(true, idx);
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
+    #[test]
+    fn control_input_stays_buffered_until_the_candidate_is_ready() {
+        assert!(control_input_needs_buffer(None, true, false));
+        assert!(control_input_needs_buffer(Some(Mode::Control), true, true));
+        assert!(control_input_needs_buffer(None, false, false));
+        assert!(!control_input_needs_buffer(None, true, true));
+    }
+
+    #[test]
+    fn wake_recovery_caps_every_backoff_rung_for_thirty_seconds() {
+        let now = Instant::now();
+        let wake_retry_until = Some(now + WAKE_RETRY_WINDOW);
+        for delay in [1_000, 2_000, 5_000, 10_000, GONE_BACKOFF_MS] {
+            assert_eq!(
+                bound_reconnect_delay(delay, wake_retry_until, now),
+                1_000
+            );
+        }
+        assert_eq!(
+            bound_reconnect_delay(10_000, wake_retry_until, now + WAKE_RETRY_WINDOW),
+            10_000
+        );
     }
 
 }

@@ -11,21 +11,29 @@
 
 mod api;
 mod binding;
+mod child_supervisor;
+mod claim_token;
 mod closes;
 mod config;
+mod controller_identity;
 mod daemon;
 mod docker;
 mod foreground;
+mod frame_stream;
 mod grid;
 mod layout_sync;
+mod liveness;
 mod mirror;
+mod ownership;
 mod pane;
 mod paste;
+mod pending_input;
 mod predict;
 mod remote;
 mod remote_action;
 mod ssh_relay;
 mod state;
+mod streamer_lock;
 mod util;
 
 use util::{Env, Result};
@@ -87,7 +95,11 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         "teardown" => rt.block_on(daemon::cmd_teardown(Env::resolve()?)),
         "pane" => {
             let args = pane::parse_args(&rest[1..])?;
-            rt.block_on(pane::run(args))
+            let state_dir = util::home_dir()
+                .join(".local")
+                .join("state")
+                .join("herdr-mirror");
+            rt.block_on(pane::run(args, state_dir))
         }
         "remote-workspace" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run_cmd(Env::resolve()?, "tab", None)),
