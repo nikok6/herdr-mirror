@@ -278,6 +278,16 @@ async fn run_connected(
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
+                    // a hide pressed while we are up arrives as a poke, and
+                    // converge only freezes — the closing is here
+                    crate::mirror::apply_hidden(
+                        &ctx.local,
+                        &ctx.env_state_dir,
+                        &ctx.host.name,
+                        &ctx.log,
+                        &ctx.closes,
+                    )
+                    .await;
                     let state = converge(&deps).await?;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
@@ -304,6 +314,18 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
     loop {
+        // Before dialling, and again after every failed dial: taking a hidden
+        // host's mirrors down needs only the LOCAL api, so it must not wait on a
+        // remote that may never come back. That case — a dead host leaving
+        // reconnecting panes on screen — is the main reason to hide one.
+        crate::mirror::apply_hidden(
+            &ctx.local,
+            &ctx.env_state_dir,
+            &ctx.host.name,
+            &ctx.log,
+            &ctx.closes,
+        )
+        .await;
         let e = match run_connected(
             &ctx,
             &mut poke,
@@ -340,8 +362,26 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
         }
         was_dormant = dormant;
-        tokio::time::sleep(Duration::from_secs(delay)).await;
-        // drain stale pokes accumulated while down (reconnect converges anyway)
+        // drain FIRST: pokes that piled up during a multi-second dial say nothing
+        // about now, and honouring them would skip the sleep entirely
+        while poke.try_recv().is_ok() {}
+        // Wake early only for a hidden host, whose close is genuinely waiting on
+        // us and would otherwise sit behind a 300s dormant sleep. Every other
+        // poke is ordinary local traffic — `local_events_task` fans one out to
+        // every host on every event, `layout.updated` included, so treating them
+        // all as urgent collapses the reconnect ladder and burns a dial (or a
+        // `docker ps`) per split drag.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = poke.recv() => {
+                    if crate::state::is_hidden(&ctx.env_state_dir, &ctx.host.name) {
+                        break;
+                    }
+                }
+            }
+        }
         while poke.try_recv().is_ok() {}
     }
 }
@@ -716,7 +756,22 @@ pub fn cmd_status(env: &Env) -> Result<()> {
         let state = load_state(&env.state_dir, &h.name);
         let ws = state.workspaces.values().filter(|w| !w.is_tombstoned()).count();
         let panes = state.panes.values().filter(|p| !p.is_tombstoned()).count();
-        println!("host {} ({}): {ws} mirror workspaces, {panes} mirror panes", h.name, h.target);
+        // `hidden` persists across reboots, so without this a host hidden weeks
+        // ago is indistinguishable from one whose remote is unreachable: both
+        // print zero mirrors and a healthy daemon
+        let hidden = match crate::state::is_hidden(&env.state_dir, &h.name) {
+            // marker set but the mirrors are still mapped: the daemon has not
+            // applied it yet (it is stopped, or the host has not looped)
+            true if ws > 0 || panes > 0 => {
+                " — HIDDEN (pending; start the daemon to apply)".to_string()
+            }
+            true => format!(" — HIDDEN, `herdr-mirror show {}` brings it back", h.name),
+            false => String::new(),
+        };
+        println!(
+            "host {} ({}): {ws} mirror workspaces, {panes} mirror panes{hidden}",
+            h.name, h.target
+        );
         let tombs: Vec<String> = state
             .workspaces
             .iter()
@@ -743,6 +798,12 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     let config = load_config(&env.config_search)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
+        // converge would only freeze anyway, and dialling a host someone hid
+        // *because* it is dead would abort the whole run with `?`
+        if crate::state::is_hidden(&env.state_dir, &h.name) {
+            println!("{}: hidden — skipped", h.name);
+            continue;
+        }
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
         let (remote, _status) = remote_host.connect_api().await?;
         converge(&ConvergeDeps {
@@ -797,6 +858,22 @@ pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>
     if cleared == 0 {
         println!("nothing to restore (no tombstoned mirrors matched)");
         return Ok(());
+    }
+    // a hidden host freezes converge, so the tombstones really are gone but
+    // nothing reappears until `show` — say so rather than claiming a sync
+    let hidden: Vec<&str> = config
+        .hosts
+        .iter()
+        .filter(|h| filter_host.is_none_or(|f| f == h.name))
+        .filter(|h| crate::state::is_hidden(&env.state_dir, &h.name))
+        .map(|h| h.name.as_str())
+        .collect();
+    if !hidden.is_empty() {
+        println!(
+            "note: {} is hidden — run `herdr-mirror show {}` to bring mirrors back",
+            hidden.join(", "),
+            hidden[0]
+        );
     }
     match running_pid(env) {
         Some(pid) => {

@@ -86,12 +86,38 @@ pub struct HostState {
     /// permanent winner and revert the other side's drag.
     #[serde(default)]
     pub ratios: BTreeMap<String, f64>,
-    /// user hid this host's mirrors via `hide`: converge freezes (no tombstone,
-    /// no recreate) until `show` clears it. Distinct from tombstone, which means
-    /// "closed, don't come back until restore" — hide means "still watching,
-    /// just out of the way."
-    #[serde(default)]
-    pub hidden: bool,
+}
+
+/// Marker for `hide`: this host's mirrors are off the sidebar until `show`.
+///
+/// Deliberately its OWN file rather than a field on `HostState`. The map file is
+/// load-modify-written by the daemon, by every CLI subcommand, and by converge
+/// around a pass that spans dozens of awaits, with no lock anywhere — so a flag
+/// living inside it is silently reset by whoever saves last, and `hide` reports
+/// success having done nothing. A marker file has no such race: it is written by
+/// one process and only ever read by the others. Same shape as `daemon.paused`.
+pub fn hidden_path(state_dir: &Path, host: &str) -> PathBuf {
+    state_dir.join(format!("{host}.hidden"))
+}
+
+pub fn is_hidden(state_dir: &Path, host: &str) -> bool {
+    hidden_path(state_dir, host).exists()
+}
+
+/// Returns the error rather than swallowing it: this one write gates the whole
+/// feature, so a read-only state dir or a host name that is not a single path
+/// component would otherwise make `hide` claim success forever while nothing
+/// ever acts on it.
+pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result<()> {
+    let path = hidden_path(state_dir, host);
+    if hidden {
+        std::fs::write(path, "")
+    } else {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
 }
 
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
@@ -149,16 +175,19 @@ mod tests {
         assert!(!out.contains("\"reported\":null"));
     }
 
-    /// Pre-hide state files have no `hidden` key at all — must default false,
-    /// not fail to parse.
     #[test]
-    fn hidden_defaults_false_and_round_trips() {
-        let state: HostState = serde_json::from_str(r#"{"workspaces":{}}"#).unwrap();
-        assert!(!state.hidden);
-
-        let hidden = HostState { hidden: true, ..Default::default() };
-        let out = serde_json::to_string(&hidden).unwrap();
-        let reparsed: HostState = serde_json::from_str(&out).unwrap();
-        assert!(reparsed.hidden);
+    fn hidden_is_a_marker_file_not_a_state_field() {
+        let dir = std::env::temp_dir().join(format!("hm-hidden-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert!(!is_hidden(&dir, "h"));
+        set_hidden(&dir, "h", true).unwrap();
+        assert!(is_hidden(&dir, "h"));
+        // and it survives a map rewrite, which is the whole reason it is not a
+        // field on HostState
+        save_state(&dir, "h", &HostState::default()).unwrap();
+        assert!(is_hidden(&dir, "h"));
+        set_hidden(&dir, "h", false).unwrap();
+        assert!(!is_hidden(&dir, "h"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

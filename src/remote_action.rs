@@ -411,47 +411,62 @@ pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
 
 async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     let host = resolve_host(env, host_arg).await?;
-    let mut state = crate::state::load_state(&env.state_dir, &host.name);
-    if state.hidden {
-        println!("{} is already hidden", host.name);
-        return Ok(());
+    let already = crate::state::is_hidden(&env.state_dir, &host.name);
+    crate::state::set_hidden(&env.state_dir, &host.name, true)
+        .map_err(|e| err(format!("could not mark {} hidden: {e}", host.name)))?;
+    // The daemon does the closing (mirror::apply_hidden): it owns the close
+    // tracker, and an unmarked close is read back as user intent, which
+    // close-through then aims at the remote once `show` rebuilds the mirrors
+    // onto ids herdr has recycled. Re-poke even when already hidden: the last
+    // hide may not have landed (daemon down, or it was still starting), and
+    // "already hidden" with the mirrors still on screen is a dead end.
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!(
+                "hid {} — remote keeps running; `herdr-mirror show {}` brings it back",
+                host.name, host.name
+            );
+        }
+        None => {
+            println!(
+                "{} hidden — mirrors disappear when the daemon starts (`herdr-mirror start`)",
+                host.name
+            );
+            return Ok(());
+        }
     }
-    let local_ids: Vec<String> = state.workspaces.values().map(|e| e.local_id.clone()).collect();
-    state.hidden = true;
-    crate::state::save_state(&env.state_dir, &host.name, &state)?;
-    let local = crate::api::ApiClient::connect(&env.local_socket).await?;
-    for local_id in &local_ids {
-        let _ = local.request("workspace.close", json!({ "workspace_id": local_id })).await;
+    if already {
+        println!("({} was already hidden — re-poked the daemon)", host.name);
     }
-    state.workspaces.clear();
-    state.panes.clear();
-    crate::state::save_state(&env.state_dir, &host.name, &state)?;
-    println!("hid {} — remote keeps running; `herdr-mirror show {}` brings it back", host.name, host.name);
     Ok(())
 }
 
 async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
-    let host = match host_arg {
-        Some(name) => Some(resolve_host(env, Some(name)).await?),
-        None => {
-            let config = load_config(&env.config_search)?;
-            let ctx = invocation_context();
-            resolve_context(env, &config.hosts, &ctx).map(|r| r.host)
-        }
-    };
-    match host {
-        Some(host) => show_one(env, &host).await,
-        None => show_all(env).await,
+    if let Some(name) = host_arg {
+        let host = resolve_host(env, Some(name)).await?;
+        return show_one(env, &host).await;
     }
+    // No argument. The invocation context can only ever name a host that is
+    // VISIBLE — a hidden one has no mapped workspace to resolve against — so a
+    // context hit that is not hidden must fall through to "show everything",
+    // or the key bound inside one mirror can never bring back another host.
+    let config = load_config(&env.config_search)?;
+    let ctx = invocation_context();
+    if let Some(host) = resolve_context(env, &config.hosts, &ctx).map(|r| r.host) {
+        if crate::state::is_hidden(&env.state_dir, &host.name) {
+            return show_one(env, &host).await;
+        }
+    }
+    show_all(env).await
 }
 
 fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
-    let mut state = crate::state::load_state(&env.state_dir, &host.name);
-    if !state.hidden {
+    if !crate::state::is_hidden(&env.state_dir, &host.name) {
         return Ok(false);
     }
-    state.hidden = false;
-    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    crate::state::set_hidden(&env.state_dir, &host.name, false)
+        .map_err(|e| err(format!("could not un-hide {}: {e}", host.name)))?;
     Ok(true)
 }
 
@@ -467,9 +482,9 @@ async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
 async fn show_all(env: &Env) -> Result<()> {
     let config = load_config(&env.config_search)?;
     let mut shown = Vec::new();
-    for host in &config.hosts {
-        if clear_hidden(env, host)? {
-            shown.push(host.name.clone());
+    for h in &config.hosts {
+        if clear_hidden(env, h)? {
+            shown.push(h.name.clone());
         }
     }
     if shown.is_empty() {

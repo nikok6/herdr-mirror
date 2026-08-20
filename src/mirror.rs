@@ -247,6 +247,99 @@ fn prune_closed(node: &LayoutNode, panes: &BTreeMap<String, PaneEntry>) -> Optio
     }
 }
 
+/// Which mirrors `apply_hidden` would close, and what survives the map.
+///
+/// Split out so the gating is testable without a live herdr: the first version
+/// of this closed every mirror on EVERY call because it never read the marker,
+/// which turned the daemon into a destroy/rebuild loop. Full-green tests said
+/// nothing, because nothing reached the function.
+pub(crate) fn hidden_close_plan(
+    hidden: bool,
+    state: &mut HostState,
+    live: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    if !hidden {
+        return Vec::new();
+    }
+    let doomed: Vec<String> = state
+        .workspaces
+        .values()
+        .filter(|e| !e.is_tombstoned() && live.contains(&e.local_id))
+        .map(|e| e.local_id.clone())
+        .collect();
+    if doomed.is_empty() {
+        return doomed;
+    }
+    // tombstones on both maps survive: they mean "the user closed this, do not
+    // recreate until `restore`", which hiding must not quietly forget
+    state.workspaces.retain(|_, e| e.is_tombstoned());
+    state.panes.retain(|_, e| e.is_tombstoned());
+    state.tabs.clear();
+    doomed
+}
+
+/// Take a hidden host's mirrors off the sidebar.
+///
+/// Lives in the daemon and needs only the LOCAL api, so it works while the
+/// remote is unreachable — which is the main reason to hide a connection in the
+/// first place (a dead host leaving reconnecting panes on screen). `converge`
+/// cannot do this job: it only runs while connected, and it is also called by
+/// one-shots whose close tracker nobody reads.
+///
+/// Tombstoned entries are kept. A tombstone means "the user closed this, do not
+/// recreate it until `restore`", and hiding a host must not quietly forget that
+/// — otherwise `show` resurrects every mirror they had deliberately closed.
+///
+/// Two layers against close-through, the same pair `teardown` uses: each id is
+/// marked as ours before its close, and the map entries are dropped first so a
+/// missed mark has nothing to attribute a close to.
+pub async fn apply_hidden(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    log: &Logger,
+    closes: &crate::closes::Closes,
+) {
+    // The guard, not the caller's job: this is called on every host_task loop
+    // and before every connected converge, so without it the daemon closes the
+    // mirrors it just created, forever.
+    let hidden = crate::state::is_hidden(state_dir, host_name);
+    if !hidden {
+        return;
+    }
+    let mut state = load_state(state_dir, host_name);
+    // only ids herdr still shows. Note this filters ids that are GONE, not ids
+    // that now belong to someone else: a local server restart can reassign one,
+    // and this cannot tell. Converge's own close paths share that weakness.
+    let live: std::collections::HashSet<String> = match fetch_snapshot(local).await {
+        Ok(snap) => snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect(),
+        Err(e) => {
+            // the one path where hide legitimately does nothing; say so, or the
+            // mirrors stay up with no explanation anywhere
+            log.log(&format!("hidden: local snapshot failed for {host_name}: {e}"));
+            return;
+        }
+    };
+    let doomed = hidden_close_plan(hidden, &mut state, &live);
+    if doomed.is_empty() {
+        return;
+    }
+    if let Err(e) = save_state(state_dir, host_name, &state) {
+        log.log(&format!("hidden: could not save state for {host_name}: {e}"));
+        return;
+    }
+    for local_id in &doomed {
+        log.log(&format!("hidden — closing mirror workspace {local_id}"));
+        if let Ok(mut t) = closes.lock() {
+            t.mark_self_close(local_id);
+        }
+        if let Err(e) = local.request("workspace.close", json!({ "workspace_id": local_id })).await
+        {
+            log.log(&format!("hidden: close failed for {local_id}: {e}"));
+        }
+    }
+}
+
 /// Mark a local id the plugin itself is about to close, so the close event it
 /// raises isn't read back as the user closing the mirror (see closes.rs).
 fn mark_self_close(deps: &ConvergeDeps, local_id: &str) {
@@ -661,16 +754,24 @@ pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
 async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
     let host = &deps.host;
     let log = &deps.log;
+    // Hidden hosts freeze here and go no further. Deliberately BEFORE the
+    // snapshots: a hidden host should be quiet, not keep paying for two RPCs a
+    // minute forever.
+    //
+    // This branch only freezes; it never closes. Closing has to happen exactly
+    // once, in the process that owns the authoritative close tracker, and
+    // `converge` is called by `once` and other one-shots that carry a throwaway
+    // tracker (see `cmd_once`). Doing the close here meant those marked on a
+    // tracker nobody reads while the daemon's event stream recorded every close
+    // as user intent — which is the chain that closed two real remote
+    // workspaces. The daemon does it in `apply_hidden` instead.
+    if crate::state::is_hidden(&deps.state_dir, &deps.host.name) {
+        return Ok(());
+    }
+
     let (remote_snap, local_snap) =
         tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
 
-    // hidden: the remote is still polled above (health/status keeps working),
-    // but every local reconciliation below is frozen — `hide` already closed
-    // the local mirrors itself (see remote_action::hide), so touching state
-    // here would tombstone them as if the user had closed them for good.
-    if state.hidden {
-        return Ok(());
-    }
 
     let mut local_ws_ids: HashSet<String> =
         local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
@@ -1434,6 +1535,10 @@ pub async fn teardown(
     // remote. Manual close is unaffected: there the entry is still mapped when
     // the user closes it, so the intent still reaches the remote.
     save_state(state_dir, host_name, &HostState::default())?;
+    // teardown means "stop mirroring here entirely", which supersedes hide —
+    // leaving the marker would make a later `start` bring back nothing with no
+    // explanation of why
+    let _ = crate::state::set_hidden(state_dir, host_name, false);
     for entry in state.workspaces.values() {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         // ours, not the user's: the heal re-adopts these ids, so without the mark
@@ -1532,6 +1637,46 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 
 #[cfg(test)]
 mod tests {
+    use super::hidden_close_plan;
+
+    fn ws_entry(local: &str, tomb: bool) -> WsEntry {
+        WsEntry {
+            local_id: local.into(),
+            tombstone: tomb.then_some(true),
+            root_tab_local_id: None,
+            last_remote_label: None,
+        }
+    }
+
+    fn live(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The bug that made the daemon close the mirrors it had just created, on
+    /// every pass, for every host. It shipped past a full-green suite because
+    /// nothing exercised the gate.
+    #[test]
+    fn a_host_that_is_not_hidden_is_never_touched() {
+        let mut state = HostState::default();
+        state.workspaces.insert("R1".into(), ws_entry("w7", false));
+        let doomed = hidden_close_plan(false, &mut state, &live(&["w7"]));
+        assert!(doomed.is_empty(), "closed a mirror on a host nobody hid");
+        assert_eq!(state.workspaces.len(), 1, "map must survive untouched");
+    }
+
+    #[test]
+    fn hiding_closes_live_mirrors_and_keeps_tombstones() {
+        let mut state = HostState::default();
+        state.workspaces.insert("R1".into(), ws_entry("w7", false));
+        state.workspaces.insert("R2".into(), ws_entry("w8", true)); // user closed it
+        state.workspaces.insert("R3".into(), ws_entry("w9", false)); // already gone
+        let doomed = hidden_close_plan(true, &mut state, &live(&["w7", "w8"]));
+        assert_eq!(doomed, vec!["w7".to_string()], "only the live, non-tombstoned one");
+        // the tombstone survives, or `show` resurrects a mirror the user closed
+        assert!(state.workspaces.contains_key("R2"));
+        assert!(!state.workspaces.contains_key("R1"));
+        assert!(!state.workspaces.contains_key("R3"));
+    }
     use super::*;
 
     fn ssh_host() -> HostConfig {
