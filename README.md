@@ -102,6 +102,35 @@ same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
 `remote-new-tab`, `remote-split-right`, `remote-split-down`. The new object
 mirrors back within seconds.
 
+**Or ask every time** — the **new-workspace-pick** action pops up a picker
+listing *this machine* plus every host in `hosts.toml`; the new workspace is
+created wherever you choose. Arrows or `j`/`k` move, digits pick directly,
+`Enter` confirms, `Esc` cancels. Rows carry their context — the cwd the local
+workspace would inherit, each host's ssh target and default marker — and a
+remote pick follows through: once the daemon mirrors the new workspace back,
+the picker focuses it, so choosing a host lands you in the workspace just
+like choosing this machine does. Local creation inherits the invoking pane's
+cwd (never the `.mirror-pane` placeholder); remote creation uses the remote's
+default, like `remote-new-workspace` outside a mirror. Bound over the native
+new-workspace key it turns "new workspace" into a where-do-you-want-it prompt:
+
+```toml
+[[keys.command]]
+key = "prefix+shift+n"         # shadows native new_workspace
+type = "plugin_action"
+command = "mirror.new-workspace-pick"
+```
+
+The mouse buttons and native keys can't be rebound to any of this (herdr has
+no button action setting), so creation hooks catch them after the fact: a
+native create from inside a mirror lands in the `.mirror-pane` placeholder,
+and `workspace.created` / `tab.created` / `pane.created` hooks recognize
+exactly that shape, close the botched object, and do what was meant — a
+workspace gets the picker; a tab or split is recreated on the remote (cwd
+inherited from the mirrored pane, the tab's mirror focused when it arrives).
+Native creation from any normal workspace is untouched, and
+`intercept_native_create = false` turns all of it off.
+
 **One key for both worlds** — outside a mirror they degrade to the plain local
 action instead of erroring, so one binding can replace the native key entirely.
 Exception: on a non-mirrored pane inside a mirror workspace, `remote-split-*`
@@ -288,6 +317,12 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# intercept_native_create = true
+                         # default. A native workspace create that lands in the
+                         # .mirror-pane placeholder (the sidebar's unrebindable
+                         # "+" clicked from inside a mirror) is closed and
+                         # replaced by the host picker. Set false to leave
+                         # native creation alone.
 
 [hosts.work]
 target = "work"

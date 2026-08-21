@@ -41,6 +41,21 @@ title = "Mirror: new workspace"
 description = "New workspace on the remote host (the invoking mirror's host, else hosts.toml default_host)"
 command = ["./target/release/herdr-mirror", "remote-workspace"]
 
+# The picker popup. The [[panes]] entry is the interactive surface (actions
+# run headless with output discarded); the action below summons it via
+# plugin.pane.open. See src/pick.rs.
+[[panes]]
+id = "pick-host"
+title = "New workspace"
+placement = "popup"
+command = ["./target/release/herdr-mirror", "pick-workspace", "--menu"]
+
+[[actions]]
+id = "new-workspace-pick"
+title = "Mirror: new workspace — pick host"
+description = "Pop up a picker: create the new workspace on this machine or on a configured host"
+command = ["./target/release/herdr-mirror", "pick-workspace"]
+
 [[actions]]
 id = "remote-new-tab"
 title = "Mirror: new tab"
@@ -74,3 +89,20 @@ command = ["./target/release/herdr-mirror", "teardown"]
 [[events]]
 on = "workspace.focused"
 command = ["./target/release/herdr-mirror", "ensure"]
+
+# The mouse path to the picker: herdr can't rebind the sidebar's buttons, but
+# a native create from inside a mirror lands in the .mirror-pane placeholder —
+# these hooks recognize the botched object, close it, and do what the user
+# meant: workspaces get the host picker; tabs and splits are recreated on the
+# remote. No-op for every other creation. See src/pick.rs::intercept.
+[[events]]
+on = "workspace.created"
+command = ["./target/release/herdr-mirror", "intercept-new", "workspace"]
+
+[[events]]
+on = "tab.created"
+command = ["./target/release/herdr-mirror", "intercept-new", "tab"]
+
+[[events]]
+on = "pane.created"
+command = ["./target/release/herdr-mirror", "intercept-new", "pane"]

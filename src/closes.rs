@@ -46,6 +46,16 @@ impl CloseTracker {
         self.user_closed.insert(local_id.to_string(), Instant::now());
     }
 
+    /// A local id was just (re)assigned to an object the mirror created or
+    /// adopted. herdr reuses freed ids, so a close event recorded before this
+    /// moment can only refer to a PREVIOUS holder of the id (say, the
+    /// intercept hook closing a native junk pane — a separate process, so it
+    /// can never mark_self_close). Drop it, or close-through would close the
+    /// fresh mirror's REMOTE for a close aimed at something long gone.
+    pub fn forget(&mut self, local_id: &str) {
+        self.user_closed.remove(local_id);
+    }
+
     /// Take the user-closed ids among `mine` (this host's mapped local ids).
     /// Draining keeps one host's converge from consuming another's.
     pub fn take_user_closed(&mut self, mine: &HashSet<String>) -> HashSet<String> {
@@ -106,6 +116,17 @@ mod tests {
         // the id is later re-mapped (heal adopts it) and the user closes it
         t.note_close_event("w1");
         assert_eq!(t.take_user_closed(&ids(&["w1"])), ids(&["w1"]));
+    }
+
+    #[test]
+    fn a_reused_id_does_not_inherit_the_old_holders_close() {
+        let mut t = CloseTracker::default();
+        t.note_close_event("p7"); // a junk/native pane closed — its id is freed
+        t.forget("p7"); // the daemon maps a fresh mirror pane that got the freed id
+        assert!(t.take_user_closed(&ids(&["p7"])).is_empty());
+        // a REAL close of the new pane still counts
+        t.note_close_event("p7");
+        assert_eq!(t.take_user_closed(&ids(&["p7"])), ids(&["p7"]));
     }
 
     #[test]

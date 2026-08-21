@@ -649,6 +649,23 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
 
 // --- the converge pass ---
 
+/// A fresh local id just entered the map (mirror created or adopted). Two
+/// duties, both time-sensitive. Purge any stale user-close recorded against
+/// the id: herdr reuses freed ids, so a close noted before this moment can
+/// only refer to a previous holder, and letting it linger would close-through
+/// the new mirror's REMOTE within USER_CLOSE_TTL. And persist the map right
+/// away instead of at pass end, so the intercept hook's map read (250ms after
+/// pane.created) sees the daemon-built object as mapped instead of judging it
+/// native junk and closing it.
+fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String]) {
+    if let Ok(mut t) = deps.closes.lock() {
+        for id in fresh_local_ids {
+            t.forget(id);
+        }
+    }
+    let _ = save_state(&deps.state_dir, &deps.host.name, state);
+}
+
 /// Returns the post-converge state so callers don't re-read the state file.
 pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
@@ -931,7 +948,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
+            let fresh: Vec<String> = std::iter::once(entry.local_id.clone())
+                .chain(entry.root_tab_local_id.clone())
+                .collect();
             state.workspaces.insert(rws.workspace_id.clone(), entry);
+            note_mapped(deps, state, &fresh);
         }
     }
 
@@ -1029,6 +1050,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     ws.root_tab_local_id = None;
                 }
                 // applied with `tab_label: rtab.label`, so the two agree from birth
+                let mut fresh = vec![applied.layout.tab_id.clone()];
                 state.tabs.insert(
                     rtab.tab_id.clone(),
                     crate::state::TabEntry {
@@ -1038,6 +1060,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 );
                 let mut local_order = Vec::new();
                 walk_pane_ids(&applied.layout.root, &mut local_order);
+                // map every pane first and persist, THEN exec streamers: the
+                // panes already exist (layout.apply made them), so the map
+                // write must not wait behind the send_text round-trips
+                let mut to_spawn: Vec<(String, String)> = Vec::new();
                 for (i, rid) in remote_order.iter().enumerate() {
                     if rid.is_empty() || local_order.get(i).is_none_or(|l| l.is_empty()) {
                         continue;
@@ -1048,8 +1074,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         rid.clone(),
                         PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
                     );
+                    fresh.push(local_id.clone());
+                    to_spawn.push((local_id, rid.clone()));
+                }
+                note_mapped(deps, state, &fresh);
+                for (local_id, rid) in &to_spawn {
                     // plain pane created above; exec the streamer into it
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(rid), &deps.log).await;
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, local_id, &cmd_for(rid), &deps.log).await;
                 }
             } else {
                 // tab exists — add mirrors for individual new remote panes as
@@ -1104,12 +1135,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                             )
                             .await;
                     }
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
-                        .await;
+                    // map + persist BEFORE the streamer exec: the pane exists
+                    // as of pane.split above, and the intercept hook judges
+                    // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
                     );
+                    note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
+                        .await;
                 }
                 // A pane whose remote sibling is a multi-pane subtree can't be
                 // reproduced: pane.split splits a leaf, and nothing wraps a
@@ -1139,12 +1174,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     ));
                     let local_id =
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
-                        .await;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
                     );
+                    note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
+                        .await;
                 }
             }
         }
