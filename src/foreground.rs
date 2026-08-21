@@ -31,15 +31,47 @@ pub fn is_shell(name: &str) -> bool {
     SHELLS.contains(&n.as_str())
 }
 
-/// Classify a `pane process-info` JSON response. `Some(true)` = foreground is a
-/// shell, `Some(false)` = something else, `None` = indeterminate (empty/unparseable).
-pub fn classify(json: &str) -> Option<bool> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+/// What the remote pane's foreground implies for local input handling.
+///
+/// Three states because two different questions hide in "is it a TUI?": which
+/// cursor-key encoding to use, and who should get the mouse. An agent CLI is not
+/// a shell (it sets DECCKM, so arrows must be application mode) and still does
+/// not read mouse reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fg {
+    /// interactive shell at a prompt: sets no mouse modes, so the grab is
+    /// released and herdr does its own native selection
+    Shell,
+    /// an agent CLI. herdr identified it, so this is not a guess.
+    Agent,
+    /// anything else: assume it wants the mouse, which is the safe default
+    /// because being wrong only costs a selection, never an app's clicks
+    Mouse,
+}
+
+/// Classify from the remote pane's `agent` field and its foreground job.
+///
+/// The agent question is answered by HERDR, not by us: `PaneInfo.agent` comes
+/// from its `identify_agent_in_job`, which scans the whole foreground job across
+/// its own canonical agent table and resolves CLIs shipped behind `node`, `bun`
+/// or `python` wrappers using argv0/argv/cmdline. A hardcoded list here would be
+/// a second, worse copy of data herdr already maintains and already serves over
+/// the API we are calling anyway — and it would drift the day a new agent ships.
+///
+/// It also fixes the leaf problem for free: `process-info` returns the whole
+/// foreground process GROUP, so an agent's leaf is whatever tool it just spawned
+/// (`node`, `rg`, `bash`) and moves every few seconds. `agent` does not move.
+pub fn classify(pane_json: &str, proc_json: &str) -> Option<Fg> {
+    let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
+    if pane.get("result")?.get("pane")?.get("agent").and_then(|v| v.as_str()).is_some() {
+        return Some(Fg::Agent);
+    }
+    let v: serde_json::Value = serde_json::from_str(proc_json).ok()?;
     let fg = v.get("result")?.get("process_info")?.get("foreground_processes")?.as_array()?;
     // the last foreground process is the actually-running leaf, so `sudo vim`
     // classifies on `vim`, not `sudo`
     let name = fg.last()?.get("name")?.as_str()?;
-    Some(is_shell(name))
+    Some(if is_shell(name) { Fg::Shell } else { Fg::Mouse })
 }
 
 /// Query the remote pane's foreground process over ssh and classify it. `None`
@@ -51,10 +83,15 @@ pub async fn poll(
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
-) -> Option<bool> {
+) -> Option<Fg> {
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
-    let cmd = format!("exec {} pane process-info --pane {}", bin, sh_quote(pane));
+    // both answers in ONE hop: same ssh round trip cost as the old single query
+    let cmd = format!(
+        "{b} pane get {p}; echo '<<>>'; exec {b} pane process-info --pane {p}",
+        b = bin,
+        p = sh_quote(pane)
+    );
     let mut sc = match container {
         Some(ct) => {
             // async resolve, not the blocking one: this runs on the pane's
@@ -93,12 +130,25 @@ pub async fn poll(
     if !out.status.success() {
         return None;
     }
-    classify(&String::from_utf8_lossy(&out.stdout))
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (pane_json, proc_json) = text.split_once("<<>>")?;
+    classify(pane_json, proc_json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pane_with_agent(a: Option<&str>) -> String {
+        match a {
+            Some(a) => format!(r#"{{"result":{{"pane":{{"agent":"{a}"}}}}}}"#),
+            None => r#"{"result":{"pane":{}}}"#.to_string(),
+        }
+    }
+
+    fn proc_with(leaf: &str) -> String {
+        format!(r#"{{"result":{{"process_info":{{"foreground_processes":[{{"name":"{leaf}"}}]}}}}}}"#)
+    }
 
     #[test]
     fn shells_recognized_including_login_and_path() {
@@ -114,21 +164,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_reads_leaf_foreground() {
-        let shell = r#"{"result":{"process_info":{"foreground_processes":[{"name":"zsh"}]}}}"#;
-        assert_eq!(classify(shell), Some(true));
-        let tui = r#"{"result":{"process_info":{"foreground_processes":[{"name":"vim"}]}}}"#;
-        assert_eq!(classify(tui), Some(false));
-        // sudo wrapper: the leaf is the real program
-        let sudo =
-            r#"{"result":{"process_info":{"foreground_processes":[{"name":"sudo"},{"name":"vim"}]}}}"#;
-        assert_eq!(classify(sudo), Some(false));
-    }
-
-    #[test]
     fn classify_indeterminate_on_empty_or_garbage() {
-        assert_eq!(classify(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#), None);
-        assert_eq!(classify("not json"), None);
-        assert_eq!(classify(r#"{"result":{}}"#), None);
+        let none = pane_with_agent(None);
+        assert_eq!(
+            classify(&none, r#"{"result":{"process_info":{"foreground_processes":[]}}}"#),
+            None
+        );
+        assert_eq!(classify(&none, "not json"), None);
+        assert_eq!(classify("not json", &proc_with("zsh")), None);
     }
 }

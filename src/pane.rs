@@ -43,6 +43,7 @@ use tokio::time::Instant;
 
 use crate::util::{err, Result};
 use crate::grid::{Grid, Renderer};
+use crate::foreground::Fg;
 use crate::predict::Predictor;
 use crate::select::{Released, Select};
 
@@ -201,9 +202,9 @@ enum Msg {
     Frame { gen: u64, frame: Frame },
     SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
     Stdin(Vec<u8>),
-    /// result of a background foreground-process poll: Some(true)=shell,
-    /// Some(false)=TUI, None=poll failed (keep last value)
-    Foreground(Option<bool>),
+    /// result of a background foreground poll; None=poll failed (keep the last
+    /// value)
+    Foreground(Option<Fg>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
@@ -490,21 +491,30 @@ fn button_number(btn: u32) -> u32 {
 /// and is a better judge than this side's process-name heuristic (e.g. a TUI
 /// that doesn't consume wheel events, like an agent CLI). Non-wheel
 /// clicks/drags keep the existing foreground-based routing.
-/// The left button routes through the selection for *every* remote TUI, not a
-/// list of ones known to ignore the mouse. That is only safe because the
-/// selection defers rather than steals: a gesture that never leaves its cell is
-/// replayed to the app as a click. Middle and right buttons have no selection
-/// meaning, so they forward untouched.
-fn mouse_action(remote_is_shell: Option<bool>, btn: u32, press: bool) -> MouseAction {
+/// The left button goes to the local selection in every remote TUI, agent or
+/// not, because a drag is the gesture with no substitute: an app's click can be
+/// replayed after the fact, a selection cannot be recovered.
+///
+/// A gesture that never leaves its cell is replayed to the app as a real click,
+/// so htop still sorts on a header click and lazygit still stages on a file
+/// click. Agent CLIs get it too: they never enabled mouse reporting, but claude
+/// and codex both discard the bytes cleanly, so withholding it only stood to
+/// swallow clicks the day one of them grows mouse support.
+///
+/// A shell is unaffected: the grab is released there, so herdr does its own
+/// native selection and none of this arrives.
+///
+/// The cost is an in-app *drag*: vim's mouse visual-select, a resize handle.
+fn mouse_action(fg: Option<Fg>, btn: u32, press: bool) -> MouseAction {
     match button_number(btn) {
         // wheel up/down. Matched on the button number, not on `btn == 64`, so a
         // modified scroll still scrolls instead of falling through as a click.
         b @ (4 | 5) if press => MouseAction::Scroll { up: b == 4 },
         6 | 7 => MouseAction::Drop,
-        _ if remote_is_shell != Some(false) => MouseAction::Drop,
-        0 => MouseAction::Select,
-        // middle, right, wheel release and the extra buttons: unchanged
-        _ => MouseAction::ForwardRaw,
+        0 if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::Select,
+        // middle, right, wheel release and the extra buttons
+        _ if matches!(fg, Some(Fg::Agent) | Some(Fg::Mouse)) => MouseAction::ForwardRaw,
+        _ => MouseAction::Drop,
     }
 }
 
@@ -684,10 +694,9 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
-    /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
-    /// Some(false)=TUI (selection + deferred clicks), None=unknown (fail safe
-    /// to local). Refreshed lazily on mouse activity via `pane process-info`.
-    remote_is_shell: Option<bool>,
+    /// remote pane foreground classification, None=unknown (fail safe to local).
+    /// Refreshed lazily on mouse activity; see `foreground::classify`.
+    remote_fg: Option<Fg>,
     /// local drag-selection, driven by the left button the remote app would
     /// otherwise receive
     select: Select,
@@ -824,7 +833,7 @@ impl App {
             return;
         }
         // grab unless we've confirmed the foreground is a shell
-        let want = self.remote_is_shell != Some(true);
+        let want = self.remote_fg != Some(Fg::Shell);
         if want == self.mouse_grabbed {
             return;
         }
@@ -851,7 +860,7 @@ impl App {
         }
         // a shell prompt reads arrows in normal mode; a TUI is the case that
         // sets smkx, so mirror application mode unless we've confirmed a shell
-        let want = self.remote_is_shell == Some(false);
+        let want = matches!(self.remote_fg, Some(Fg::Agent) | Some(Fg::Mouse));
         if want == self.app_cursor_keys {
             return;
         }
@@ -1247,7 +1256,7 @@ impl App {
         let mut copy_span: Option<(crate::select::Pos, crate::select::Pos)> = None;
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                match mouse_action(self.remote_is_shell, btn, press) {
+                match mouse_action(self.remote_fg, btn, press) {
                     // Without a tty there is no grab, so this is unreachable in
                     // normal operation — but stdin could still be a pipe, and a
                     // selection there would be sized against a phantom viewport
@@ -1268,9 +1277,15 @@ impl App {
                                 // the clipboard holds one thing, so a second
                                 // gesture in the same read legitimately wins
                                 Released::Selection(span) => copy_span = Some(span),
-                                // it was a click: the app gets it at the release's
-                                // position in the stream, which is the point of
-                                // deferring it
+                                // It was a click, not a drag: the app gets it,
+                                // whatever the app is. An earlier version
+                                // swallowed clicks in agent panes on the theory
+                                // that a program which never enabled mouse
+                                // reporting would render the bytes as literal
+                                // text. Measured against claude and codex, both
+                                // discard them cleanly, so the special case only
+                                // stood to swallow clicks the day an agent grows
+                                // mouse support.
                                 Released::Click(bytes) => rest.extend_from_slice(&bytes),
                                 Released::Nothing => {}
                             },
@@ -1454,7 +1469,7 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
-        remote_is_shell: None,
+        remote_fg: None,
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
@@ -1524,10 +1539,10 @@ pub async fn run(args: Args) -> Result<()> {
                         // a foreground change means the screen belongs to a
                         // different program now, so the old highlight points at
                         // text that is gone
-                        if v != app.remote_is_shell && app.select.clear() {
+                        if v != app.remote_fg && app.select.clear() {
                             app.paint();
                         }
-                        app.remote_is_shell = v;
+                        app.remote_fg = v;
                         app.sync_mouse_grab();
                         app.sync_cursor_key_mode();
                     },
@@ -1641,31 +1656,31 @@ mod tests {
         // remote foreground classified as a TUI (e.g. `claude`) — wheel must
         // still produce a semantic scroll, not a raw forward, or it silently
         // does nothing when the TUI doesn't consume mouse wheel input
-        assert_eq!(mouse_action(Some(false), 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(false), 65, true), MouseAction::Scroll { up: false });
+        assert_eq!(mouse_action(Some(Fg::Agent), 64, true), MouseAction::Scroll { up: true });
+        assert_eq!(mouse_action(Some(Fg::Agent), 65, true), MouseAction::Scroll { up: false });
         // unclassified/shell foreground: wheel still scrolls
         assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(true), 65, true), MouseAction::Scroll { up: false });
+        assert_eq!(mouse_action(Some(Fg::Shell), 65, true), MouseAction::Scroll { up: false });
         // the wheel never reaches the selection path at all, which is what
         // keeps PR #54's scroll regression impossible here by construction
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(true), 0, true), MouseAction::Drop); // shell click
+        assert_eq!(mouse_action(Some(Fg::Agent), 0, true), MouseAction::Select);
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop); // shell click
         assert_eq!(mouse_action(None, 0, true), MouseAction::Drop); // unclassified click
     }
 
     #[test]
-    fn every_remote_tui_routes_its_left_button_through_the_selection() {
-        // press, drag (motion bit 32) and release, with no list of apps: the
-        // selection defers the press, so this is safe even for a mouse TUI
-        assert_eq!(mouse_action(Some(false), 0, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(false), 32, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(false), 0, false), MouseAction::Select);
-        // modifiers ride the same button: shift(4)/alt(8)/ctrl(16) still select
-        assert_eq!(mouse_action(Some(false), 4, true), MouseAction::Select);
-        assert_eq!(mouse_action(Some(false), 16 | 32, true), MouseAction::Select);
-        // middle and right have no selection meaning, so they forward as before
-        assert_eq!(mouse_action(Some(false), 1, true), MouseAction::ForwardRaw);
-        assert_eq!(mouse_action(Some(false), 2, true), MouseAction::ForwardRaw);
+    fn every_remote_tui_selects_on_drag_agent_or_not() {
+        for fg in [Fg::Agent, Fg::Mouse] {
+            assert_eq!(mouse_action(Some(fg), 0, true), MouseAction::Select, "{fg:?} press");
+            assert_eq!(mouse_action(Some(fg), 32, true), MouseAction::Select, "{fg:?} drag");
+            assert_eq!(mouse_action(Some(fg), 0, false), MouseAction::Select, "{fg:?} release");
+            // other buttons still reach the app
+            assert_eq!(mouse_action(Some(fg), 1, true), MouseAction::ForwardRaw);
+            assert_eq!(mouse_action(Some(fg), 2, true), MouseAction::ForwardRaw);
+        }
+        // a shell releases the grab, so these never arrive; unknown fails safe
+        assert_eq!(mouse_action(Some(Fg::Shell), 0, true), MouseAction::Drop);
+        assert_eq!(mouse_action(None, 0, true), MouseAction::Drop);
     }
 
     #[test]
@@ -1676,25 +1691,25 @@ mod tests {
         // wheel bytes to the app as a click.
         for mods in [4, 8, 16, 4 + 8, 4 + 16, 8 + 16, 4 + 8 + 16] {
             assert_eq!(
-                mouse_action(Some(false), 64 + mods, true),
+                mouse_action(Some(Fg::Agent), 64 + mods, true),
                 MouseAction::Scroll { up: true },
                 "shift/alt/ctrl + wheel-up (btn {})",
                 64 + mods
             );
             assert_eq!(
-                mouse_action(Some(false), 65 + mods, true),
+                mouse_action(Some(Fg::Agent), 65 + mods, true),
                 MouseAction::Scroll { up: false },
                 "modified wheel-down (btn {})",
                 65 + mods
             );
         }
         // horizontal wheel keeps dropping, modified or not
-        assert_eq!(mouse_action(Some(false), 66 + 16, true), MouseAction::Drop);
+        assert_eq!(mouse_action(Some(Fg::Agent), 66 + 16, true), MouseAction::Drop);
         // buttons 8-11 carry bit 7, which the old mask also leaked
-        assert_eq!(mouse_action(Some(false), 128, true), MouseAction::ForwardRaw);
-        assert_eq!(mouse_action(Some(false), 128 + 4, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(Fg::Agent), 128, true), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(Fg::Agent), 128 + 4, true), MouseAction::ForwardRaw);
         // a wheel release is not a left release
-        assert_eq!(mouse_action(Some(false), 64, false), MouseAction::ForwardRaw);
+        assert_eq!(mouse_action(Some(Fg::Agent), 64, false), MouseAction::ForwardRaw);
     }
 
     #[test]
