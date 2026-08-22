@@ -107,6 +107,18 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// mirror only remote workspaces that have an agent in one of their panes.
+    /// Default off: mirror everything, which is what a machine you work on
+    /// directly wants. Turn it on for a viewer of many remotes, where the
+    /// interesting rows are the agents and a remote's bare shells are noise
+    /// (and a pane apiece: each mirror pane is a process plus a connection).
+    ///
+    /// This is a live filter, NOT a close: a workspace whose agent appears is
+    /// mirrored on the next converge, and one whose agent goes away has its
+    /// mirror closed locally with the remote untouched. Deliberately not
+    /// implemented as a tombstone, which is keyed to the remote workspace and
+    /// would keep a future agent in that workspace hidden forever.
+    pub agents_only: bool,
     /// Cap the size control asks the remote for. `None` = uncapped: fill the
     /// local pane, which is right for a headless remote nobody looks at.
     /// Control is authoritative on the remote, so on a host with its own
@@ -160,6 +172,7 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    agents_only: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -181,6 +194,7 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    agents_only: Option<bool>,
     api_transport: Option<String>,
 }
 
@@ -261,6 +275,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_agents_only = raw.agents_only.unwrap_or(false);
     // 0 is treated as unset rather than "clamp to nothing", same as an empty
     // remote_bin: a cap that would starve the remote of every column is a typo,
     // not an instruction. Warn rather than dropping it silently — and say that
@@ -318,6 +333,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             session: h.session.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            agents_only: h.agents_only.unwrap_or(global_agents_only),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
@@ -373,6 +389,31 @@ mod tests {
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
+        assert!(!h.agents_only); // default off: mirror every remote workspace
+    }
+
+    /// Global default off, settable globally, overridable per host in both
+    /// directions — one noisy host filtered on an otherwise unfiltered viewer,
+    /// or one machine mirrored whole on a filtered one.
+    #[test]
+    fn agents_only_global_default_and_per_host_override() {
+        let c = parse_config(
+            "[hosts.a]\ntarget = \"a\"\n[hosts.b]\ntarget = \"b\"\nagents_only = true\n",
+        )
+        .unwrap();
+        let by = |n: &str| c.hosts.iter().find(|h| h.name == n).unwrap().agents_only;
+        assert!(!by("a")); // inherits the global default
+        assert!(by("b")); // opted in for this host only
+
+        let c = parse_config(
+            "agents_only = true\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nagents_only = false\n",
+        )
+        .unwrap();
+        let by = |n: &str| c.hosts.iter().find(|h| h.name == n).unwrap().agents_only;
+        assert!(by("a")); // inherits global on
+        assert!(!by("b")); // opted back out
     }
 
     #[test]

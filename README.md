@@ -87,6 +87,16 @@ set `always_control = false` (globally or per host). Its mirrors become
 read-only: a live view with zero effect on the remote that escalates to control
 when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
 
+**Agents only** — `agents_only = true` (globally or per host) mirrors only the
+remote workspaces that have an agent in one of their panes. On a viewer of
+several machines the agents are the point and a remote's bare shells are noise —
+and a mirror pane is a process plus a connection apiece, so a machine with a
+dozen scratch workspaces costs real CPU to watch. It is a live filter, not a
+close: a workspace appears within seconds of its agent starting, and when the
+agent exits its mirror closes locally with the remote untouched. Closing those
+rows by hand instead is not equivalent — that tombstones them, which also hides
+the next agent to start in one.
+
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
 pane/tab/workspace on the remote (`close_remote_on_local_close`; set it false to
 only stop mirroring and leave the remote — and its agent — running). When the
@@ -288,6 +298,12 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# agents_only = false    # default. true mirrors only remote workspaces that
+                         # have an agent in one of their panes — for a viewer of
+                         # many machines, where a remote's bare shells are noise
+                         # and a process apiece. A live filter, not a close: a
+                         # workspace appears when its agent starts and its mirror
+                         # closes (remote untouched) when the agent exits.
 
 [hosts.work]
 target = "work"
@@ -299,6 +315,9 @@ target = "work"
 # max_rows = 58                      # always_control = false
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
+# agents_only = true                 # per-host override: filter one noisy host
+                                     # on an otherwise unfiltered sidebar, or
+                                     # mirror one machine whole under a global
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # api_transport = "auto"             # how to reach the remote API socket:
