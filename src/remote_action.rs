@@ -379,3 +379,113 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+/// Host for `hide`/`show`: an explicit name is looked up directly (same
+/// unknown-host error shape as `remote-actions`); omitted, it falls back to
+/// the invocation context like `remote-tab`/`remote-split` do, so a key bound
+/// inside a mirror workspace hides/shows whichever connection it's pressed in.
+async fn resolve_host(env: &Env, host_arg: Option<&str>) -> Result<HostConfig> {
+    let config = load_config(&env.config_search)?;
+    if let Some(name) = host_arg {
+        return config.hosts.iter().find(|h| h.name == name).cloned().ok_or_else(|| {
+            let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
+            err(format!(
+                "unknown host {name:?} (configured: {})",
+                if known.is_empty() { "none".into() } else { known.join(", ") }
+            ))
+        });
+    }
+    let ctx = invocation_context();
+    resolve_context(env, &config.hosts, &ctx).map(|r| r.host).ok_or_else(|| {
+        err("no host given and not invoked from inside a mirror workspace — pass one: herdr-mirror hide <host>")
+    })
+}
+
+pub async fn hide_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "hide", hide(&env, host_arg).await).await
+}
+
+pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
+    report_failure(&env, "show", show(&env, host_arg).await).await
+}
+
+async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = resolve_host(env, host_arg).await?;
+    let mut state = crate::state::load_state(&env.state_dir, &host.name);
+    if state.hidden {
+        println!("{} is already hidden", host.name);
+        return Ok(());
+    }
+    let local_ids: Vec<String> = state.workspaces.values().map(|e| e.local_id.clone()).collect();
+    state.hidden = true;
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    let local = crate::api::ApiClient::connect(&env.local_socket).await?;
+    for local_id in &local_ids {
+        let _ = local.request("workspace.close", json!({ "workspace_id": local_id })).await;
+    }
+    state.workspaces.clear();
+    state.panes.clear();
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    println!("hid {} — remote keeps running; `herdr-mirror show {}` brings it back", host.name, host.name);
+    Ok(())
+}
+
+async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
+    let host = match host_arg {
+        Some(name) => Some(resolve_host(env, Some(name)).await?),
+        None => {
+            let config = load_config(&env.config_search)?;
+            let ctx = invocation_context();
+            resolve_context(env, &config.hosts, &ctx).map(|r| r.host)
+        }
+    };
+    match host {
+        Some(host) => show_one(env, &host).await,
+        None => show_all(env).await,
+    }
+}
+
+fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
+    let mut state = crate::state::load_state(&env.state_dir, &host.name);
+    if !state.hidden {
+        return Ok(false);
+    }
+    state.hidden = false;
+    crate::state::save_state(&env.state_dir, &host.name, &state)?;
+    Ok(true)
+}
+
+async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
+    if !clear_hidden(env, host)? {
+        println!("{} is not hidden", host.name);
+        return Ok(());
+    }
+    nudge_daemon(env, &format!("showing {}", host.name));
+    Ok(())
+}
+
+async fn show_all(env: &Env) -> Result<()> {
+    let config = load_config(&env.config_search)?;
+    let mut shown = Vec::new();
+    for host in &config.hosts {
+        if clear_hidden(env, host)? {
+            shown.push(host.name.clone());
+        }
+    }
+    if shown.is_empty() {
+        println!("no hidden hosts");
+        return Ok(());
+    }
+    nudge_daemon(env, &format!("showing {}", shown.join(", ")));
+    Ok(())
+}
+
+fn nudge_daemon(env: &Env, prefix: &str) {
+    match crate::daemon::running_pid(env) {
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            println!("{prefix} — daemon syncing now");
+        }
+        None => println!("{prefix} — mirrors reappear when the daemon starts"),
+    }
+}

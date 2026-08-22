@@ -60,6 +60,18 @@ description = "Split the mirrored remote pane down; splits locally when invoked 
 command = ["./target/release/herdr-mirror", "remote-split", "down"]
 
 [[actions]]
+id = "hide"
+title = "Mirror: hide"
+description = "Hide this connection's mirrored terminals locally — remote keeps running"
+command = ["./target/release/herdr-mirror", "hide"]
+
+[[actions]]
+id = "show"
+title = "Mirror: show"
+description = "Bring back a connection's mirrored terminals after hiding them"
+command = ["./target/release/herdr-mirror", "show"]
+
+[[actions]]
 id = "restore"
 title = "Mirror: restore closed mirrors"
 description = "Bring back mirror workspaces/panes you closed locally"

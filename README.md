@@ -96,6 +96,16 @@ back mirrors you closed.
 **Pause** — the **pause** action halts syncing; mirrors stay frozen in place
 and resume with **start**. `teardown` closes all mirrors and clears state.
 
+**Hide / show** — **hide** closes one connection's mirrors locally without
+touching the remote (unaffected by `close_remote_on_local_close`) and freezes
+that host so syncing doesn't just recreate them. **show** clears that and
+resyncs — a fresh recreate, not a resume, since the local objects are gone.
+With a host given (explicitly, or from the connection you invoked it from,
+same as the remote-create actions below), `herdr-mirror hide <host>` / `show
+<host>` act on that one. With no host and no invocation context, bare
+`herdr-mirror show` clears every hidden connection at once. Unlike
+`teardown`, other hosts keep mirroring normally.
+
 **Create on the remote** — four actions create objects on the remote host,
 inheriting the target host and cwd from the mirror you invoke them from (the
 same rule as native `prefix+shift+n`, but remote): `remote-new-workspace`,
@@ -146,6 +156,16 @@ command = "mirror.restore"     # un-close mirrors you closed locally
 key = "prefix+alt+d"           # destructive: closes ALL mirrors + clears state
 type = "plugin_action"
 command = "mirror.teardown"    # stop mirroring everything (start to resume)
+
+[[keys.command]]
+key = "prefix+alt+h"
+type = "plugin_action"
+command = "mirror.hide"        # hide this connection's mirrors (remote keeps running)
+
+[[keys.command]]
+key = "prefix+alt+shift+h"
+type = "plugin_action"
+command = "mirror.show"        # bring a hidden connection's mirrors back
 
 # Create objects on the REMOTE host, or locally when invoked outside a mirror.
 # Each is herdr's native local key + alt (Option): same muscle memory, remote
