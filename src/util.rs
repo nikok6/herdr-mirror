@@ -12,6 +12,17 @@ pub fn err(msg: impl Into<String>) -> Error {
 }
 
 pub fn home_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(user_profile) = std::env::var("USERPROFILE") {
+            if !user_profile.is_empty() {
+                return PathBuf::from(user_profile);
+            }
+        }
+        if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
+            return PathBuf::from(format!("{drive}{path}"));
+        }
+    }
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
@@ -64,7 +75,14 @@ pub fn default_config_dir() -> PathBuf {
 
 /// The stable CLI path install.sh links and the README's keybindings use.
 pub fn cli_link_path() -> PathBuf {
-    home_dir().join(".local").join("bin").join("herdr-mirror")
+    #[cfg(windows)]
+    {
+        home_dir().join(".local").join("bin").join("herdr-mirror.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        home_dir().join(".local").join("bin").join("herdr-mirror")
+    }
 }
 
 pub enum CliLink {
@@ -121,10 +139,24 @@ pub fn repair_cli_link() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let _ = fs::create_dir_all(link.parent()?);
     let _ = fs::remove_file(&link);
-    Some(match std::os::unix::fs::symlink(&exe, &link) {
-        Ok(()) => format!("relinked {} -> {}", link.display(), exe.display()),
-        Err(e) => format!("could not relink {}: {e}", link.display()),
-    })
+
+    #[cfg(unix)]
+    {
+        Some(match std::os::unix::fs::symlink(&exe, &link) {
+            Ok(()) => format!("relinked {} -> {}", link.display(), exe.display()),
+            Err(e) => format!("could not relink {}: {e}", link.display()),
+        })
+    }
+    #[cfg(windows)]
+    {
+        Some(match std::os::windows::fs::symlink_file(&exe, &link) {
+            Ok(()) => format!("linked {} -> {}", link.display(), exe.display()),
+            Err(_) => match fs::copy(&exe, &link) {
+                Ok(_) => format!("copied {} -> {}", exe.display(), link.display()),
+                Err(e) => format!("could not link or copy {}: {e}", link.display()),
+            },
+        })
+    }
 }
 
 /// Config dirs to search, most specific first.
@@ -217,7 +249,26 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Is a pid alive? (signal 0)
 pub fn pid_alive(pid: i32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match status {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout.contains(&pid.to_string())
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// Pidfile a pane streamer writes at startup. The daemon starts streamers by

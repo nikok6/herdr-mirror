@@ -37,6 +37,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -382,21 +383,43 @@ fn initial_mode(always_control: bool, size: (usize, usize)) -> Mode {
 }
 
 fn term_size() -> (usize, usize) {
+    #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
             return (ws.ws_col as usize, ws.ws_row as usize);
         }
     }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
+                let cols = (info.srWindow.Right - info.srWindow.Left + 1).max(1) as usize;
+                let rows = (info.srWindow.Bottom - info.srWindow.Top + 1).max(1) as usize;
+                return (cols, rows);
+            }
+        }
+    }
     (80, 24)
 }
 
-struct RawMode {
+pub struct RawMode {
+    #[cfg(unix)]
     orig: libc::termios,
+    #[cfg(windows)]
+    orig_in: u32,
+    #[cfg(windows)]
+    orig_out: u32,
 }
 
 impl RawMode {
     fn enable() -> Option<RawMode> {
+        #[cfg(unix)]
         unsafe {
             let mut orig: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
@@ -409,11 +432,46 @@ impl RawMode {
             }
             Some(RawMode { orig })
         }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT,
+                ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+            unsafe {
+                let h_in = GetStdHandle(STD_INPUT_HANDLE);
+                let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+                let mut orig_in = 0u32;
+                let mut orig_out = 0u32;
+                if GetConsoleMode(h_in, &mut orig_in) == 0 || GetConsoleMode(h_out, &mut orig_out) == 0 {
+                    return None;
+                }
+                let raw_in = (orig_in & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                let raw_out = orig_out | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                SetConsoleMode(h_in, raw_in);
+                SetConsoleMode(h_out, raw_out);
+                Some(RawMode { orig_in, orig_out })
+            }
+        }
     }
 
     fn restore(&self) {
+        #[cfg(unix)]
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            unsafe {
+                let h_in = GetStdHandle(STD_INPUT_HANDLE);
+                let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+                SetConsoleMode(h_in, self.orig_in);
+                SetConsoleMode(h_out, self.orig_out);
+            }
         }
     }
 }
@@ -891,7 +949,10 @@ impl App {
                     let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
+                #[cfg(unix)]
                 unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                #[cfg(windows)]
+                let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &s.pid.to_string()]).output();
             });
         }
     }
@@ -908,7 +969,10 @@ impl App {
             Mode::Control => self.control_size(),
         };
         if let Some(s) = self.session.take() {
+            #[cfg(unix)]
             unsafe { libc::kill(s.pid, libc::SIGTERM) };
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &s.pid.to_string()]).output();
         }
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
@@ -1414,7 +1478,16 @@ pub async fn run(args: Args) -> Result<()> {
         PidfileGuard(path)
     });
 
+    #[cfg(unix)]
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+    #[cfg(windows)]
+    let tty = !args.dump && {
+        use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE};
+        unsafe {
+            let mut mode = 0u32;
+            GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+        }
+    };
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
@@ -1494,9 +1567,13 @@ pub async fn run(args: Args) -> Result<()> {
     // is to be ignored). That window is exactly when a client attaching lays out
     // a freshly created pane — the resize we now promote on. Registered first,
     // tokio buffers it and delivers it once the loop starts.
+    #[cfg(unix)]
     let mut sigterm = signal(SignalKind::terminate())?;
+    #[cfg(unix)]
     let mut sigint = signal(SignalKind::interrupt())?;
+    #[cfg(unix)]
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
+    #[cfg(unix)]
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
@@ -1527,6 +1604,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.settle_at,
         ]);
 
+        #[cfg(unix)]
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
@@ -1534,7 +1612,6 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
-                    // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
                         // a foreground change means the screen belongs to a
                         // different program now, so the old highlight points at
@@ -1552,17 +1629,10 @@ pub async fn run(args: Args) -> Result<()> {
             }
             _ = sigwinch.recv() => {
                 app.renderer.invalidate();
-                // a resize means a client is laying this pane out, so the size is
-                // now a real viewport: take control if that is what we're for.
-                // control_sticky means control was refused twice in a row and we
-                // told the user "type to retry" — a window drag must not turn
-                // that into a reconnect storm.
                 if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
                     app.switch_mode(Mode::Control);
                 }
                 if app.mode == Mode::Control {
-                    // capped like the initial connect: a local window drag must
-                    // not push a capped host past its ceiling either
                     let (cols, rows) = app.control_size();
                     app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
                 }
@@ -1571,39 +1641,28 @@ pub async fn run(args: Args) -> Result<()> {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
-            _ = sleep => {
-                let now = Instant::now();
-                if app.switch_at.is_some_and(|t| t <= now) {
-                    app.switch_at = None;
-                    if let Some(m) = app.switching_to.take() {
-                        app.connect(m).await; // pending input from the gap flushes here
-                    }
-                }
-                if let Some((t, m)) = app.reconnect_at {
-                    if t <= now {
-                        app.reconnect_at = None;
-                        app.connect(m).await;
-                    }
-                }
-                if app.hint_clear_at.is_some_and(|t| t <= now) {
-                    app.hint_clear_at = None;
-                    app.renderer.status("");
-                    app.paint();
-                }
-                if idle_at.is_some_and(|t| t <= now) && app.mode == Mode::Control && app.switching_to.is_none() {
-                    app.control_sticky = true;
-                    app.switch_mode(Mode::Observe);
-                    app.hint("control released (idle) — type to retake");
-                }
-                if app.settle_at.is_some_and(|t| t <= now) {
-                    app.settle_at = None;
-                    app.spawn_foreground_poll(true); // forced: bypass the throttle
-                }
-                if app.predict.deadline().is_some_and(|t| t <= now) {
-                    app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
-                    app.paint();
+            _ = sleep => app_tick(&mut app, idle_at).await,
+        }
+
+        #[cfg(not(unix))]
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    None => break,
+                    Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
+                    Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
+                    Some(Msg::Foreground(v)) => if v.is_some() {
+                        app.remote_is_shell = v;
+                        app.sync_mouse_grab();
+                        app.sync_cursor_key_mode();
+                    },
+                    Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
+                    Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
+            _ = tokio::signal::ctrl_c() => break,
+            _ = sleep => app_tick(&mut app, idle_at).await,
         }
     }
 
@@ -1613,7 +1672,10 @@ pub async fn run(args: Args) -> Result<()> {
             let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        #[cfg(unix)]
         unsafe { libc::kill(s.pid, libc::SIGTERM) };
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &s.pid.to_string()]).output();
     }
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
@@ -1624,6 +1686,40 @@ pub async fn run(args: Args) -> Result<()> {
         raw.restore();
     }
     Ok(())
+}
+
+async fn app_tick(app: &mut App, idle_at: Option<Instant>) {
+    let now = Instant::now();
+    if app.switch_at.is_some_and(|t| t <= now) {
+        app.switch_at = None;
+        if let Some(m) = app.switching_to.take() {
+            app.connect(m).await; // pending input from the gap flushes here
+        }
+    }
+    if let Some((t, m)) = app.reconnect_at {
+        if t <= now {
+            app.reconnect_at = None;
+            app.connect(m).await;
+        }
+    }
+    if app.hint_clear_at.is_some_and(|t| t <= now) {
+        app.hint_clear_at = None;
+        app.renderer.status("");
+        app.paint();
+    }
+    if idle_at.is_some_and(|t| t <= now) && app.mode == Mode::Control && app.switching_to.is_none() {
+        app.control_sticky = true;
+        app.switch_mode(Mode::Observe);
+        app.hint("control released (idle) — type to retake");
+    }
+    if app.settle_at.is_some_and(|t| t <= now) {
+        app.settle_at = None;
+        app.spawn_foreground_poll(true); // forced: bypass the throttle
+    }
+    if app.predict.deadline().is_some_and(|t| t <= now) {
+        app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
+        app.paint();
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,10 @@ edition = "2021"
 license = "MIT"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
 
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "net", "process", "time", "sync", "signal", "fs"] }
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock", "Win32_System_Console"] }
+
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "net", "process", "time", "sync", "signal", "fs"] }
 serde = { version = "1", features = ["derive"] }
