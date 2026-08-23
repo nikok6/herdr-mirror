@@ -3,7 +3,7 @@ name = "Herdr Mirror"
 version = "0.3.1"
 min_herdr_version = "0.7.2"
 description = "Mirror a remote herdr server's workspaces and agents into the local sidebar"
-platforms = ["macos", "linux"]
+platforms = ["macos", "linux", "windows"]
 
 # Fetch the prebuilt herdr-mirror binary for this platform into
 # ./target/release/herdr-mirror — everything below invokes that binary.

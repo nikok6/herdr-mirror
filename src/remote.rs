@@ -3,6 +3,7 @@
 // their own direct connections instead (see pane.rs).
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -76,6 +77,7 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
             )))
         }
     };
+    #[cfg(unix)]
     if !metadata.file_type().is_socket() {
         return Err(err(format!(
             "refusing to replace ssh control path {} because it is not a socket",
@@ -160,8 +162,6 @@ fn short_hash(s: &str) -> String {
 /// installs on byte-identical paths across this upgrade (no orphaned masters,
 /// no migration). Only names that were already too long to work at all move.
 fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
-    use std::os::unix::ffi::OsStrExt;
-
     // macOS reserves one byte of sockaddr_un's 104-byte path for NUL; Linux
     // allows 108, and we deliberately apply the tighter bound on both so a
     // hosts.toml is portable. Overhead is the worst case across the three
@@ -170,7 +170,7 @@ fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
     const MAX_SOCKET_PATH_BYTES: usize = 103;
     const CONTROL_SOCKET_OVERHEAD: usize = 21;
 
-    let directory_bytes = state_dir.as_os_str().as_bytes().len() + 1;
+    let directory_bytes = state_dir.as_os_str().as_encoded_bytes().len() + 1;
     let budget = MAX_SOCKET_PATH_BYTES.saturating_sub(directory_bytes + CONTROL_SOCKET_OVERHEAD);
     if host_name.len() <= budget {
         return host_name.into();
@@ -259,55 +259,67 @@ impl RemoteHost {
     }
 
     fn base_args(&self) -> Vec<String> {
-        vec![
-            "-S".into(),
-            self.ctl_path.display().to_string(),
-            "-o".into(),
-            "BatchMode=yes".into(),
-        ]
+        #[cfg(windows)]
+        {
+            vec!["-o".into(), "BatchMode=yes".into()]
+        }
+        #[cfg(not(windows))]
+        {
+            vec![
+                "-S".into(),
+                self.ctl_path.display().to_string(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+            ]
+        }
     }
 
     pub async fn ensure_master(&mut self) -> Result<()> {
-        let mut check = self.base_args();
-        check.extend(["-O".into(), "check".into(), self.cfg.target.clone()]);
-        if ssh(&check, 15000).await.code == 0 {
+        #[cfg(windows)]
+        {
+            // OpenSSH for Windows does not support unix domain socket ControlMaster multiplexing (getsockname failed)
             return Ok(());
         }
-        self.forwarded = false;
-        // OpenSSH falls back to a standalone connection when ControlPath exists
-        // but no master is listening. With -f -N that silently leaks one process
-        // per retry, while every later -O command keeps targeting the dead socket.
-        remove_stale_control_socket(&self.ctl_path)?;
-        let mut start: Vec<String> = vec![
-            "-M".into(),
-            "-S".into(),
-            self.ctl_path.display().to_string(),
-        ];
-        start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
-        start.extend([
-            "-o".into(),
-            "ControlPersist=yes".into(),
-            "-f".into(),
-            "-N".into(),
-            self.cfg.target.clone(),
-        ]);
-        let res = ssh(&start, 20000).await;
-        if res.code != 0 {
-            return Err(err(format!(
-                "ssh master to {} failed: {}",
-                self.cfg.target,
-                nonempty(&res.err, res.code)
-            )));
+        #[cfg(not(windows))]
+        {
+            let mut check = self.base_args();
+            check.extend(["-O".into(), "check".into(), self.cfg.target.clone()]);
+            if ssh(&check, 15000).await.code == 0 {
+                return Ok(());
+            }
+            self.forwarded = false;
+            remove_stale_control_socket(&self.ctl_path)?;
+            let mut start: Vec<String> = vec![
+                "-M".into(),
+                "-S".into(),
+                self.ctl_path.display().to_string(),
+            ];
+            start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
+            start.extend([
+                "-o".into(),
+                "ControlPersist=yes".into(),
+                "-f".into(),
+                "-N".into(),
+                self.cfg.target.clone(),
+            ]);
+            let res = ssh(&start, 20000).await;
+            if res.code != 0 {
+                return Err(err(format!(
+                    "ssh master to {} failed: {}",
+                    self.cfg.target,
+                    nonempty(&res.err, res.code)
+                )));
+            }
+            let verified = ssh(&check, 15000).await;
+            if verified.code != 0 {
+                return Err(err(format!(
+                    "ssh master to {} did not create a usable control socket: {}",
+                    self.cfg.target,
+                    nonempty(&verified.err, verified.code)
+                )));
+            }
+            Ok(())
         }
-        let verified = ssh(&check, 15000).await;
-        if verified.code != 0 {
-            return Err(err(format!(
-                "ssh master to {} did not create a usable control socket: {}",
-                self.cfg.target,
-                nonempty(&verified.err, verified.code)
-            )));
-        }
-        Ok(())
     }
 
     pub async fn exec(&self, command: &str, timeout_ms: u64) -> Result<String> {
@@ -319,7 +331,8 @@ impl RemoteHost {
         let res = ssh(&args, timeout_ms).await;
         if res.code != 0 {
             return Err(err(format!(
-                "ssh exec failed ({command}): {}",
+                "ssh to {} failed ({command}): {}",
+                self.cfg.target,
                 nonempty(&res.err, res.code)
             )));
         }
@@ -384,57 +397,47 @@ impl RemoteHost {
         if self.forwarded && self.fwd_sock.exists() {
             return Ok(self.fwd_sock.clone());
         }
-        // NEVER cancel a healthy forward — other processes may be using it
         if self.fwd_sock.exists() && ApiClient::connect(&self.fwd_sock).await.is_ok() {
             self.forwarded = true;
             return Ok(self.fwd_sock.clone());
         }
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        // a dead process can leave the forward registered on the master with
-        // its socket file unlinked — cancel before re-adding
-        let mut cancel = self.base_args();
-        cancel.extend(["-O".into(), "cancel".into(), "-L".into(), spec.clone(), self.cfg.target.clone()]);
-        let _ = ssh(&cancel, 15000).await;
-        let _ = std::fs::remove_file(&self.fwd_sock);
-        let mut fwd = self.base_args();
-        fwd.extend(["-O".into(), "forward".into(), "-L".into(), spec, self.cfg.target.clone()]);
-        let res = ssh(&fwd, 15000).await;
-        if res.code != 0 {
-            return Err(err(format!("ssh socket forward failed: {}", nonempty(&res.err, res.code))));
+        #[cfg(windows)]
+        {
+            // Windows OpenSSH does not support -O multiplexing commands
+            return Err(err("streamlocal forward unavailable on windows via multiplexing"));
         }
-        self.forwarded = true;
-        Ok(self.fwd_sock.clone())
+        #[cfg(not(windows))]
+        {
+            let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+            let mut cancel = self.base_args();
+            cancel.extend(["-O".into(), "cancel".into(), "-L".into(), spec.clone(), self.cfg.target.clone()]);
+            let _ = ssh(&cancel, 15000).await;
+            let _ = std::fs::remove_file(&self.fwd_sock);
+            let mut fwd = self.base_args();
+            fwd.extend(["-O".into(), "forward".into(), "-L".into(), spec, self.cfg.target.clone()]);
+            let res = ssh(&fwd, 15000).await;
+            if res.code != 0 {
+                return Err(err(format!("ssh socket forward failed: {}", nonempty(&res.err, res.code))));
+            }
+            self.forwarded = true;
+            Ok(self.fwd_sock.clone())
+        }
     }
 
-    /// Try the streamlocal `-L` forward, verified with a real ping — not just
-    /// that `ssh -O forward` reported success.
-    ///
-    /// The forward registering successfully is not proof the transport works:
-    /// some sshds (embedded Go sshds fronting container/VM workspaces are the
-    /// case this was written against) accept a direct-streamlocal channel
-    /// open and then never service it. Every byte written just sits there, so
-    /// the first sign of trouble is the API layer's own connect/ping timing
-    /// out or the channel closing with zero bytes read — which is exactly
-    /// what `ApiClient::connect`'s ping round-trip surfaces.
-    ///
-    /// That ping is the client `connect_api` returns, not an extra probe on
-    /// top of it: a working host must not pay a round trip for a fallback it
-    /// never needs.
     async fn try_socket_transport(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let sock = self.forward_api(remote_socket).await?;
         ApiClient::connect(&sock).await
     }
 
-    /// Drop a forward that just proved itself dead, so it doesn't sit
-    /// registered on the ControlMaster for the connection's life with its
-    /// socket file unlinked. Unlike `forward_api`'s guard this cannot steal a
-    /// healthy forward: it only runs after a real ping failed.
     async fn cancel_forward(&mut self, remote_socket: &str) {
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        let mut args = self.base_args();
-        args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
-        let _ = ssh(&args, 15000).await;
-        let _ = std::fs::remove_file(&self.fwd_sock);
+        #[cfg(not(windows))]
+        {
+            let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+            let mut args = self.base_args();
+            args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
+            let _ = ssh(&args, 15000).await;
+            let _ = std::fs::remove_file(&self.fwd_sock);
+        }
         self.forwarded = false;
     }
 
@@ -448,7 +451,13 @@ impl RemoteHost {
         // `remote-*` actions, `once`), and state_dir is a single fixed path.
         // `exec_sock` is the relay's OWN path, so a live streamlocal forward
         // can't answer for it and quietly cancel the exec transport.
-        if self.exec_relay.is_none() && ApiClient::connect(&self.exec_sock).await.is_ok() {
+        //
+        // NOTE: use IpcStream::connect directly here — ApiClient::connect
+        // ignores the ping error and always returns Ok, so .is_ok() would be
+        // true even when the socket does not exist.
+        let exec_sock_alive = self.exec_relay.is_none() && self.exec_sock.exists()
+            && crate::api::IpcStream::connect(&self.exec_sock).await.is_ok();
+        if exec_sock_alive {
             return Ok(self.exec_sock.clone());
         }
         self.exec_relay = None;
@@ -464,7 +473,7 @@ impl RemoteHost {
             relay_cmd,
             self.exec_sock.clone(),
             self.log.clone(),
-        )?;
+        ).await?;
         let path = handle.path.clone();
         self.exec_relay = Some(handle);
         Ok(path)
@@ -482,6 +491,9 @@ impl RemoteHost {
     /// cost before this fallback existed.
     async fn connect_ssh_api(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let configured = self.cfg.api_transport;
+        #[cfg(windows)]
+        let start_with_socket = configured == ApiTransport::Socket;
+        #[cfg(not(windows))]
         let start_with_socket =
             (if configured == ApiTransport::Auto { self.transport_hint } else { configured })
                 != ApiTransport::Exec;
@@ -548,7 +560,7 @@ impl RemoteHost {
                         status.socket.clone(),
                         self.fwd_sock.clone(),
                         self.log.clone(),
-                    )?;
+                    ).await?;
                     let path = handle.path.clone();
                     self.relay = Some(handle);
                     path
@@ -699,6 +711,7 @@ mod tests {
         assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn removes_stale_control_socket() {
         let path = test_path("stale-control");
@@ -710,6 +723,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_to_replace_non_socket_control_path() {
         let path = test_path("non-socket-control");

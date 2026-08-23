@@ -16,13 +16,17 @@
 // The held `events.subscribe` stream is a single long-lived exec, so the
 // high-frequency path costs nothing extra.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(not(unix))]
+use tokio::net::{TcpListener as UnixListener, TcpStream as UnixStream};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -222,7 +226,7 @@ impl Container {
 /// Serve `local_sock` by relaying every accepted connection into the container.
 ///
 /// Returns once the listener is bound, so callers can connect immediately.
-pub fn serve_relay(
+pub async fn serve_relay(
     container: Container,
     remote_sock: String,
     local_sock: PathBuf,
@@ -236,11 +240,17 @@ pub fn serve_relay(
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    #[cfg(unix)]
     let listener = UnixListener::bind(&local_sock)
         .map_err(|e| err(format!("cannot bind {}: {e}", local_sock.display())))?;
+    #[cfg(not(unix))]
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| err(format!("cannot bind tcp listener: {e}")))?;
     // anyone who can connect here drives the remote herdr API unauthenticated,
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(&local_sock, std::fs::Permissions::from_mode(0o600)) {
         log.log(&format!("relay: cannot restrict {}: {e}", local_sock.display()));
     }
@@ -325,7 +335,7 @@ async fn pump(
     let mut cin = child.stdin.take().ok_or_else(|| err("relay: no child stdin"))?;
     let mut cout = child.stdout.take().ok_or_else(|| err("relay: no child stdout"))?;
     let mut cerr = child.stderr.take().ok_or_else(|| err("relay: no child stderr"))?;
-    let (mut lr, mut lw) = stream.into_split();
+    let (mut lr, mut lw) = tokio::io::split(stream);
 
     // Client → container. Finishing means the client half-closed after sending
     // its request, which is NOT the end of the exchange: forward the EOF and
@@ -421,6 +431,7 @@ mod tests {
         assert!(validate_socket_path("relative/path.sock").is_err(), "not absolute");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_blocking_times_out_rather_than_hanging() {
         // A stub that ignores its args and hangs, standing in for a wedged
@@ -432,6 +443,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("slow-docker");
         std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let start = Instant::now();
@@ -481,12 +493,15 @@ mod tests {
         let local_sock = dir.join("it-api.sock");
         let container = Container { id: cid, docker_bin };
         let handle =
-            serve_relay(container, sock, local_sock.clone(), Logger::new(&dir, false)).unwrap();
+            serve_relay(container, sock, local_sock.clone(), Logger::new(&dir, false)).await.unwrap();
 
         // the socket must not be readable by other users: it proxies an API
         // that can start agents with arbitrary argv
-        let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+        }
 
         // 1. one-shot request/response (ApiClient::connect pings)
         let api = crate::api::ApiClient::connect(&handle.path).await.expect("ping through relay");
