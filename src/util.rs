@@ -237,6 +237,21 @@ pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) 
         .join(format!("{}--{}.pid", sane_component(ssh_target), sane_component(pane_target)))
 }
 
+/// A launch claim exists from the first local `pane.send_text` until the
+/// streamer writes its pidfile. Recovery must not type another command into
+/// that pane during this interval: the first streamer can already own stdin
+/// even when herdr's process snapshot still reports the shell.
+pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamerSpawnClaim {
+    Claimed,
+    Active,
+    Pending,
+}
+
 /// Where the streamer of a given LOCAL herdr pane announces its pid.
 ///
 /// `streamer_pid_path` addresses a streamer by what it is showing (host + remote
@@ -251,6 +266,58 @@ pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> 
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
         .is_some_and(pid_alive)
+}
+
+pub fn pane_streamer_alive(state_dir: &Path, local_pane_id: &str) -> bool {
+    fs::read_to_string(pane_pid_path(state_dir, local_pane_id))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .is_some_and(pid_alive)
+}
+
+/// Claim the right to type one streamer launcher into a local pane.
+///
+/// The pidfile protects an active streamer. The exclusive pending file closes
+/// the startup interval before the streamer can publish its pid. A stale claim
+/// leaves a visible shell instead of risking input in a live remote terminal.
+pub fn claim_streamer_spawn(
+    state_dir: &Path,
+    ssh_target: &str,
+    pane_target: &str,
+    local_pane_id: &str,
+) -> std::io::Result<StreamerSpawnClaim> {
+    if streamer_alive(state_dir, ssh_target, pane_target)
+        || pane_streamer_alive(state_dir, local_pane_id)
+    {
+        return Ok(StreamerSpawnClaim::Active);
+    }
+
+    let path = streamer_spawn_pending_path(state_dir, local_pane_id);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut claim = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(StreamerSpawnClaim::Pending);
+        }
+        Err(e) => return Err(e),
+    };
+    writeln!(claim, "{ssh_target} {pane_target}")?;
+
+    // A streamer from an earlier launch can publish its pid between the first
+    // check and our claim. Its pid wins, and its startup removes this claim.
+    if streamer_alive(state_dir, ssh_target, pane_target)
+        || pane_streamer_alive(state_dir, local_pane_id)
+    {
+        let _ = fs::remove_file(path);
+        return Ok(StreamerSpawnClaim::Active);
+    }
+    Ok(StreamerSpawnClaim::Claimed)
+}
+
+pub fn clear_streamer_spawn_pending(state_dir: &Path, local_pane_id: &str) {
+    let _ = fs::remove_file(streamer_spawn_pending_path(state_dir, local_pane_id));
 }
 
 /// Poke the streamer drawing a given local pane, so it picks up a notice left
@@ -285,5 +352,71 @@ where
     match deadlines.into_iter().flatten().min() {
         Some(d) => tokio::time::sleep_until(d).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-mirror-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn a_live_pid_claim_blocks_a_recovery_write() {
+        let state_dir = test_state_dir("active-spawn");
+        let pid_path = streamer_pid_path(&state_dir, "host", "w1:p1");
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Active
+        );
+        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_live_local_pane_pid_blocks_a_recovery_write() {
+        let state_dir = test_state_dir("active-local-pane");
+        let pid_path = pane_pid_path(&state_dir, "w2:p2");
+        fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Active
+        );
+        assert!(!streamer_spawn_pending_path(&state_dir, "w2:p2").exists());
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn one_pending_launch_owns_each_local_pane() {
+        let state_dir = test_state_dir("pending-spawn");
+
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Pending
+        );
+        clear_streamer_spawn_pending(&state_dir, "w2:p2");
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        let _ = fs::remove_dir_all(state_dir);
     }
 }

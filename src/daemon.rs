@@ -405,6 +405,10 @@ async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
     }))
 }
 
+fn streamer_recovery_needed(process_info_live: Option<bool>, pidfile_live: bool) -> bool {
+    process_info_live == Some(false) && !pidfile_live
+}
+
 /// Is this foreground process one of our pane wrappers?
 ///
 /// argv[0] is the resolved exe path, which varies by install (release build,
@@ -449,7 +453,10 @@ async fn heal_zombie_mirrors(
         // line into the user's live remote session instead.
         let mut dead: Vec<(String, String)> = Vec::new();
         for (remote_pane_id, local_pane_id) in panes {
-            if has_live_streamer(local, &local_pane_id).await == Some(false) {
+            let process_info_live = has_live_streamer(local, &local_pane_id).await;
+            let pidfile_live = crate::util::streamer_alive(state_dir, &h.target, &remote_pane_id)
+                || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
+            if streamer_recovery_needed(process_info_live, pidfile_live) {
                 dead.push((remote_pane_id, local_pane_id));
             }
         }
@@ -985,5 +992,15 @@ mod tests {
     fn other_subcommands_are_not_streamers() {
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
+    }
+
+    /// The live failure reported no foreground streamer while its pidfile
+    /// already named the active wrapper. Recovery must trust either signal.
+    #[test]
+    fn a_live_pidfile_blocks_false_recovery() {
+        assert!(!streamer_recovery_needed(Some(false), true));
+        assert!(!streamer_recovery_needed(Some(true), false));
+        assert!(!streamer_recovery_needed(None, false));
+        assert!(streamer_recovery_needed(Some(false), false));
     }
 }

@@ -668,6 +668,32 @@ pub(crate) async fn spawn_streamer_pane(
     argv: &[String],
     log: &Logger,
 ) {
+    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
+    else {
+        log.log(&format!("refusing malformed streamer command for {local_pane_id}"));
+        return;
+    };
+    match crate::util::claim_streamer_spawn(
+        state_dir,
+        &ssh_target,
+        &pane_target,
+        local_pane_id,
+    ) {
+        Ok(crate::util::StreamerSpawnClaim::Claimed) => {}
+        Ok(crate::util::StreamerSpawnClaim::Active) => {
+            log.log(&format!("streamer for {pane_target} already active in {local_pane_id}; not retyping"));
+            return;
+        }
+        Ok(crate::util::StreamerSpawnClaim::Pending) => {
+            log.log(&format!("streamer launch for {pane_target} already pending in {local_pane_id}; not retyping"));
+            return;
+        }
+        Err(e) => {
+            log.log(&format!("cannot claim streamer launch for {local_pane_id}: {e}; not retyping"));
+            return;
+        }
+    }
+
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
@@ -676,6 +702,7 @@ pub(crate) async fn spawn_streamer_pane(
         .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
         .await
     {
+        crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
         log.log(&format!("spawn streamer {local_pane_id}: {e}"));
         return;
     }
@@ -687,16 +714,14 @@ pub(crate) async fn spawn_streamer_pane(
     // alive-check right before each resend keeps a late-starting streamer
     // from getting the line typed into its stdin (which would forward it to
     // the remote pane as text).
-    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
-    else {
-        return;
-    };
     let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
     let pane_id = local_pane_id.to_string();
     tokio::spawn(async move {
         for wait_ms in [3000u64, 4000] {
             tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                || crate::util::pane_streamer_alive(&state_dir, &pane_id)
+            {
                 return;
             }
             log.log(&format!(
@@ -711,7 +736,9 @@ pub(crate) async fn spawn_streamer_pane(
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target) {
+        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+            && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
+        {
             log.log(&format!(
                 "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
             ));
