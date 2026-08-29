@@ -684,6 +684,16 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         println!("mirror daemon already running");
         return Ok(());
     }
+    // A stale pidfile is not proof that nothing is running. Starting beside an
+    // orphan gives every remote workspace two mirrors, and the second one comes
+    // from a daemon no command here can see.
+    let others = other_daemon_pids(None);
+    if !others.is_empty() {
+        let list = others.iter().map(i32::to_string).collect::<Vec<_>>().join(", ");
+        println!("not starting: a mirror daemon is already running (pid {list}) that the pidfile does not track");
+        println!("run `herdr-mirror pause` first — it stops untracked daemons too — then start again");
+        return Ok(());
+    }
     let exe = crate::util::self_exe_path()
         .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn"))?;
     let log = fs::OpenOptions::new()
@@ -705,15 +715,56 @@ pub fn cmd_start(env: &Env) -> Result<()> {
     Ok(())
 }
 
+/// Live `herdr-mirror daemon` processes other than this one, skipping `skip`.
+///
+/// The pidfile alone is not enough. If it goes stale -- an orphan that was
+/// never written to it, or a shutdown that removed the file while another
+/// daemon was still up -- a second daemon starts happily beside the first.
+/// Both then mirror every remote workspace, so every create lands twice and
+/// the only outward sign is doubled log lines. Uses `ps` rather than /proc so
+/// it works on macOS as well as Linux.
+fn other_daemon_pids(skip: Option<i32>) -> Vec<i32> {
+    let me = std::process::id() as i32;
+    let Ok(out) = std::process::Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, args) = line.trim().split_once(' ')?;
+            let pid: i32 = pid.trim().parse().ok()?;
+            if pid == me || Some(pid) == skip {
+                return None;
+            }
+            let mut words = args.split_whitespace();
+            let bin = words.next()?;
+            // argv[0] is our binary and argv[1] is exactly `daemon`, so a
+            // `pane` streamer or someone's grep never matches
+            let is_ours = std::path::Path::new(bin)
+                .file_name()
+                .is_some_and(|f| f.to_string_lossy().starts_with("herdr-mirror"));
+            (is_ours && words.next() == Some("daemon")).then_some(pid)
+        })
+        .collect()
+}
+
 pub fn cmd_pause(env: &Env) {
     // sticky: mirrors stay, only the sync loop halts; resume with start
     set_paused(env, true);
-    match running_pid(env) {
+    let tracked = running_pid(env);
+    match tracked {
         None => println!("mirror daemon already stopped; paused (won't autostart until you run start)"),
         Some(pid) => {
             unsafe { libc::kill(pid, libc::SIGTERM) };
             println!("paused mirror daemon (pid {pid}); mirrors stay, resume with start");
         }
+    }
+    // Stop the ones the pidfile never knew about too. Leaving one behind is the
+    // whole failure this guards against: it keeps mirroring while status says
+    // stopped, and the next start puts a second daemon beside it.
+    for pid in other_daemon_pids(tracked) {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        println!("also stopped untracked mirror daemon (pid {pid})");
     }
 }
 
@@ -732,7 +783,13 @@ pub fn cmd_ensure(env: &Env) {
 
 pub fn cmd_status(env: &Env) -> Result<()> {
     match running_pid(env) {
-        Some(pid) => println!("daemon: running (pid {pid})"),
+        Some(pid) => {
+            println!("daemon: running (pid {pid})");
+            for other in other_daemon_pids(Some(pid)) {
+                println!("  WARNING: a second, untracked mirror daemon is running (pid {other})");
+                println!("  every remote workspace is being mirrored twice; `herdr-mirror pause` stops both");
+            }
+        }
         None => println!(
             "daemon: not running{}",
             if is_paused(env) { " (paused — resume with start)" } else { "" }
