@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -245,6 +246,19 @@ pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> Pat
     state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
 }
 
+/// How long a `.pending` claim may block another launch. The retype loop is
+/// 3s+4s+4s; anything older is leftover from a crashed or abandoned attempt
+/// and must not freeze heal forever.
+const SPAWN_PENDING_TTL: Duration = Duration::from_secs(30);
+
+fn pending_is_fresh(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < SPAWN_PENDING_TTL)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamerSpawnClaim {
     Claimed,
@@ -278,8 +292,9 @@ pub fn pane_streamer_alive(state_dir: &Path, local_pane_id: &str) -> bool {
 /// Claim the right to type one streamer launcher into a local pane.
 ///
 /// The pidfile protects an active streamer. The exclusive pending file closes
-/// the startup interval before the streamer can publish its pid. A stale claim
-/// leaves a visible shell instead of risking input in a live remote terminal.
+/// the startup interval before the streamer can publish its pid. A claim older
+/// than `SPAWN_PENDING_TTL` is treated as abandoned so a later heal can type
+/// again (session-restore after a spawn that never published a pid).
 pub fn claim_streamer_spawn(
     state_dir: &Path,
     ssh_target: &str,
@@ -296,24 +311,32 @@ pub fn claim_streamer_spawn(
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut claim = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(StreamerSpawnClaim::Pending);
-        }
-        Err(e) => return Err(e),
-    };
-    writeln!(claim, "{ssh_target} {pane_target}")?;
+    // one retry: a stale file we just unlinked can lose create_new to a racer
+    for _ in 0..2 {
+        let mut claim = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if pending_is_fresh(&path) {
+                    return Ok(StreamerSpawnClaim::Pending);
+                }
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        writeln!(claim, "{ssh_target} {pane_target}")?;
 
-    // A streamer from an earlier launch can publish its pid between the first
-    // check and our claim. Its pid wins, and its startup removes this claim.
-    if streamer_alive(state_dir, ssh_target, pane_target)
-        || pane_streamer_alive(state_dir, local_pane_id)
-    {
-        let _ = fs::remove_file(path);
-        return Ok(StreamerSpawnClaim::Active);
+        // A streamer from an earlier launch can publish its pid between the first
+        // check and our claim. Its pid wins, and its startup removes this claim.
+        if streamer_alive(state_dir, ssh_target, pane_target)
+            || pane_streamer_alive(state_dir, local_pane_id)
+        {
+            let _ = fs::remove_file(&path);
+            return Ok(StreamerSpawnClaim::Active);
+        }
+        return Ok(StreamerSpawnClaim::Claimed);
     }
-    Ok(StreamerSpawnClaim::Claimed)
+    Ok(StreamerSpawnClaim::Pending)
 }
 
 pub fn clear_streamer_spawn_pending(state_dir: &Path, local_pane_id: &str) {
@@ -413,6 +436,29 @@ mod tests {
             StreamerSpawnClaim::Pending
         );
         clear_streamer_spawn_pending(&state_dir, "w2:p2");
+        assert_eq!(
+            claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
+            StreamerSpawnClaim::Claimed
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn a_stale_pending_claim_can_be_replaced() {
+        let state_dir = test_state_dir("stale-pending");
+        let path = streamer_spawn_pending_path(&state_dir, "w2:p2");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "host w1:p1\n").unwrap();
+        let past = std::time::SystemTime::now()
+            .checked_sub(SPAWN_PENDING_TTL + Duration::from_secs(1))
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let times = libc::utimbuf { actime: past, modtime: past };
+        assert_eq!(unsafe { libc::utime(cpath.as_ptr(), &times) }, 0);
+
         assert_eq!(
             claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
             StreamerSpawnClaim::Claimed

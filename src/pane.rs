@@ -1407,13 +1407,12 @@ impl Drop for PidfileGuard {
 pub async fn run(args: Args) -> Result<()> {
     let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
+    let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
 
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
     // daemon-spawned streamer, so it must not claim the slot
     let _pidfile = (!args.dump).then(|| {
-        let state_dir =
-            crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
         let path =
             crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
         if let Some(dir) = path.parent() {
@@ -1426,10 +1425,7 @@ pub async fn run(args: Args) -> Result<()> {
     // at least one guard, even while herdr's process snapshot catches up.
     if _pidfile.is_some() {
         if let Some(id) = &local_pane_id {
-            crate::util::clear_streamer_spawn_pending(
-                &crate::util::home_dir().join(".local").join("state").join("herdr-mirror"),
-                id,
-            );
+            crate::util::clear_streamer_spawn_pending(&state_dir, id);
         }
     }
 
@@ -1438,7 +1434,6 @@ pub async fn run(args: Args) -> Result<()> {
     // is talking about and no way to write to it; this is how a hook reaches
     // the streamer sitting in that pane. HERDR_PANE_ID comes from herdr itself
     // and is inherited by whatever it starts in a pane, which is us.
-    let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
     let _pane_pidfile = local_pane_id.as_deref().map(|id| {
         let path = crate::util::pane_pid_path(&state_dir, id);
         if let Some(dir) = path.parent() {

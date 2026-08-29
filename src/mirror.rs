@@ -732,6 +732,7 @@ pub(crate) async fn spawn_streamer_pane(
                 .await
                 .is_err()
             {
+                crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
                 return; // pane gone (closed meanwhile) — nothing to heal
             }
         }
@@ -739,6 +740,7 @@ pub(crate) async fn spawn_streamer_pane(
         if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
             && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
         {
+            crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
             log.log(&format!(
                 "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
             ));
