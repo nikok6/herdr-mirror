@@ -684,7 +684,8 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         println!("mirror daemon already running");
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::self_exe_path()
+        .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn"))?;
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)

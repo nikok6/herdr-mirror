@@ -442,9 +442,7 @@ pub(crate) fn cmd_for_pane(
     state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
 ) -> impl Fn(&str) -> Vec<String> {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "herdr-mirror".into());
+    let exe = crate::util::self_exe();
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let session = host.session.clone();
