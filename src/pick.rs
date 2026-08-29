@@ -1151,15 +1151,15 @@ mod tests {
 
     #[test]
     fn reads_aliases_skips_patterns_and_keeps_file_order() {
-        let cfg = "Host ts-ubuntu
+        let cfg = "Host build-box
   HostName 10.0.0.1
 # a comment line
-Host portatil portatil-wsl
-  User diego
+Host laptop laptop-wsl
+  User someone
 Host *
   ServerAliveInterval 30
 Host bad*glob
-Host ts-ubuntu
+Host build-box
 HOST shouty
    host  indented-and-lowercase
 Host with#hash
@@ -1167,9 +1167,9 @@ Host with#hash
         assert_eq!(
             parse_ssh_config_hosts(cfg),
             vec![
-                "ts-ubuntu",
-                "portatil",
-                "portatil-wsl",
+                "build-box",
+                "laptop",
+                "laptop-wsl",
                 "shouty",
                 "indented-and-lowercase",
                 "with",
