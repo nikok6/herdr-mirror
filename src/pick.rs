@@ -27,6 +27,7 @@ const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
 const PICK_TITLE: &str = "New workspace on...";
 const ADD_TITLE: &str = "Add a machine from ~/.ssh/config";
 const ADD_ROW: &str = "+ add a machine...";
+const BACK_ROW: &str = "< back";
 
 /// Plugin-action leg: open the popup that runs the menu below.
 pub async fn summon(env: Env) -> Result<()> {
@@ -591,17 +592,27 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
     rows.push(Row { main: ADD_ROW.into(), sub: "reads ~/.ssh/config".into() });
     let add_idx = rows.len() - 1;
 
-    let choice = run_menu(&rows, PICK_TITLE, config_note.as_deref())?;
-    let outcome = match choice {
-        None => {
-            println!("cancelled");
-            Ok(())
+    // Looped, so leaving the add-a-machine menu returns HERE rather than
+    // dropping the popup. Backing out of a submenu is not the same gesture as
+    // cancelling the whole thing, and making one mean the other costs a
+    // re-summon every time you open the wrong menu.
+    let (choice, outcome) = loop {
+        let choice = run_menu(&rows, PICK_TITLE, false, config_note.as_deref())?;
+        match choice {
+            None => {
+                println!("cancelled");
+                break (choice, Ok(()));
+            }
+            Some(0) => break (choice, rt.block_on(create_local(&env))),
+            // BEFORE the hosts[i - 1] arm: the add row is not a host, and
+            // indexing the host list with it would panic
+            Some(i) if i == add_idx => match rt.block_on(add_machine(&env, &hosts)) {
+                Ok(Nav::Back) => continue,
+                Ok(Nav::Done) => break (choice, Ok(())),
+                Err(e) => break (choice, Err(e)),
+            },
+            Some(i) => break (choice, rt.block_on(create_remote(&env, hosts[i - 1].clone()))),
         }
-        Some(0) => rt.block_on(create_local(&env)),
-        // BEFORE the hosts[i - 1] arm: the add row is not a host, and indexing
-        // the host list with it would panic
-        Some(i) if i == add_idx => rt.block_on(add_machine(&env, &hosts)),
-        Some(i) => rt.block_on(create_remote(&env, hosts[i - 1].clone())),
     };
     if let Err(e) = &outcome {
         println!("failed: {e}");
@@ -611,6 +622,12 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(1200));
     }
     outcome
+}
+
+/// Whether a submenu finished the job or wants the caller to redraw itself.
+enum Nav {
+    Done,
+    Back,
 }
 
 async fn create_local(env: &Env) -> Result<()> {
@@ -733,20 +750,24 @@ fn parse_ssh_config_hosts(text: &str) -> Vec<String> {
 
 /// Second leg of the picker: choose an ssh alias, PROVE it works, write it to
 /// hosts.toml, then open a workspace on it.
-async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<()> {
+async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
     let known: std::collections::HashSet<&str> =
         existing.iter().flat_map(|h| [h.name.as_str(), h.target.as_str()]).collect();
     let candidates: Vec<String> =
         ssh_config_hosts().into_iter().filter(|a| !known.contains(a.as_str())).collect();
     if candidates.is_empty() {
         println!("nothing to add: every Host in ~/.ssh/config is already configured");
-        return Ok(());
+        return Ok(Nav::Back);
     }
-    let rows: Vec<Row> =
+    let mut rows: Vec<Row> =
         candidates.iter().map(|c| Row { main: c.clone(), sub: String::new() }).collect();
-    let Some(i) = run_menu(&rows, ADD_TITLE, None)? else {
-        println!("cancelled");
-        return Ok(());
+    rows.push(Row { main: BACK_ROW.into(), sub: "return to the host list".into() });
+    let back_idx = rows.len() - 1;
+    // Esc backs out one level here rather than closing the popup: this menu was
+    // itself reached by a choice, so the thing to undo is that choice.
+    let choice = run_menu(&rows, ADD_TITLE, true, None)?;
+    let Some(i) = choice.filter(|i| *i != back_idx) else {
+        return Ok(Nav::Back);
     };
     let target = candidates[i].clone();
 
@@ -769,7 +790,7 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<()> {
     }
     if let Err(e) = probe {
         println!("not added -- {target}: {e}");
-        return Ok(());
+        return Ok(Nav::Back);
     }
 
     append_host(env, &target)?;
@@ -784,7 +805,7 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<()> {
             "{target} was written to hosts.toml but did not parse back"
         )));
     };
-    create_remote(env, added).await
+    create_remote(env, added).await.map(|()| Nav::Done)
 }
 
 /// A plain ssh host, used only to probe a candidate before it is written.
@@ -826,7 +847,7 @@ fn append_host(env: &Env, target: &str) -> Result<()> {
 // --- the menu itself -------------------------------------------------------
 
 /// Returns the selected row index, or None on cancel.
-fn run_menu(rows: &[Row], title: &str, note: Option<&str>) -> Result<Option<usize>> {
+fn run_menu(rows: &[Row], title: &str, esc_goes_back: bool, note: Option<&str>) -> Result<Option<usize>> {
     let _raw = RawMode::enable();
     let mut out = std::io::stdout().lock();
     let mut sel = 0usize;
@@ -846,7 +867,7 @@ fn run_menu(rows: &[Row], title: &str, note: Option<&str>) -> Result<Option<usiz
     let _ = out.write_all(b"\x1b[?25l\x1b[?1000h\x1b[?1006h");
 
     loop {
-        draw(&mut out, rows, sel, title, note);
+        draw(&mut out, rows, sel, title, esc_goes_back, note);
         match read_key()? {
             Key::Up => sel = sel.checked_sub(1).unwrap_or(rows.len() - 1),
             Key::Down => sel = (sel + 1) % rows.len(),
@@ -883,8 +904,9 @@ fn run_menu(rows: &[Row], title: &str, note: Option<&str>) -> Result<Option<usiz
 /// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
 
-fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, note: Option<&str>) {
+fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, esc_goes_back: bool, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
+    let esc = if esc_goes_back { "esc back" } else { "esc cancel" };
     let cols = term_cols();
     let name_w = rows.iter().map(|r| r.main.len()).max().unwrap_or(0);
     let rule_w = cols.saturating_sub(8).min(60);
@@ -914,7 +936,7 @@ fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, note: Optio
         }
     }
     let _ = write!(out, "\r\n    \x1b[2m{}\x1b[0m\r\n", "─".repeat(rule_w));
-    let _ = write!(out, "    \x1b[2mclick or enter pick - up/down move - esc cancel\x1b[0m\r\n");
+    let _ = write!(out, "    \x1b[2mclick or enter pick - up/down move - {esc}\x1b[0m\r\n");
     if let Some(n) = note {
         let _ = write!(out, "    \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
     }
