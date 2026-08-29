@@ -1415,6 +1415,9 @@ impl App {
         }
         if let Some((start, end)) = copy_span {
             let text = self.grid.selection_text(start, end);
+            // Copy-on-select matches herdr's native lifecycle: the highlight
+            // disappears as soon as the release has been copied.
+            sel_changed |= self.select.clear();
             match crate::select::osc52(&text) {
                 // no hint on success: herdr shows its own "copied to clipboard"
                 // toast when it takes the OSC 52, so ours would be a duplicate
