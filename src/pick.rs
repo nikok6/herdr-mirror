@@ -24,6 +24,9 @@ use crate::remote::RemoteHost;
 use crate::util::{Env, Result};
 
 const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
+const PICK_TITLE: &str = "New workspace on...";
+const ADD_TITLE: &str = "Add a machine from ~/.ssh/config";
+const ADD_ROW: &str = "+ add a machine...";
 
 /// Plugin-action leg: open the popup that runs the menu below.
 pub async fn summon(env: Env) -> Result<()> {
@@ -56,7 +59,7 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
         "width": widest.clamp(58, 90),
         // +2 for herdr's border, +1 so the hint line's trailing newline has
         // somewhere to go, +1 for the optional hosts.toml note
-        "height": (n_hosts + 13).max(14),
+        "height": (n_hosts + 14).max(15),
         "focus": true,
         "env": {},
     });
@@ -585,13 +588,19 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
         rows.push(Row { main: h.name.clone(), sub });
     }
 
-    let choice = run_menu(&rows, config_note.as_deref())?;
+    rows.push(Row { main: ADD_ROW.into(), sub: "reads ~/.ssh/config".into() });
+    let add_idx = rows.len() - 1;
+
+    let choice = run_menu(&rows, PICK_TITLE, config_note.as_deref())?;
     let outcome = match choice {
         None => {
             println!("cancelled");
             Ok(())
         }
         Some(0) => rt.block_on(create_local(&env)),
+        // BEFORE the hosts[i - 1] arm: the add row is not a host, and indexing
+        // the host list with it would panic
+        Some(i) if i == add_idx => rt.block_on(add_machine(&env, &hosts)),
         Some(i) => rt.block_on(create_remote(&env, hosts[i - 1].clone())),
     };
     if let Err(e) = &outcome {
@@ -682,10 +691,142 @@ async fn local_workspace_ids(api: &ApiClient) -> Result<std::collections::HashSe
         .unwrap_or_default())
 }
 
+// --- adding a machine from ~/.ssh/config -----------------------------------
+
+/// `Host` aliases from ~/.ssh/config, in file order.
+///
+/// Patterns are skipped: `*`, `?` and `!` describe a matching RULE, not a
+/// machine you can ssh to by name. Aliases carrying a quote or backslash are
+/// skipped rather than escaped -- they cannot be written as a TOML key without
+/// escaping bugs, and nobody names a host that way on purpose.
+fn ssh_config_hosts() -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(std::path::Path::new(&home).join(".ssh/config")) else {
+        return Vec::new();
+    };
+    parse_ssh_config_hosts(&text)
+}
+
+/// Split out from the file read so the parsing rules are testable.
+fn parse_ssh_config_hosts(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut words = line.split_whitespace();
+        if !words.next().is_some_and(|k| k.eq_ignore_ascii_case("host")) {
+            continue;
+        }
+        for alias in words {
+            // a backslash cannot appear in a bare TOML key either; compared as a
+            // byte so the source carries no escape to get mangled
+            if alias.contains(['*', '?', '!', '"']) || alias.as_bytes().contains(&92) {
+                continue;
+            }
+            if seen.insert(alias.to_string()) {
+                out.push(alias.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Second leg of the picker: choose an ssh alias, PROVE it works, write it to
+/// hosts.toml, then open a workspace on it.
+async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<()> {
+    let known: std::collections::HashSet<&str> =
+        existing.iter().flat_map(|h| [h.name.as_str(), h.target.as_str()]).collect();
+    let candidates: Vec<String> =
+        ssh_config_hosts().into_iter().filter(|a| !known.contains(a.as_str())).collect();
+    if candidates.is_empty() {
+        println!("nothing to add: every Host in ~/.ssh/config is already configured");
+        return Ok(());
+    }
+    let rows: Vec<Row> =
+        candidates.iter().map(|c| Row { main: c.clone(), sub: String::new() }).collect();
+    let Some(i) = run_menu(&rows, ADD_TITLE, None)? else {
+        println!("cancelled");
+        return Ok(());
+    };
+    let target = candidates[i].clone();
+
+    // Prove it before writing. ~/.ssh/config lists every machine the user can
+    // REACH, not every machine that can mirror: a Windows box and the WSL inside
+    // it are two aliases and only one of them runs herdr. An entry that can
+    // never work would otherwise sit in the picker forever, and the picker is
+    // the one place that cannot afford a row that lies.
+    println!("checking {target}...");
+    let mut remote = RemoteHost::new(&ssh_host(&target), &env.state_dir);
+    let mut probe = remote.connect_api().await;
+    if probe.is_err() {
+        // First contact with a host that has no live ControlMaster can fail
+        // spuriously -- the control socket does not exist yet, and a multi-hop
+        // ProxyCommand target takes seconds to answer, which surfaces as
+        // "remote herdr server is not running" while it is running perfectly.
+        // A host's first ever use is the worst moment to be strict.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        probe = remote.connect_api().await;
+    }
+    if let Err(e) = probe {
+        println!("not added -- {target}: {e}");
+        return Ok(());
+    }
+
+    append_host(env, &target)?;
+    println!("added {target} to hosts.toml");
+
+    // Re-read rather than reuse the probe's hand-built config, so the workspace
+    // opened now uses exactly the HostConfig every later run will parse. It also
+    // proves the block just appended round-trips.
+    let cfg = load_config(&env.config_search)?;
+    let Some(added) = cfg.hosts.iter().find(|h| h.name == target).cloned() else {
+        return Err(crate::util::err(format!(
+            "{target} was written to hosts.toml but did not parse back"
+        )));
+    };
+    create_remote(env, added).await
+}
+
+/// A plain ssh host, used only to probe a candidate before it is written.
+fn ssh_host(target: &str) -> HostConfig {
+    HostConfig {
+        name: target.to_string(),
+        target: target.to_string(),
+        kind: crate::config::HostKind::Ssh,
+        docker_bin: "docker".into(),
+        prefix: target.to_string(),
+        remote_bin: None,
+        session: None,
+        api_transport: crate::config::ApiTransport::Auto,
+        always_control: false,
+        max_cols: None,
+        max_rows: None,
+    }
+}
+
+/// Append a host block to whichever hosts.toml the config actually came from,
+/// creating the file if there is none yet.
+///
+/// The key is always QUOTED. ssh aliases legally contain dots, and a bare
+/// `[hosts.my.host]` nests a table instead of naming a host -- producing a
+/// config that parses fine and contains no such host in it.
+fn append_host(env: &Env, target: &str) -> Result<()> {
+    let path = load_config(&env.config_search)
+        .ok()
+        .and_then(|c| c.source)
+        .unwrap_or_else(|| crate::util::default_config_dir().join("hosts.toml"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(f, "\n[hosts.\"{target}\"]\ntarget = \"{target}\"")?;
+    Ok(())
+}
+
 // --- the menu itself -------------------------------------------------------
 
 /// Returns the selected row index, or None on cancel.
-fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
+fn run_menu(rows: &[Row], title: &str, note: Option<&str>) -> Result<Option<usize>> {
     let _raw = RawMode::enable();
     let mut out = std::io::stdout().lock();
     let mut sel = 0usize;
@@ -705,7 +846,7 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
     let _ = out.write_all(b"\x1b[?25l\x1b[?1000h\x1b[?1006h");
 
     loop {
-        draw(&mut out, rows, sel, note);
+        draw(&mut out, rows, sel, title, note);
         match read_key()? {
             Key::Up => sel = sel.checked_sub(1).unwrap_or(rows.len() - 1),
             Key::Down => sel = (sel + 1) % rows.len(),
@@ -742,13 +883,13 @@ fn run_menu(rows: &[Row], note: Option<&str>) -> Result<Option<usize>> {
 /// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
 
-fn draw(out: &mut impl Write, rows: &[Row], sel: usize, note: Option<&str>) {
+fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, note: Option<&str>) {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
     let cols = term_cols();
     let name_w = rows.iter().map(|r| r.main.len()).max().unwrap_or(0);
     let rule_w = cols.saturating_sub(8).min(60);
     let _ = out.write_all(b"\x1b[2J\x1b[H");
-    let _ = write!(out, "\r\n\r\n    \x1b[1mNew workspace on...\x1b[0m\r\n");
+    let _ = write!(out, "\r\n\r\n    \x1b[1m{title}\x1b[0m\r\n");
     let _ = write!(out, "    \x1b[2m{}\x1b[0m\r\n\r\n", "─".repeat(rule_w));
     for (i, row) in rows.iter().enumerate() {
         // Absolute, not "wherever the line feeds landed". The popup used to
@@ -979,5 +1120,49 @@ mod cwd_tests {
         let all = api.request("workspace.list", json!({})).await.unwrap();
         assert!(all["workspaces"].as_array().unwrap().iter().any(|w| w["workspace_id"] == id));
         api.request("workspace.close", json!({"workspace_id": id})).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ssh_config_hosts;
+
+    #[test]
+    fn reads_aliases_skips_patterns_and_keeps_file_order() {
+        let cfg = "Host ts-ubuntu
+  HostName 10.0.0.1
+# a comment line
+Host portatil portatil-wsl
+  User diego
+Host *
+  ServerAliveInterval 30
+Host bad*glob
+Host ts-ubuntu
+HOST shouty
+   host  indented-and-lowercase
+Host with#hash
+";
+        assert_eq!(
+            parse_ssh_config_hosts(cfg),
+            vec![
+                "ts-ubuntu",
+                "portatil",
+                "portatil-wsl",
+                "shouty",
+                "indented-and-lowercase",
+                "with",
+            ],
+            "one Host line can name several aliases; patterns, comments and              duplicates drop out; matching is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn no_hosts_at_all_is_empty_not_a_panic() {
+        assert!(parse_ssh_config_hosts("").is_empty());
+        assert!(parse_ssh_config_hosts("HostName 1.2.3.4
+User bob
+").is_empty());
+        assert!(parse_ssh_config_hosts("Host
+").is_empty(), "a bare Host names nothing");
     }
 }
