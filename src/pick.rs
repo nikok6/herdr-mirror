@@ -710,42 +710,105 @@ async fn local_workspace_ids(api: &ApiClient) -> Result<std::collections::HashSe
 
 // --- adding a machine from ~/.ssh/config -----------------------------------
 
-/// `Host` aliases from ~/.ssh/config, in file order.
+/// Aliases from ~/.ssh/config, following `Include` the way ssh does.
+///
+/// Reading only the top file is wrong the moment anyone splits their config,
+/// which is the normal way to organise one: the missing machines simply never
+/// appear in the picker and nothing says why.
+fn ssh_config_hosts() -> Vec<String> {
+    let Ok(home) = std::env::var("HOME") else { return Vec::new() };
+    let home = std::path::PathBuf::from(home);
+    let ssh_dir = home.join(".ssh");
+
+    let mut queue = std::collections::VecDeque::from([ssh_dir.join("config")]);
+    let mut visited = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    // Breadth-first so the main file's hosts come first, and bounded twice over:
+    // a config that includes itself (directly or in a ring) must not spin here,
+    // and neither must a directory full of files.
+    while let Some(path) = queue.pop_front() {
+        if visited.len() >= 64 || !visited.insert(path.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let (hosts, includes) = parse_ssh_config_file(&text);
+        for alias in hosts {
+            if seen.insert(alias.clone()) {
+                out.push(alias);
+            }
+        }
+        for pattern in includes {
+            queue.extend(expand_include(&pattern, &home, &ssh_dir));
+        }
+    }
+    out
+}
+
+/// One config file's aliases and its `Include` patterns. Pure, so the rules
+/// stay testable without touching the filesystem.
 ///
 /// Patterns are skipped: `*`, `?` and `!` describe a matching RULE, not a
 /// machine you can ssh to by name. Aliases carrying a quote or backslash are
 /// skipped rather than escaped -- they cannot be written as a TOML key without
 /// escaping bugs, and nobody names a host that way on purpose.
-fn ssh_config_hosts() -> Vec<String> {
-    let Ok(home) = std::env::var("HOME") else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(std::path::Path::new(&home).join(".ssh/config")) else {
-        return Vec::new();
-    };
-    parse_ssh_config_hosts(&text)
-}
-
-/// Split out from the file read so the parsing rules are testable.
-fn parse_ssh_config_hosts(text: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
+fn parse_ssh_config_file(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut hosts = Vec::new();
+    let mut includes = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let mut words = line.split_whitespace();
-        if !words.next().is_some_and(|k| k.eq_ignore_ascii_case("host")) {
-            continue;
-        }
-        for alias in words {
-            // a backslash cannot appear in a bare TOML key either; compared as a
-            // byte so the source carries no escape to get mangled
-            if alias.contains(['*', '?', '!', '"']) || alias.as_bytes().contains(&92) {
-                continue;
+        let Some(keyword) = words.next() else { continue };
+        if keyword.eq_ignore_ascii_case("host") {
+            for alias in words {
+                // a backslash cannot appear in a bare TOML key either; compared
+                // as a byte so the source carries no escape to get mangled
+                if alias.contains(['*', '?', '!', '"']) || alias.as_bytes().contains(&92) {
+                    continue;
+                }
+                hosts.push(alias.to_string());
             }
-            if seen.insert(alias.to_string()) {
-                out.push(alias.to_string());
-            }
+        } else if keyword.eq_ignore_ascii_case("include") {
+            includes.extend(words.map(str::to_string));
         }
     }
-    out
+    (hosts, includes)
+}
+
+/// Resolve one `Include` pattern to real files. ssh allows several patterns per
+/// line, `~` for home, paths relative to ~/.ssh, and a glob. There is no glob
+/// crate here, so `*` is handled in the final component, which is where it is
+/// actually used (`Include config.d/*.conf`).
+fn expand_include(
+    pattern: &str,
+    home: &std::path::Path,
+    ssh_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let path = if let Some(rest) = pattern.strip_prefix("~/") {
+        home.join(rest)
+    } else if std::path::Path::new(pattern).is_absolute() {
+        std::path::PathBuf::from(pattern)
+    } else {
+        ssh_dir.join(pattern)
+    };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Vec::new() };
+    let Some((prefix, suffix)) = name.split_once('*') else { return vec![path] };
+    let Some(dir) = path.parent() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.len() >= prefix.len() + suffix.len()
+                && n.starts_with(prefix)
+                && n.ends_with(suffix)
+        })
+        .map(|e| e.path())
+        .collect();
+    found.sort(); // read_dir order is arbitrary; the menu should not be
+    found
 }
 
 /// Second leg of the picker: choose an ssh alias, PROVE it works, write it to
@@ -1147,7 +1210,7 @@ mod cwd_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ssh_config_hosts;
+    use super::{expand_include, parse_ssh_config_file};
 
     #[test]
     fn reads_aliases_skips_patterns_and_keeps_file_order() {
@@ -1165,26 +1228,70 @@ HOST shouty
 Host with#hash
 ";
         assert_eq!(
-            parse_ssh_config_hosts(cfg),
+            parse_ssh_config_file(cfg).0,
             vec![
                 "build-box",
                 "laptop",
                 "laptop-wsl",
+                "build-box",
                 "shouty",
                 "indented-and-lowercase",
                 "with",
             ],
-            "one Host line can name several aliases; patterns, comments and              duplicates drop out; matching is case-insensitive"
+            "one Host line can name several aliases; patterns and comments drop              out and the keyword is case-insensitive. Repeats are KEPT here on              purpose: dedup belongs to the caller, which has to collapse them              across included files too, not just within one"
+        );
+    }
+
+    #[test]
+    fn include_resolves_globs_relative_paths_and_tilde() {
+        let base = std::env::temp_dir().join(format!("hm-ssh-{}", std::process::id()));
+        let ssh = base.join(".ssh");
+        let d = ssh.join("config.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("10-work.conf"), "Host work
+").unwrap();
+        std::fs::write(d.join("20-home.conf"), "Host home
+").unwrap();
+        // must be ignored: the glob asks for *.conf
+        std::fs::write(d.join("notes.txt"), "Host ignored
+").unwrap();
+
+        let got = expand_include("config.d/*.conf", &base, &ssh);
+        assert_eq!(got, vec![d.join("10-work.conf"), d.join("20-home.conf")], "sorted, .txt excluded");
+
+        // ~ and absolute forms resolve too
+        assert_eq!(expand_include("~/x", &base, &ssh), vec![base.join("x")]);
+        assert_eq!(expand_include("/etc/y", &base, &ssh), vec![std::path::PathBuf::from("/etc/y")]);
+        // a relative literal hangs off ~/.ssh, like ssh does
+        assert_eq!(expand_include("extra", &base, &ssh), vec![ssh.join("extra")]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn include_lines_are_collected_separately_from_hosts() {
+        let (hosts, includes) = parse_ssh_config_file(
+            "Host a
+Include config.d/*.conf other
+  include ~/more
+Host b
+",
+        );
+        assert_eq!(hosts, vec!["a", "b"]);
+        assert_eq!(
+            includes,
+            vec!["config.d/*.conf", "other", "~/more"],
+            "one Include line may name several patterns; the keyword is case-insensitive"
         );
     }
 
     #[test]
     fn no_hosts_at_all_is_empty_not_a_panic() {
-        assert!(parse_ssh_config_hosts("").is_empty());
-        assert!(parse_ssh_config_hosts("HostName 1.2.3.4
+        assert!(parse_ssh_config_file("").0.is_empty());
+        assert!(parse_ssh_config_file("HostName 1.2.3.4
 User bob
-").is_empty());
-        assert!(parse_ssh_config_hosts("Host
-").is_empty(), "a bare Host names nothing");
+").0.is_empty());
+        assert!(parse_ssh_config_file("Host
+").0.is_empty(), "a bare Host names nothing");
     }
 }
