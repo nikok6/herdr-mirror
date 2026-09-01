@@ -16,6 +16,19 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
+/// herdr's own config.toml — same precedence herdr's config_path() uses.
+pub fn herdr_config_path() -> PathBuf {
+    if let Ok(p) = std::env::var("HERDR_CONFIG_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr/config.toml"),
+        _ => home_dir().join(".config/herdr/config.toml"),
+    }
+}
+
 /// Resolved runtime environment. Config is searched across candidate dirs so
 /// shell and plugin-action invocations agree (see `config_candidates`); state
 /// is ALWAYS the fixed path so both share one id map and pidfile.

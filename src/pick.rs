@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::api::ApiClient;
 use crate::config::{load_config, HostConfig};
 use crate::remote::RemoteHost;
-use crate::util::{Env, Result};
+use crate::util::{herdr_config_path, home_dir, Env, Result};
 
 const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
 
@@ -243,7 +243,7 @@ async fn intercept_workspace(
     }) else {
         return Ok(());
     };
-    if !is_bare_placeholder(p, placeholder) {
+    if !is_bare_placeholder(p, placeholder, fixed_new_cwd().as_deref()) {
         return Ok(());
     }
 
@@ -251,9 +251,28 @@ async fn intercept_workspace(
     open_popup(api, env).await
 }
 
-fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path) -> bool {
+fn is_bare_placeholder(pane: &Value, placeholder: &std::path::Path, fixed_cwd: Option<&str>) -> bool {
+    let cwd = pane.get("cwd").and_then(Value::as_str);
     pane.get("agent").is_none_or(Value::is_null)
-        && pane.get("cwd").and_then(Value::as_str) == placeholder.to_str()
+        && (cwd == placeholder.to_str() || (cwd.is_some() && cwd == fixed_cwd))
+}
+
+/// A fixed `[terminal] new_cwd` in herdr's config means a native create inside
+/// a mirror lands THERE, not in the `.mirror-pane` placeholder — so that path
+/// is an equally valid junk marker. "follow" and "current" keep the intercept
+/// placeholder-only; "home" and `~/` expand against $HOME, matching herdr.
+fn fixed_new_cwd() -> Option<String> {
+    let text = std::fs::read_to_string(herdr_config_path()).ok()?;
+    let value: toml::Value = text.parse().ok()?;
+    let cwd = value.get("terminal")?.get("new_cwd")?.as_str()?;
+    match cwd {
+        "follow" | "current" => None,
+        "home" => home_dir().to_str().map(str::to_string),
+        p => match p.strip_prefix("~/") {
+            Some(rest) => home_dir().join(rest).to_str().map(str::to_string),
+            None => Some(p.to_string()),
+        },
+    }
 }
 
 /// The tab and split arms share their discovery: the focused workspace must
@@ -343,6 +362,7 @@ async fn intercept_in_mirror(
     // The junk is the object the event named, if it still qualifies — never
     // "the first unmapped placeholder we can find". Scanning is what let a
     // leftover pane become a target for an unrelated later event.
+    let fixed_cwd = fixed_new_cwd();
     let junk = all.iter().find(|p| {
         let pid = p.get("pane_id").and_then(Value::as_str).unwrap_or("");
         let named = if what == "tab" {
@@ -350,7 +370,7 @@ async fn intercept_in_mirror(
         } else {
             pid == target
         };
-        named && !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder)
+        named && !mapped_panes.contains(pid) && is_bare_placeholder(p, placeholder, fixed_cwd.as_deref())
     });
     let Some(junk) = junk else { return Ok(()) };
     let junk_id = junk.get("pane_id").and_then(Value::as_str).unwrap_or("").to_string();

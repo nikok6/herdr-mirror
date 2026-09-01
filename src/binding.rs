@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::config::load_config;
 use crate::remote::RemoteHost;
-use crate::util::{err, home_dir, Env, Result};
+use crate::util::{err, herdr_config_path, Env, Result};
 
 /// The stable CLI path install.sh links; used verbatim in written bindings so
 /// they don't depend on the login-sh PATH (see the README's Remote plugin
@@ -26,19 +26,6 @@ use crate::util::{err, home_dir, Env, Result};
 const CLI_PATH: &str = "~/.local/bin/herdr-mirror";
 
 const MARKER: &str = "# herdr-mirror bind:";
-
-fn herdr_config_path() -> PathBuf {
-    // same precedence herdr's own config_path() uses
-    if let Ok(p) = std::env::var("HERDR_CONFIG_PATH") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("herdr/config.toml"),
-        _ => home_dir().join(".config/herdr/config.toml"),
-    }
-}
 
 /// herdr constrains plugin/action ids to this charset at manifest load; a
 /// spec is such ids joined by dots. Enforcing it here keeps a hostile or
