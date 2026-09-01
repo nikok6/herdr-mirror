@@ -339,12 +339,17 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     let (api, _status) = remote.connect_api().await?;
 
     // cwd inheritance comes from the REMOTE side: the remote pane behind the
-    // focused mirror pane knows its real cwd; local cwds are meaningless there
+    // focused mirror pane knows its real cwd; local cwds are meaningless
+    // there. Only splits inherit it — a tab or workspace passes no cwd at
+    // all, so the remote's own `[terminal] new_cwd` policy decides, matching
+    // pick.rs ("the remote's default is right, local paths are not").
     let mut cwd: Option<String> = None;
-    if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
-        let snap = fetch_snapshot(&api).await?;
-        if let Some(pane) = snap.panes.iter().find(|p| p.pane_id == pane_id) {
-            cwd = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone());
+    if kind == "split" {
+        if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
+            let snap = fetch_snapshot(&api).await?;
+            if let Some(pane) = snap.panes.iter().find(|p| p.pane_id == pane_id) {
+                cwd = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone());
+            }
         }
     }
 
