@@ -231,21 +231,34 @@ pub fn workspace_cwds(snapshot: &Snapshot) -> HashMap<String, String> {
 
 /// Map a measured repo onto the `$mgit_*` token set. Null values clear a
 /// token, so exactly one of clean/dirty/conflict can ever render.
-pub fn tokens_for(info: &GitInfo) -> Map<String, Value> {
+///
+/// `include_identity`: on LOCAL workspaces herdr's built-in `branch` and
+/// `git_status` tokens already render the same branch and ahead/behind from
+/// its own git discovery — reporting `$mgit_branch`/`$mgit_ab` there shows
+/// the branch twice on one row. So the local relay reports only the severity
+/// tokens (clean/dirty/conflict), and nulls the identity ones to clear any
+/// leftovers from an earlier build. Mirror workspaces have no built-in chip
+/// (non-git marker cwd), so the host relay keeps reporting everything.
+pub fn tokens_for(info: &GitInfo, include_identity: bool) -> Map<String, Value> {
     let mut t = Map::new();
-    t.insert(
-        "mgit_branch".into(),
-        info.branch.clone().map(Value::String).unwrap_or(Value::Null),
-    );
-    t.insert(
-        "mgit_ab".into(),
-        match (info.ahead, info.behind) {
-            (0, 0) => Value::Null,
-            (a, 0) => json!(format!("↑{a}")),
-            (0, b) => json!(format!("↓{b}")),
-            (a, b) => json!(format!("↑{a} ↓{b}")),
-        },
-    );
+    if include_identity {
+        t.insert(
+            "mgit_branch".into(),
+            info.branch.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        t.insert(
+            "mgit_ab".into(),
+            match (info.ahead, info.behind) {
+                (0, 0) => Value::Null,
+                (a, 0) => json!(format!("↑{a}")),
+                (0, b) => json!(format!("↓{b}")),
+                (a, b) => json!(format!("↑{a} ↓{b}")),
+            },
+        );
+    } else {
+        t.insert("mgit_branch".into(), Value::Null);
+        t.insert("mgit_ab".into(), Value::Null);
+    }
     let dirty = info.staged + info.modified + info.untracked;
     let (clean, dirty_t, conflict_t) = if info.conflicts > 0 {
         (Value::Null, Value::Null, json!(format!("!{}", info.conflicts)))
@@ -371,7 +384,7 @@ pub async fn refresh(
         let report = json!({
             "workspace_id": lid,
             "source": source(&host.name),
-            "tokens": Value::Object(tokens_for(info)),
+            "tokens": Value::Object(tokens_for(info, true)),
             "seq": seq,
             "ttl_ms": ttl,
         });
@@ -477,7 +490,7 @@ pub async fn refresh_local(
         let report = json!({
             "workspace_id": w.workspace_id,
             "source": source_local(),
-            "tokens": Value::Object(tokens_for(info)),
+            "tokens": Value::Object(tokens_for(info, false)),
             "seq": seq,
             "ttl_ms": ttl,
         });
@@ -697,7 +710,7 @@ mod tests {
     #[test]
     fn tokens_are_mutually_exclusive_by_severity() {
         let mut info = GitInfo { branch: Some("main".into()), ..Default::default() };
-        let t = tokens_for(&info);
+        let t = tokens_for(&info, true);
         assert_eq!(t["mgit_branch"], json!("main"));
         assert_eq!(t["mgit_clean"], json!("✓"));
         assert_eq!(t["mgit_dirty"], Value::Null);
@@ -707,27 +720,40 @@ mod tests {
         info.staged = 2;
         info.modified = 1;
         info.untracked = 3;
-        let t = tokens_for(&info);
+        let t = tokens_for(&info, true);
         assert_eq!(t["mgit_dirty"], json!("+2 ~1 ?3"));
         assert_eq!(t["mgit_clean"], Value::Null);
         assert_eq!(t["mgit_conflict"], Value::Null);
 
         info.conflicts = 2;
         info.staged = 0;
-        let t = tokens_for(&info);
+        let t = tokens_for(&info, true);
         assert_eq!(t["mgit_conflict"], json!("!2"));
         assert_eq!(t["mgit_dirty"], Value::Null);
 
         // committed but unpushed: no ✓, the ab token carries it
         info = GitInfo { branch: Some("main".into()), ahead: 1, ..Default::default() };
-        let t = tokens_for(&info);
+        let t = tokens_for(&info, true);
         assert_eq!(t["mgit_clean"], Value::Null);
         assert_eq!(t["mgit_ab"], json!("↑1"));
 
         // detached: branch token clears
         info = GitInfo::default();
-        let t = tokens_for(&info);
+        let t = tokens_for(&info, true);
         assert_eq!(t["mgit_branch"], Value::Null);
+    }
+
+    #[test]
+    fn local_tokens_clear_identity_builtins_already_show() {
+        // LOCAL relay: herdr's built-in branch/git_status already render the
+        // branch and ahead/behind on local workspaces — identity tokens must
+        // be nulled (clearing stale values), severity still reported
+        let info = GitInfo { branch: Some("main".into()), ahead: 2, staged: 1, ..Default::default() };
+        let t = tokens_for(&info, false);
+        assert_eq!(t["mgit_branch"], Value::Null);
+        assert_eq!(t["mgit_ab"], Value::Null);
+        assert_eq!(t["mgit_dirty"], json!("+1"));
+        assert_eq!(t["mgit_clean"], Value::Null);
     }
 
     #[test]
