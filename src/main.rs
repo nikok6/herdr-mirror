@@ -84,6 +84,10 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
         }
         "status" => daemon::cmd_status(&Env::resolve()?),
         "once" => rt.block_on(daemon::cmd_once(Env::resolve()?)),
+        "git-status" => {
+            let (interval, socket) = git_status::parse_args(&rest[1..])?;
+            rt.block_on(git_status::run_standalone(interval, socket))
+        }
         "restore" => daemon::cmd_restore(
             &Env::resolve()?,
             rest.get(1).map(String::as_str),

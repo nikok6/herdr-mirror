@@ -47,7 +47,7 @@ use crate::config::HostConfig;
 use crate::mirror::{fetch_snapshot, Snapshot};
 use crate::remote::RemoteHost;
 use crate::state::HostState;
-use crate::util::Logger;
+use crate::util::{err, Env, Logger, Result};
 
 /// Marker line ending each per-dir record. A porcelain line is `XY <path>` or
 /// `## …`, so no git output line can equal this whole line — a repo containing
@@ -489,6 +489,80 @@ pub async fn refresh_local(
         }
     }
     reported
+}
+
+// --- the standalone CLI mode ---
+
+/// `herdr-mirror git-status`: run ONLY the local relay, no daemon, no config,
+/// no ssh. For machines that just run herdr (e.g. the mirrored servers
+/// themselves) — gives their native workspaces the same `$mgit_*` tokens.
+///
+/// `--interval <secs>`: probe cadence (default 20, min 5).
+/// `--socket <path>`: herdr socket (default: HERDR_SOCKET_PATH, else
+/// `herdr status`);
+pub fn parse_args(args: &[String]) -> Result<(u64, Option<std::path::PathBuf>)> {
+    let mut interval = DEFAULT_INTERVAL_SECS;
+    let mut socket = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" => {
+                i += 1;
+                interval = args
+                    .get(i)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| err("--interval needs a number of seconds"))?;
+            }
+            "--socket" => {
+                i += 1;
+                socket = Some(
+                    args.get(i)
+                        .ok_or_else(|| err("--socket needs a path"))?
+                        .into(),
+                );
+            }
+            other => return Err(err(format!("unknown git-status flag: {other}"))),
+        }
+        i += 1;
+    }
+    Ok((interval.max(MIN_INTERVAL_SECS), socket))
+}
+
+pub async fn run_standalone(interval_secs: u64, socket: Option<std::path::PathBuf>) -> Result<()> {
+    // non-interactive ssh PATHs often lack ~/.local/bin, where herdr lives;
+    // Env::resolve shells out to `herdr status` for socket discovery
+    if socket.is_none() && std::env::var_os("HERDR_SOCKET_PATH").is_none() {
+        if let (Some(home), Some(path)) = (std::env::var_os("HOME"), std::env::var_os("PATH")) {
+            let local_bin = std::path::PathBuf::from(&home).join(".local/bin");
+            let mut parts: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+            if !parts.iter().any(|p| p == &local_bin) {
+                parts.insert(0, local_bin);
+                std::env::set_var("PATH", std::env::join_paths(parts).unwrap_or(path));
+            }
+        }
+    }
+    let mut env = Env::resolve()?;
+    if let Some(p) = socket {
+        env.local_socket = p;
+    }
+    let local = ApiClient::connect(&env.local_socket).await?;
+    let log = Logger::new(&env.state_dir, false);
+    log.log(&format!(
+        "git-status relay starting (standalone, interval {interval_secs}s)"
+    ));
+    let cfg = crate::config::GitStatusLocal {
+        enabled: true,
+        interval_secs,
+        include_mirrors: crate::config::IncludeMirrors::Yes,
+    };
+    let mut relay = RefreshState::default();
+    // no hosts.toml here by assumption: an empty host list means the mirror
+    // exclusion pass has nothing to load, so every workspace is covered —
+    // exactly right on a server that only runs its own herdr
+    loop {
+        refresh_local(&local, &env.state_dir, &[], &cfg, &mut relay, &log).await;
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+    }
 }
 
 #[cfg(test)]
