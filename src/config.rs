@@ -115,6 +115,47 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// per-workspace git status tokens for the mirror rows; see `GitStatusCfg`
+    pub git_status: GitStatusCfg,
+}
+
+/// Mirror-row git status relay settings (see `git_status.rs`). Enabled by
+/// default: the only cost is one batched `git status` exec per interval per
+/// connected host, and the tokens only render if the local sidebar rows name
+/// them — a user who never added the rows sees nothing change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitStatusCfg {
+    /// `git_status = false` (global or per host) turns the relay off entirely
+    pub enabled: bool,
+    /// seconds between batched probes; clamped to `MIN_INTERVAL_SECS`
+    pub interval_secs: u64,
+}
+
+/// Should the LOCAL relay also cover mirror workspaces? The single-writer
+/// setup (`all`) exists for `git_status = false` users: the per-host relays
+/// are off, so without this the mirror rows would never get `$mgit_*` tokens
+/// at all. Default `native`: mirrors are owned by the per-host relays, and
+/// two reporters writing the same token key on the same workspace would fight
+/// every interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IncludeMirrors {
+    /// skip mirror workspaces (they have their own relay)
+    #[default]
+    Native,
+    /// cover every workspace on this machine, mirrors included
+    Yes,
+}
+
+/// LOCAL relay settings: the same `$mgit_*` tokens for this machine's native
+/// workspaces (TroopAI, pengepul, …), which otherwise only get the built-in
+/// branch/ahead-behind chip. Runs in the daemon's process over plain `sh -c`
+/// — no ssh — and defaults to following `git_status`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitStatusLocal {
+    pub enabled: bool,
+    /// seconds between batched probes; clamped to `MIN_INTERVAL_SECS`
+    pub interval_secs: u64,
+    pub include_mirrors: IncludeMirrors,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +171,8 @@ pub struct MirrorConfig {
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
     pub hosts: Vec<HostConfig>,
+    /// local-workspace git relay (native spaces on this machine)
+    pub git_status_local: GitStatusLocal,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
     pub source: Option<PathBuf>,
@@ -160,6 +203,13 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    git_status: Option<bool>,
+    git_status_secs: Option<u64>,
+    git_status_local: Option<bool>,
+    git_status_local_secs: Option<u64>,
+    /// "all" covers mirror workspaces too (single-writer setup for
+    /// `git_status = false`); anything else keeps mirrors on their own relays
+    git_status_local_scope: Option<String>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -182,6 +232,8 @@ struct RawHost {
     max_cols: Option<usize>,
     max_rows: Option<usize>,
     api_transport: Option<String>,
+    git_status: Option<bool>,
+    git_status_secs: Option<u64>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -274,6 +326,28 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     }
     let global_max_cols = size_cap(raw.max_cols);
     let global_max_rows = size_cap(raw.max_rows);
+    let global_git_status = raw.git_status.unwrap_or(true);
+    let global_git_secs = raw
+        .git_status_secs
+        .filter(|&s| s > 0)
+        .unwrap_or(crate::git_status::DEFAULT_INTERVAL_SECS);
+    // local relay: on unless asked off, or unless the global relay is off and
+    // no explicit local choice was made (off means off, not "switch to local")
+    let git_status_local = raw.git_status_local.unwrap_or(global_git_status);
+    let git_status_local_secs = raw
+        .git_status_local_secs
+        .filter(|&s| s > 0)
+        .unwrap_or(global_git_secs);
+    let git_status_local_scope = match raw.git_status_local_scope.as_deref() {
+        None => IncludeMirrors::Native,
+        Some("all") => IncludeMirrors::Yes,
+        Some(other) => {
+            warnings.push(format!(
+                "git_status_local_scope = \"{other}\" ignored (expected \"all\" or \"native\")"
+            ));
+            IncludeMirrors::Native
+        }
+    };
     let mut hosts: Vec<HostConfig> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
@@ -322,6 +396,14 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             max_rows: size_cap(h.max_rows).or(global_max_rows),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
+            git_status: GitStatusCfg {
+                enabled: h.git_status.unwrap_or(global_git_status),
+                interval_secs: h
+                    .git_status_secs
+                    .filter(|&s| s > 0)
+                    .unwrap_or(global_git_secs)
+                    .max(crate::git_status::MIN_INTERVAL_SECS),
+            },
             kind,
             target,
             name,
@@ -349,6 +431,11 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
         hosts,
+        git_status_local: GitStatusLocal {
+            enabled: git_status_local,
+            interval_secs: git_status_local_secs.max(crate::git_status::MIN_INTERVAL_SECS),
+            include_mirrors: git_status_local_scope,
+        },
         source: None,
         shadowed: Vec::new(),
         warnings,

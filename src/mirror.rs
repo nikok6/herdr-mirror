@@ -1762,6 +1762,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
+            git_status: crate::config::GitStatusCfg { enabled: true, interval_secs: 20 },
         }
     }
 

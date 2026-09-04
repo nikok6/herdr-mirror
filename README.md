@@ -331,10 +331,75 @@ target = "work"
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
+# git_status = true                  # default. Report each mirror workspace's
+                                     # remote git state as $mgit_* tokens (see
+                                     # "Git status on mirror rows" below).
+# git_status_secs = 20               # probe cadence; minimum 5
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
 ```
+
+### Git status on local rows too
+
+The same tokens cover this machine's **native** workspaces (which otherwise
+only get the built-in branch/ahead-behind chip — no clean/dirty/conflict). A
+second relay runs in the daemon over plain `sh -c` — no ssh — probing each
+local workspace's cwd on the same cadence and reporting under its own source
+ID (`plugin:mirror:local:git`). Mirror workspaces are skipped: their tokens
+are the per-host relays' job, and two reporters on one token key would fight.
+
+| hosts.toml | effect |
+|---|---|
+| `git_status_local = false` | turn the local relay off (default: follows `git_status`) |
+| `git_status_local_secs` | its cadence (default: follows `git_status_secs`); min 5 |
+| `git_status_local_scope = "all"` | also cover mirror workspaces — only for the single-writer setup where `git_status = false` turned the per-host relays off |
+
+### Git status on mirror rows
+
+herdr derives the sidebar's branch/ahead-behind from the workspace's *local*
+cwd, and mirror workspaces deliberately sit on a non-git cwd — so by default
+they show no git chip. The daemon bridges that itself: every `git_status_secs`
+it probes each mirror workspace's remote cwd with one batched
+`git --no-optional-locks status --porcelain=v1 -b` (one ssh exec per host,
+regardless of workspace count), and reports the result to the local mirror row
+as `$mgit_*` metadata tokens with a TTL of three intervals — a host that dies
+self-clears instead of lying forever.
+
+| token          | content                                                |
+|----------------|--------------------------------------------------------|
+| `$mgit_branch` | the remote branch (elided on a detached HEAD)           |
+| `$mgit_ab`     | `↑N` ahead / `↓N` behind upstream                       |
+| `$mgit_clean`  | `✓` — nothing to commit, push, or pull                  |
+| `$mgit_dirty`  | `+staged ~modified ?untracked` (non-zero parts only)    |
+| `$mgit_conflict` | `!N` unmerged paths (beats dirty and clean)           |
+
+herdr renders token values as flat text, so severity colour comes from naming
+the tokens in `[ui.sidebar.spaces]` with an inline `fg` each — only the active
+one of clean/dirty/conflict ever renders:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status",
+    { token = "$mgit_branch",   fg = "#a89984" },
+    { token = "$mgit_ab",       fg = "#83a598" },
+    { token = "$mgit_clean",    fg = "#b8bb26" },
+    { token = "$mgit_dirty",    fg = "#fabd2f" },
+    { token = "$mgit_conflict", fg = "#fb4934" }],
+]
+```
+
+Then `herdr server reload-config`. On native (non-mirror) workspaces none of
+the `$mgit_*` tokens are ever reported, so the same rows render them as
+nothing and the built-in `branch`/`git_status` keep working as usual.
+
+The probe needs only `git` on the remote — nothing is installed there. If the
+cwd is not a repo the row simply shows nothing. Note the token names are
+`mgit_*`, deliberately distinct from herdr-git-status's `$git_*`: if the
+remote runs that plugin, its tokens reach your mirror rows through the
+ordinary metadata forwarding, and both can coexist.
 
 ## Devcontainer
 
@@ -403,10 +468,14 @@ rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
-- **No git status on mirror rows** — herdr derives the sidebar git branch and
-  ahead/behind from the local workspace cwd, and there's no API to feed it a
-  remote repo's state, so mirror workspaces show no git chip. The remote's real
-  branch and status stay visible in the streamed pane's prompt.
+- **No built-in branch chip on mirror rows** — herdr derives the sidebar's
+  `branch`/`git_status` from the local workspace cwd, and there's no API to
+  feed it a remote repo's state, so those built-ins stay blank on mirrors.
+  The daemon bridges the gap itself with `$mgit_*` tokens (see
+  [Git status on mirror rows](#git-status-on-mirror-rows)): one batched
+  remote `git status` per host per interval, rendered by your sidebar rows.
+  The remote's real branch and status stay visible in the streamed pane's
+  prompt either way.
 - **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
   label prefix and the daemon keeps them ordered into per-host groups, but it
   can't render a richer affordance (group headers, collapse, colour).

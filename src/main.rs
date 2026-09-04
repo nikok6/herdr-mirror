@@ -18,6 +18,7 @@ mod config;
 mod daemon;
 mod docker;
 mod foreground;
+mod git_status;
 mod grid;
 mod layout_sync;
 mod mirror;

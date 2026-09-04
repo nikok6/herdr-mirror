@@ -220,11 +220,18 @@ async fn run_connected(
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
     let mut closes_at: Option<Instant> = None;
+    // git status relay: first pass shortly after converge (the map is fresh
+    // and panes are streaming), then every configured interval
+    let mut git_at: Option<Instant> = None;
+    let mut git_relay = crate::git_status::RefreshState::default();
     let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
+    // first git pass shortly after converge — the map is fresh and panes are
+    // streaming by then; later passes follow every interval below
+    git_at.get_or_insert(Instant::now() + Duration::from_secs(3));
 
     loop {
-        let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
+        let sleep = sleep_until_earliest([converge_at, status_at, closes_at, git_at]);
         tokio::select! {
             ev = stream.next() => {
                 match ev {
@@ -275,6 +282,26 @@ async fn run_connected(
                     apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
                     // reconcile + refresh subscriptions after the removals
                     converge_at.get_or_insert(now);
+                }
+                if git_at.is_some_and(|t| t <= now) {
+                    // a fresh map: converge may have created/removed mirrors
+                    // since the last pass, and each pass must target exactly
+                    // the workspaces that exist now
+                    let state = load_state(&ctx.env_state_dir, &ctx.host.name);
+                    crate::git_status::refresh(
+                        &ctx.local,
+                        &remote,
+                        &remote_host,
+                        &ctx.host,
+                        &state,
+                        &mut git_relay,
+                        &ctx.log,
+                    )
+                    .await;
+                    // probe failures also wait a full interval: the warn-once
+                    // log keeps the first failure visible, and a status chip
+                    // does not justify backing off harder than a flat retry
+                    git_at = Some(now + Duration::from_secs(ctx.host.git_status.interval_secs));
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
@@ -486,6 +513,26 @@ async fn heal_zombie_mirrors(
     }
 }
 
+/// Local-workspace git relay loop: independent of the per-host tasks (it only
+/// ever talks to the LOCAL api and the local filesystem), so it lives beside
+/// them and keeps running while a host reconnects.
+async fn local_git_task(
+    local: ApiClient,
+    state_dir: PathBuf,
+    hosts: Vec<HostConfig>,
+    config: crate::config::GitStatusLocal,
+    log: Logger,
+) {
+    let mut relay = crate::git_status::RefreshState::default();
+    // one beat after startup: converge is populating mirror maps, and the
+    // exclusion set they feed should be as complete as possible
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    loop {
+        crate::git_status::refresh_local(&local, &state_dir, &hosts, &config, &mut relay, &log).await;
+        tokio::time::sleep(Duration::from_secs(config.interval_secs)).await;
+    }
+}
+
 // Local events: mirror closes drive tombstoning — poke every host so the
 /// next converge records the user's intent promptly.
 async fn local_events_task(
@@ -618,6 +665,18 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         log.clone(),
         closes.clone(),
     )));
+    // local git relay: same $mgit_* tokens for this machine's native spaces,
+    // probed over plain sh -c. No success logging — the host relays don't log
+    // successes either, and every 20s would be log spam.
+    if config.git_status_local.enabled {
+        tasks.push(tokio::spawn(local_git_task(
+            local.clone(),
+            env.state_dir.clone(),
+            config.hosts.clone(),
+            config.git_status_local.clone(),
+            log.clone(),
+        )));
+    }
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -815,7 +874,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
         let (remote, _status) = remote_host.connect_api().await?;
         converge(&ConvergeDeps {
             local: local.clone(),
-            remote,
+            remote: remote.clone(),
             host: h.clone(),
             state_dir: env.state_dir.clone(),
             log: log.clone(),
@@ -827,7 +886,34 @@ pub async fn cmd_once(env: Env) -> Result<()> {
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
+        // git tokens for any mirrors this pass manages; one pass, then done
+        let mut relay = crate::git_status::RefreshState::default();
+        let state = load_state(&env.state_dir, &h.name);
+        let reported = crate::git_status::refresh(
+            &local,
+            &remote,
+            &remote_host,
+            h,
+            &state,
+            &mut relay,
+            &log,
+        )
+        .await;
+        log.log(&format!("[{}] git status: {reported} workspace(s) reported", h.name));
     }
+    // local native workspaces too — this is what makes `once` a complete
+    // one-shot status pass on both sides
+    let mut relay = crate::git_status::RefreshState::default();
+    let reported = crate::git_status::refresh_local(
+        &local,
+        &env.state_dir,
+        &config.hosts,
+        &config.git_status_local,
+        &mut relay,
+        &log,
+    )
+    .await;
+    log.log(&format!("[local] git status: {reported} workspace(s) reported"));
     Ok(())
 }
 
