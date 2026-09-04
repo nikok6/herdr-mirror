@@ -355,6 +355,21 @@ are the per-host relays' job, and two reporters on one token key would fight.
 | `git_status_local_secs` | its cadence (default: follows `git_status_secs`); min 5 |
 | `git_status_local_scope = "all"` | also cover mirror workspaces — only for the single-writer setup where `git_status = false` turned the per-host relays off |
 
+### Git status without the daemon
+
+Servers that just run their own herdr (no mirroring, no hosts.toml) can get
+the same tokens with a standalone mode:
+
+```sh
+nohup ~/.local/bin/herdr-mirror git-status --interval 20 >> \
+  ~/.local/state/herdr-mirror-git.log 2>&1 &
+```
+
+It runs only the local relay loop (`--interval` seconds, default 20, min 5;
+`--socket` overrides socket discovery) and covers every workspace on that
+machine. Name the tokens in that server's `[ui.sidebar.spaces]` rows and
+reload.
+
 ### Git status on mirror rows
 
 herdr derives the sidebar's branch/ahead-behind from the workspace's *local*
