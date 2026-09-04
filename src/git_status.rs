@@ -294,17 +294,18 @@ impl RefreshState {
         }
     }
 
-    /// Monotonic per workspace: wall-clock seed on first sight (never collides
-    /// with a previous daemon run's counter), +1 after that. Bumped before the
-    /// request, not after — a lost response must not retry the same seq.
+    /// Strictly monotonic per workspace, and self-healing against a competing
+    /// reporter on the same source: seed AND floor each step at wall-clock ms,
+    /// taking the larger of "clock moved on" and "our own last + 1". A report
+    /// the server rejects as stale is silent (Ok with no effect) — a plain
+    /// in-memory counter restarting at zero, or losing to another relay's
+    /// clock-seeded seq, would freeze tokens forever with nothing in any log.
     fn next_seq(&mut self, key: &str) -> u64 {
-        let next = match self.seqs.get(key) {
-            Some(s) => s + 1,
-            None => SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(1),
-        };
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(1);
+        let next = self.seqs.get(key).map_or(now_ms, |s| (s + 1).max(now_ms));
         self.seqs.insert(key.to_string(), next);
         next
     }
@@ -737,13 +738,18 @@ mod tests {
     }
 
     #[test]
-    fn seq_seeds_from_the_clock_then_increments() {
+    fn seq_stays_above_the_clock_and_strictly_increasing() {
         let mut relay = RefreshState::default();
         let first = relay.next_seq("wA");
         assert!(first > 1_000_000_000_000, "wall-clock seed, not a counter from zero: {first}");
+        // a same-millisecond second report still strictly increases
         assert_eq!(relay.next_seq("wA"), first + 1);
-        // a second workspace seeds from the clock too — it can land on the same
-        // millisecond (>=), but never behind, or the server would drop reports
+        // a competing clock-seeded report (higher than our counter) is passed,
+        // not fought: the next seq jumps above wall clock again
+        relay.seqs.insert("wA".into(), first + 1);
+        let healed = relay.next_seq("wA");
+        assert!(healed > first + 1, "must re-seed from the clock, got {healed}");
+        // a second workspace seeds independently
         assert!(relay.next_seq("wB") >= first);
     }
 
