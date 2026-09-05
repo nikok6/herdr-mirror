@@ -15,6 +15,7 @@ mod api;
 mod binding;
 mod closes;
 mod config;
+mod cwd_policy;
 mod daemon;
 mod docker;
 mod foreground;

@@ -396,6 +396,23 @@ Locally, name it in a sidebar row (`~/.config/herdr/config.toml`):
 rows = [["state_icon", "workspace"], ["state_text", "agent"], ["$rcwd"]]
 ```
 
+## Creation directories
+
+Remote tab/workspace actions read the remote Herdr configuration: `follow`
+keeps the invoking remote pane's directory; `home`, `current`, and fixed paths
+leave directory selection to Herdr. Splits keep the invoking pane's directory.
+If the remote configuration cannot be read, actions preserve cwd inheritance.
+The read uses the configured Herdr binary's reported config path; settings must
+match the running server's loaded config (including any custom environment).
+
+Native tabs/splits inside mirrors also recognize fixed absolute paths, `home`,
+and tilde paths, including symlink aliases. `current` and relative local paths
+are not inferred because the hook does not know the server's working directory.
+Native new-workspace interception remains limited to the private `.mirror-pane`
+placeholder. With a fixed local starting directory, use Mirror's explicit
+workspace action or host picker instead; ordinary local workspaces are not
+identified as disposable merely because their directory matches.
+
 ## Limitations
 
 - **Version-locked to preview** until the `terminal session` streams reach

@@ -338,13 +338,13 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     let mut remote = RemoteHost::new(&host, &env.state_dir);
     let (api, _status) = remote.connect_api().await?;
 
-    // cwd inheritance comes from the REMOTE side: the remote pane behind the
-    // focused mirror pane knows its real cwd; local cwds are meaningless
-    // there. Only splits inherit it — a tab or workspace passes no cwd at
-    // all, so the remote's own `[terminal] new_cwd` policy decides, matching
-    // pick.rs ("the remote's default is right, local paths are not").
+    // Follow the invoking remote pane unless a known remote policy overrides
+    // it. Omitting cwd under `follow` would follow another client's focus.
+    let policy = if kind == "split" { None } else {
+        crate::cwd_policy::remote_policy(&remote, &host).await
+    };
     let mut cwd: Option<String> = None;
-    if kind == "split" {
+    if crate::cwd_policy::inherit(kind, policy.as_ref()) {
         if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
             let snap = fetch_snapshot(&api).await?;
             if let Some(pane) = snap.panes.iter().find(|p| p.pane_id == pane_id) {
@@ -518,5 +518,44 @@ fn nudge_daemon(env: &Env, prefix: &str) {
             println!("{prefix} — daemon syncing now");
         }
         None => println!("{prefix} — mirrors reappear when the daemon starts"),
+    }
+}
+
+#[cfg(test)]
+mod cwd_live_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires PR89_LIVE_ROOT with isolated remote session config and fixture.json"]
+    async fn remote_creation_directory_policies() {
+        let root = std::path::PathBuf::from(std::env::var("PR89_LIVE_ROOT").unwrap());
+        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(root.join("fixture.json")).unwrap()).unwrap();
+        let env = Env {config_search: vec![root.clone()],state_dir:root.clone(),local_socket:root.join("unused.sock")};
+        let config = load_config(&env.config_search).unwrap();
+        let host = &config.hosts[0];
+        let mut remote = RemoteHost::new(host, &root);
+        let (api, _) = remote.connect_api().await.unwrap();
+        let source = api.request("workspace.create", json!({"cwd":fixture["anchor"], "focus":true})).await.unwrap();
+        let ws = source["workspace"]["workspace_id"].as_str().unwrap();
+        let pane = source["root_pane"]["pane_id"].as_str().unwrap();
+        let anchor_cwd = source["root_pane"]["cwd"].clone();
+        api.request("tab.create", json!({"workspace_id":ws,"cwd":fixture["other"],"focus":true})).await.unwrap();
+        let mut state = crate::state::HostState::default();
+        state.workspaces.insert(ws.into(), crate::state::WsEntry {local_id:"local-ws".into(), tombstone:None,root_tab_local_id:None,last_remote_label:None});
+        state.panes.insert(pane.into(), crate::state::PaneEntry {local_id:"local-pane".into(),tombstone:None,seq:0,reported:None});
+        crate::state::save_state(&root,&host.name,&state).unwrap();
+        std::env::set_var("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_id":"local-ws","focused_pane_id":"local-pane"}"#);
+        for kind in ["tab", "workspace", "split"] {
+            let before = api.request("pane.list",json!({})).await.unwrap();
+            let ids: std::collections::HashSet<String> = before["panes"].as_array().unwrap().iter().map(|p|p["pane_id"].as_str().unwrap().into()).collect();
+            run(&env,kind,if kind=="split" {Some("right")} else {None}).await.unwrap();
+            let after = api.request("pane.list",json!({})).await.unwrap();
+            let created: Vec<_> = after["panes"].as_array().unwrap().iter().filter(|p|!ids.contains(p["pane_id"].as_str().unwrap())).collect();
+            assert_eq!(created.len(),1,"{kind}");
+            let expected = if kind=="split" || fixture["policy"]=="follow" {&anchor_cwd} else {&fixture["expected"]};
+            println!("{kind}: cwd={} expected={expected}",created[0]["cwd"]);
+            assert_eq!(&created[0]["cwd"],expected,"{kind}");
+        }
+        std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON");
     }
 }
