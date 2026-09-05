@@ -1370,7 +1370,12 @@ impl App {
                             (false, _) => match self.select.release(at, raw) {
                                 // the clipboard holds one thing, so a second
                                 // gesture in the same read legitimately wins
-                                Released::Selection(span) => copy_span = Some(span),
+                                Released::Selection(span) => {
+                                    copy_span = Some(span);
+                                    // Finish this gesture before a later press in
+                                    // the same read starts the next selection.
+                                    sel_changed |= self.select.clear();
+                                },
                                 // It was a click, not a drag. TUI/agent get it
                                 // (claude and codex discard the bytes cleanly).
                                 // A shell does not: the prompt never enabled
@@ -1415,9 +1420,6 @@ impl App {
         }
         if let Some((start, end)) = copy_span {
             let text = self.grid.selection_text(start, end);
-            // Copy-on-select matches herdr's native lifecycle: the highlight
-            // disappears as soon as the release has been copied.
-            sel_changed |= self.select.clear();
             match crate::select::osc52(&text) {
                 // no hint on success: herdr shows its own "copied to clipboard"
                 // toast when it takes the OSC 52, so ours would be a duplicate
@@ -2216,6 +2218,87 @@ mod tests {
         let (_, idx) = reconnect_delay(false, 0);
         let (_, idx) = reconnect_delay(true, idx);
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
+    }
+
+
+    // Exercise the real input routing: a release and the next press can share
+    // one stdin read. A local sink stands in for the session; no SSH is used.
+    async fn selection_followed_by_press(next_drag: bool) {
+        let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
+        let tty = true;
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            tx,
+            mode: Mode::Observe,
+            switching_to: None,
+            switch_at: None,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_failures: 0,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first classification
+            // moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        };
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
+            .spawn().unwrap();
+        app.session = Some(Session {
+            gen: 1, mode: Mode::Control, pid: child.id().unwrap() as i32,
+            stdin: child.stdin.take().unwrap(),
+        });
+        app.mode = Mode::Control;
+        app.remote_fg = Some(Fg::Mouse);
+        // Keep foreground polling local to this fixture: suppress SSH probes.
+        app.fg_poll_at = Some(Instant::now());
+        // Blank cells exercise copy handling without writing to the clipboard.
+        app.grid.resize(80, 24);
+        app.handle_stdin(
+            b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m\x1b[<0;1;2M".to_vec(),
+        ).await;
+        let result = app.select.release(
+            if next_drag { (1, 3) } else { (1, 0) }, b"release",
+        );
+        drop(app);
+        child.kill().await.unwrap();
+        let _ = child.wait().await;
+        if next_drag {
+            assert_eq!(result, Released::Selection(((1, 0), (1, 3))));
+        } else {
+            assert_eq!(result, Released::Click(b"\x1b[<0;1;2Mrelease".to_vec()));
+        }
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_click_in_same_read() {
+        selection_followed_by_press(false).await;
+    }
+
+    #[tokio::test]
+    async fn copying_selection_preserves_next_drag_in_same_read() {
+        selection_followed_by_press(true).await;
     }
 
 }
