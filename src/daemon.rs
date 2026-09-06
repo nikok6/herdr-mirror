@@ -13,7 +13,7 @@
 // arrive through one select loop, so converge and the status fast-path never
 // interleave.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd;
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
-use crate::config::{load_config, HostConfig};
+use crate::config::{load_config_for_env, HostConfig};
 use crate::mirror::{
     apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
     teardown, AgentInfo, ConvergeDeps,
@@ -231,6 +231,13 @@ async fn resubscribe(
 /// Fast-path: apply coalesced status updates without a remote snapshot.
 /// Returns true if an event referenced a pane we don't mirror yet.
 async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
+    let _lock = match crate::state::lock_host(&ctx.env_state_dir, &ctx.host.name).await {
+        Ok(l) => l,
+        Err(e) => {
+            ctx.log.log(&format!("[{}] could not lock state: {e}", ctx.host.name));
+            return false;
+        }
+    };
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
     let mut need_converge = false;
     for (remote_id, data) in pending {
@@ -249,6 +256,52 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
     }
     need_converge
+}
+
+/// Per-slot retry cooldown for `ensure_stream_masters`, so a persistently
+/// unreachable slot is attempted once and then left alone for a while rather
+/// than retried on every converge pass — which, in an event-driven daemon,
+/// can be every few hundred milliseconds during active use. Lives for the
+/// host task's whole lifetime (across reconnects), the same way
+/// `remembered_transport` does, since the point is exactly to remember a
+/// recent failure past any single converge pass.
+#[derive(Default)]
+struct StreamMasterBackoff {
+    last_failure: HashMap<u32, std::time::Instant>,
+}
+
+/// How long a slot sits out after failing before it's attempted again.
+const STREAM_MASTER_RETRY_BACKOFF: Duration = Duration::from_secs(120);
+
+impl StreamMasterBackoff {
+    /// Of `wanted`, which are due for a (re)attempt right now: never
+    /// attempted, or last failed at least `STREAM_MASTER_RETRY_BACKOFF` ago.
+    fn due(&self, wanted: &std::collections::BTreeSet<u32>, now: std::time::Instant) -> Vec<u32> {
+        wanted
+            .iter()
+            .copied()
+            .filter(|slot| {
+                self.last_failure
+                    .get(slot)
+                    .is_none_or(|t| now.saturating_duration_since(*t) >= STREAM_MASTER_RETRY_BACKOFF)
+            })
+            .collect()
+    }
+
+    /// A slot outside `wanted` (no longer assigned to any live pane) has
+    /// nothing left to back off — drop it so a slot number that's since been
+    /// reused doesn't inherit a stale failure timestamp from its predecessor.
+    fn retain_only(&mut self, wanted: &std::collections::BTreeSet<u32>) {
+        self.last_failure.retain(|slot, _| wanted.contains(slot));
+    }
+
+    fn note_result(&mut self, slot: u32, ok: bool, now: std::time::Instant) {
+        if ok {
+            self.last_failure.remove(&slot);
+        } else {
+            self.last_failure.insert(slot, now);
+        }
+    }
 }
 
 /// Which transport the next reconnect should try first.
@@ -284,6 +337,7 @@ async fn run_connected(
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    stream_master_backoff: &mut StreamMasterBackoff,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -302,12 +356,13 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        precreate_stream_masters: true,
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
-    let state = converge(&deps).await?;
+    let state = converge_and_ensure_masters(ctx, &deps, stream_master_backoff).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
@@ -382,7 +437,7 @@ async fn run_connected(
                         &ctx.closes,
                     )
                     .await;
-                    let state = converge(&deps).await?;
+                    let state = converge_and_ensure_masters(ctx, &deps, stream_master_backoff).await?;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
@@ -407,6 +462,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    let mut stream_master_backoff = StreamMasterBackoff::default();
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -426,6 +482,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut stream_master_backoff,
         )
         .await
         {
@@ -562,6 +619,13 @@ async fn heal_zombie_mirrors(
             h.name,
             dead.len()
         ));
+        // Pre-create any stream-pool slot masters these panes need before
+        // respawning: same reasoning as after `converge` in `run_connected`.
+        // A throwaway backoff tracker is fine here — healing only runs after
+        // a local server restart, already rare enough that this can't turn
+        // into the repeated-retry storm the daemon's own per-host tracker
+        // guards against on every converge tick.
+        ensure_stream_masters(h, state_dir, &state, log, &mut StreamMasterBackoff::default()).await;
         // Surgical on purpose: session-restore brought the workspace, tabs, panes
         // and layout back intact — only the streamer processes died. Exec the
         // streamer back into each existing pane rather than closing the workspace
@@ -571,13 +635,123 @@ async fn heal_zombie_mirrors(
         //
         // Sizes live in the remote layout, which we don't have here; the wrapper
         // falls back to its default and the next converge reconciles.
-        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
+        let slots: BTreeMap<String, u32> =
+            state.panes.iter().filter_map(|(rid, e)| e.stream_slot.map(|s| (rid.clone(), s))).collect();
+        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new(), &slots);
         for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
         }
         let _ = pokers[i].try_send(());
     }
+}
+
+/// Apply this pass's fresh-slot ensure outcomes to `backoff`. A free function
+/// (not inlined into `converge_and_ensure_masters`) so it can be unit-tested
+/// directly: the property that matters — these outcomes are recorded even
+/// when the overall converge `Result` is an error — is exactly what
+/// `converge`'s return shape (a plain tuple, not `Result<(state, results)>`)
+/// exists to make possible, and this is where callers must apply it BEFORE
+/// looking at that `Result` to preserve it.
+fn apply_fresh_slot_results(
+    backoff: &mut StreamMasterBackoff,
+    fresh_slot_results: Vec<(u32, Result<()>)>,
+    now: std::time::Instant,
+) {
+    for (slot, result) in fresh_slot_results {
+        backoff.note_result(slot, result.is_ok(), now);
+    }
+}
+
+/// Run one converge pass, feeding this pass's fresh-slot pre-create outcomes
+/// into the daemon's persistent backoff BEFORE the broader post-converge
+/// maintenance sweep (`ensure_stream_masters`) runs. Without this ordering, a
+/// slot that just failed inside `converge` looks never-attempted to that
+/// sweep and gets retried immediately — one failed attempt turning straight
+/// into a second, the same converge tick.
+async fn converge_and_ensure_masters(
+    ctx: &HostCtx,
+    deps: &ConvergeDeps,
+    stream_master_backoff: &mut StreamMasterBackoff,
+) -> Result<HostState> {
+    let (state_result, fresh_slot_results) = converge(deps).await;
+    // Applied unconditionally, before the `?` below can bail out on a later
+    // converge failure — otherwise a slot this pass's fresh-slot precreate
+    // already tried and failed would look never-attempted to the sweep two
+    // lines down.
+    apply_fresh_slot_results(stream_master_backoff, fresh_slot_results, std::time::Instant::now());
+    let state = state_result?;
+    ensure_stream_masters(&ctx.host, &ctx.env_state_dir, &state, &ctx.log, stream_master_backoff).await;
+    Ok(state)
+}
+
+/// Pre-create the ControlMaster for every ssh stream-pool slot this host's
+/// live panes are currently assigned to, so streamers about to (re)spawn find
+/// an already-listening master instead of running direct. A no-op when
+/// pooling is off, on a docker host, or once every needed master is already
+/// up; failures only log — a streamer whose slot has no live master here
+/// simply runs direct until a later pass creates one.
+async fn ensure_stream_masters(
+    host: &HostConfig,
+    state_dir: &std::path::Path,
+    state: &HostState,
+    log: &Logger,
+    backoff: &mut StreamMasterBackoff,
+) {
+    if host.ssh_streams_per_connection <= 1 || host.kind.is_docker() {
+        return;
+    }
+    let wanted: std::collections::BTreeSet<u32> =
+        state.panes.values().filter(|e| !e.is_tombstoned()).filter_map(|e| e.stream_slot).collect();
+    backoff.retain_only(&wanted);
+    let due = backoff.due(&wanted, std::time::Instant::now());
+    if due.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    for (slot, result) in
+        crate::remote::ensure_stream_masters_concurrent(state_dir, host, due, log).await
+    {
+        if let Err(e) = &result {
+            log.log(&format!(
+                "[{}] could not pre-create ssh stream pool slot {slot} master ({e}) — \
+                 its streams will fall back to a direct connection; retrying in {}s",
+                host.name,
+                STREAM_MASTER_RETRY_BACKOFF.as_secs()
+            ));
+        }
+        backoff.note_result(slot, result.is_ok(), now);
+    }
+}
+
+/// `status`'s one line of ssh stream pool visibility: configured capacity and
+/// per-slot occupancy, straight from persisted state — no live socket probe,
+/// so this stays as cheap as the rest of `status`. That occupancy is the
+/// INTENDED assignment, not necessarily what a running streamer is currently
+/// attached to: a pane only picks up a slot change when its streamer process
+/// is recreated (hide/show, or closing and reopening the pane), not on an
+/// ordinary ssh reconnect. `None` when pooling is off or no pane currently
+/// has a slot (a fresh host before its first converge).
+fn stream_pool_status_line(capacity: usize, state: &HostState) -> Option<String> {
+    if capacity <= 1 {
+        return None;
+    }
+    let mut occupancy: BTreeMap<u32, usize> = BTreeMap::new();
+    for entry in state.panes.values().filter(|e| !e.is_tombstoned()) {
+        if let Some(slot) = entry.stream_slot {
+            *occupancy.entry(slot).or_insert(0) += 1;
+        }
+    }
+    if occupancy.is_empty() {
+        return None;
+    }
+    let detail: Vec<String> =
+        occupancy.iter().map(|(slot, count)| format!("{slot}:{count}/{capacity}")).collect();
+    Some(format!(
+        "ssh stream pool: capacity {capacity} per connection, {} slot(s) (intended assignment) — {}",
+        occupancy.len(),
+        detail.join(", ")
+    ))
 }
 
 // Local events: mirror closes drive tombstoning — poke every host so the
@@ -654,7 +828,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     let _daemon_lifetime = acquire_daemon_lifetime(&env)?;
     let detached = std::env::var("HERDR_MIRROR_DETACHED").is_ok();
     let log = Logger::new(&env.state_dir, !detached);
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(&env)?;
     log.log(&format!(
         "daemon starting (pid {}, hosts: {}, config: {})",
         std::process::id(),
@@ -823,7 +997,7 @@ pub fn cmd_ensure(env: &Env) {
     if running_pid(env).is_some() || is_paused(env) {
         return;
     }
-    match load_config(&env.config_search) {
+    match load_config_for_env(env) {
         Ok(c) if c.autostart => {
             let _ = cmd_start(env);
         }
@@ -852,7 +1026,7 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             println!("cli link: {} is a regular file (not managed)", crate::util::cli_link_path().display())
         }
     }
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(env)?;
     if let Some(src) = &config.source {
         println!("config: {}", src.display());
     }
@@ -882,6 +1056,9 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             "host {} ({}): {ws} mirror workspaces, {panes} mirror panes{hidden}",
             h.name, h.target
         );
+        if let Some(line) = stream_pool_status_line(h.ssh_streams_per_connection, &state) {
+            println!("  {line}");
+        }
         let tombs: Vec<String> = state
             .workspaces
             .iter()
@@ -905,7 +1082,7 @@ pub fn cmd_status(env: &Env) -> Result<()> {
 
 pub async fn cmd_once(env: Env) -> Result<()> {
     let log = Logger::new(&env.state_dir, true);
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(&env)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         // converge would only freeze anyway, and dialling a host someone hid
@@ -916,7 +1093,12 @@ pub async fn cmd_once(env: Env) -> Result<()> {
         }
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
         let (remote, _status) = remote_host.connect_api().await?;
-        converge(&ConvergeDeps {
+        // Never precreates a stream-pool master (see the doc comment on
+        // `ConvergeDeps::precreate_stream_masters`): a one-shot run has
+        // nothing to supervise one afterward. A freshly spawned pooled
+        // streamer here still reuses a master the daemon already created,
+        // or runs direct.
+        let (state_result, _fresh_slot_results) = converge(&ConvergeDeps {
             local: local.clone(),
             remote,
             host: h.clone(),
@@ -927,8 +1109,10 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            precreate_stream_masters: false,
         })
-        .await?;
+        .await;
+        state_result?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
     }
     Ok(())
@@ -937,12 +1121,13 @@ pub async fn cmd_once(env: Env) -> Result<()> {
 /// Un-tombstone mirrors the user closed: deleting the entries makes converge
 /// recreate them through the normal paths. Pokes the daemon; never converges.
 pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>) -> Result<()> {
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(env)?;
     let mut cleared = 0usize;
     for h in &config.hosts {
         if filter_host.is_some_and(|f| f != h.name) {
             continue;
         }
+        let _lock = crate::state::lock_host_blocking(&env.state_dir, &h.name)?;
         let mut state = load_state(&env.state_dir, &h.name);
         let ws_doomed: Vec<String> = state
             .workspaces
@@ -1002,7 +1187,7 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     set_paused(&env, true); // torn down stays down until an explicit start
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(&env)?;
     let local = ApiClient::connect(&env.local_socket).await?;
     for h in &config.hosts {
         teardown(&local, &env.state_dir, &h.name, &log, None).await?;
@@ -1100,6 +1285,160 @@ mod tests {
         // a later success clears it, so a fixed host returns to the forward
         assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
         assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+    }
+
+    #[test]
+    fn stream_master_backoff_retries_a_never_attempted_slot_immediately() {
+        let backoff = StreamMasterBackoff::default();
+        let wanted: std::collections::BTreeSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(backoff.due(&wanted, std::time::Instant::now()), vec![0, 1]);
+    }
+
+    /// A slot that just failed must not be retried again on the very next
+    /// call — that repeated-every-pass retry is exactly what turned one
+    /// unreachable slot into a stall across many converge passes.
+    #[test]
+    fn stream_master_backoff_skips_a_recently_failed_slot() {
+        let mut backoff = StreamMasterBackoff::default();
+        let now = std::time::Instant::now();
+        backoff.note_result(0, false, now);
+        let wanted: std::collections::BTreeSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(backoff.due(&wanted, now), vec![1], "slot 0 just failed, must sit out");
+
+        // once the backoff window has elapsed, it becomes due again
+        let later = now + STREAM_MASTER_RETRY_BACKOFF;
+        assert_eq!(backoff.due(&wanted, later), vec![0, 1]);
+    }
+
+    /// A success clears any remembered failure, so a slot that recovers is
+    /// not artificially held back once it starts working again.
+    #[test]
+    fn stream_master_backoff_success_clears_the_failure() {
+        let mut backoff = StreamMasterBackoff::default();
+        let now = std::time::Instant::now();
+        backoff.note_result(0, false, now);
+        backoff.note_result(0, true, now);
+        let wanted: std::collections::BTreeSet<u32> = [0].into_iter().collect();
+        assert_eq!(backoff.due(&wanted, now), vec![0]);
+    }
+
+    /// A slot no longer assigned to any live pane must not keep a stale
+    /// failure timestamp around — otherwise a slot number reused later (a
+    /// different pane, after enough churn) would inherit its predecessor's
+    /// cooldown for no reason.
+    #[test]
+    fn stream_master_backoff_forgets_slots_no_longer_wanted() {
+        let mut backoff = StreamMasterBackoff::default();
+        let now = std::time::Instant::now();
+        backoff.note_result(0, false, now);
+        backoff.retain_only(&std::collections::BTreeSet::new());
+        let wanted: std::collections::BTreeSet<u32> = [0].into_iter().collect();
+        assert_eq!(backoff.due(&wanted, now), vec![0], "slot 0 must be retried immediately, not held back");
+    }
+
+    /// Regression for the "double-attempt in one tick" bug: converge's
+    /// fresh-slot pre-create and the daemon's post-converge maintenance
+    /// sweep must share one backoff view, or a slot that just failed inside
+    /// converge looks never-attempted to the sweep that immediately follows
+    /// it and gets retried again in the same tick. This composes
+    /// `note_result` + `due` in the exact order
+    /// `converge_and_ensure_masters` runs them, standing in for the parts of
+    /// that async wiring (real ConvergeDeps/ApiClient) this crate has no
+    /// mocking harness for.
+    #[test]
+    fn fresh_slot_failure_suppresses_the_immediate_post_converge_retry() {
+        let mut backoff = StreamMasterBackoff::default();
+        let now = std::time::Instant::now();
+
+        // converge's fresh-slot pre-create just failed slot 0; slot 1 backed
+        // only already-existing panes this pass, so converge never touched it
+        let fresh_slot_results: Vec<(u32, crate::util::Result<()>)> =
+            vec![(0, Err(crate::util::err("unreachable")))];
+        apply_fresh_slot_results(&mut backoff, fresh_slot_results, now);
+
+        // the post-converge sweep runs immediately after, wanting both slots
+        let wanted: std::collections::BTreeSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(
+            backoff.due(&wanted, now),
+            vec![1],
+            "slot 0 must not be retried again in the same tick it just failed in"
+        );
+    }
+
+    /// Regression for a second bug in the same area: `converge`'s return
+    /// shape must keep fresh-slot outcomes available even when a LATER part
+    /// of that same pass (layout/pane RPCs) errors out overall. Before the
+    /// fix, `converge` only handed back `(state, fresh_slot_results)` inside
+    /// its `Result`'s `Ok` arm, so an error anywhere after the precreate step
+    /// silently discarded a precreate failure that had already happened —
+    /// and the immediate post-converge sweep would then retry it right away,
+    /// exactly the double-attempt the backoff exists to prevent.
+    #[test]
+    fn fresh_slot_results_survive_a_later_converge_error() {
+        let mut backoff = StreamMasterBackoff::default();
+        let now = std::time::Instant::now();
+
+        // what `converge()` now returns when precreate failed slot 0 and a
+        // later step then errored: the state Result is Err, but the
+        // fresh-slot outcomes are still present alongside it (not nested
+        // inside the Result, so the two can't be lost together)
+        let converge_return: (crate::util::Result<HostState>, Vec<(u32, crate::util::Result<()>)>) =
+            (Err(crate::util::err("later converge step failed")), vec![(0, Err(crate::util::err("unreachable")))]);
+        let (state_result, fresh_slot_results) = converge_return;
+
+        // applying outcomes must not be skipped by an early `?` on state_result
+        apply_fresh_slot_results(&mut backoff, fresh_slot_results, now);
+        assert!(state_result.is_err(), "the overall converge error must still propagate to the caller");
+
+        let wanted: std::collections::BTreeSet<u32> = [0, 1].into_iter().collect();
+        assert_eq!(
+            backoff.due(&wanted, now),
+            vec![1],
+            "slot 0 must be suppressed even though converge itself errored later"
+        );
+    }
+
+    fn pane_with_slot(local_id: &str, slot: Option<u32>) -> crate::state::PaneEntry {
+        crate::state::PaneEntry {
+            local_id: local_id.into(),
+            tombstone: None,
+            seq: 0,
+            reported: None,
+            stream_slot: slot,
+            workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn stream_pool_status_line_hidden_when_capacity_is_one() {
+        let mut state = HostState::default();
+        state.panes.insert("p1".into(), pane_with_slot("l1", Some(0)));
+        assert_eq!(stream_pool_status_line(1, &state), None);
+    }
+
+    #[test]
+    fn stream_pool_status_line_hidden_until_a_pane_has_a_slot() {
+        // pooling configured, but converge hasn't run yet (or every pane is
+        // still unassigned) — nothing useful to report
+        assert_eq!(stream_pool_status_line(4, &HostState::default()), None);
+    }
+
+    #[test]
+    fn stream_pool_status_line_reports_capacity_and_occupancy() {
+        let mut state = HostState::default();
+        state.panes.insert("p1".into(), pane_with_slot("l1", Some(0)));
+        state.panes.insert("p2".into(), pane_with_slot("l2", Some(0)));
+        state.panes.insert("p3".into(), pane_with_slot("l3", Some(1)));
+        // a tombstoned pane's old slot must not inflate occupancy
+        let mut closed = pane_with_slot("l4", Some(1));
+        closed.tombstone = Some(true);
+        state.panes.insert("p4".into(), closed);
+
+        let line = stream_pool_status_line(2, &state).unwrap();
+        assert_eq!(
+            line,
+            "ssh stream pool: capacity 2 per connection, 2 slot(s) (intended assignment) — 0:2/2, 1:1/2"
+        );
     }
 
     fn argv(parts: &[&str]) -> Vec<Value> {

@@ -44,7 +44,7 @@ use std::io::IsTerminal;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::{load_config, HostConfig};
+use crate::config::{load_config_for_env, HostConfig};
 use crate::mirror::fetch_snapshot;
 use crate::remote::RemoteHost;
 use crate::state::load_state;
@@ -231,7 +231,7 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
 
     let ctx = invocation_context();
     // Same deliberate non-`?` as run(): the local fallback needs no host config.
-    let config = load_config(&env.config_search);
+    let config = load_config_for_env(env);
     let resolved = config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
     let Some(resolved) = resolved else {
@@ -292,7 +292,7 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // these actions are meant to be bound over herdr's native new_tab/split.
     // Hard-failing here would kill that key for anyone who hasn't written
     // hosts.toml yet, with an error about SSH hosts they never asked for.
-    let config = load_config(&env.config_search);
+    let config = load_config_for_env(env);
     let resolved =
         config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
@@ -401,7 +401,7 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
 /// the invocation context like `remote-tab`/`remote-split` do, so a key bound
 /// inside a mirror workspace hides/shows whichever connection it's pressed in.
 async fn resolve_host(env: &Env, host_arg: Option<&str>) -> Result<HostConfig> {
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(env)?;
     if let Some(name) = host_arg {
         return config.hosts.iter().find(|h| h.name == name).cloned().ok_or_else(|| {
             let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
@@ -427,9 +427,15 @@ pub async fn show_cmd(env: Env, host_arg: Option<&str>) -> Result<()> {
 
 async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     let host = resolve_host(env, host_arg).await?;
-    let already = crate::state::is_hidden(&env.state_dir, &host.name);
-    crate::state::set_hidden(&env.state_dir, &host.name, true)
-        .map_err(|e| err(format!("could not mark {} hidden: {e}", host.name)))?;
+    let already = {
+        let _lock = crate::state::lock_host(&env.state_dir, &host.name)
+            .await
+            .map_err(|e| err(format!("could not lock state for {}: {e}", host.name)))?;
+        let already = crate::state::is_hidden(&env.state_dir, &host.name);
+        crate::state::set_hidden(&env.state_dir, &host.name, true)
+            .map_err(|e| err(format!("could not mark {} hidden: {e}", host.name)))?;
+        already
+    };
     // The daemon does the closing (mirror::apply_hidden): it owns the close
     // tracker, and an unmarked close is read back as user intent, which
     // close-through then aims at the remote once `show` rebuilds the mirrors
@@ -467,7 +473,7 @@ async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
     // VISIBLE — a hidden one has no mapped workspace to resolve against — so a
     // context hit that is not hidden must fall through to "show everything",
     // or the key bound inside one mirror can never bring back another host.
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(env)?;
     let ctx = invocation_context();
     if let Some(host) = resolve_context(env, &config.hosts, &ctx).map(|r| r.host) {
         if crate::state::is_hidden(&env.state_dir, &host.name) {
@@ -477,7 +483,10 @@ async fn show(env: &Env, host_arg: Option<&str>) -> Result<()> {
     show_all(env).await
 }
 
-fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
+async fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
+    let _lock = crate::state::lock_host(&env.state_dir, &host.name)
+        .await
+        .map_err(|e| err(format!("could not lock state for {}: {e}", host.name)))?;
     if !crate::state::is_hidden(&env.state_dir, &host.name) {
         return Ok(false);
     }
@@ -487,7 +496,7 @@ fn clear_hidden(env: &Env, host: &HostConfig) -> Result<bool> {
 }
 
 async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
-    if !clear_hidden(env, host)? {
+    if !clear_hidden(env, host).await? {
         println!("{} is not hidden", host.name);
         return Ok(());
     }
@@ -496,10 +505,10 @@ async fn show_one(env: &Env, host: &HostConfig) -> Result<()> {
 }
 
 async fn show_all(env: &Env) -> Result<()> {
-    let config = load_config(&env.config_search)?;
+    let config = load_config_for_env(env)?;
     let mut shown = Vec::new();
     for h in &config.hosts {
-        if clear_hidden(env, h)? {
+        if clear_hidden(env, h).await? {
             shown.push(h.name.clone());
         }
     }
@@ -531,7 +540,7 @@ mod cwd_live_tests {
         let root = std::path::PathBuf::from(std::env::var("PR89_LIVE_ROOT").unwrap());
         let fixture: Value = serde_json::from_str(&std::fs::read_to_string(root.join("fixture.json")).unwrap()).unwrap();
         let env = Env {config_search: vec![root.clone()],state_dir:root.clone(),local_socket:root.join("unused.sock")};
-        let config = load_config(&env.config_search).unwrap();
+        let config = crate::config::load_config(&env.config_search).unwrap();
         let host = &config.hosts[0];
         let mut remote = RemoteHost::new(host, &root);
         let (api, _) = remote.connect_api().await.unwrap();
@@ -542,7 +551,17 @@ mod cwd_live_tests {
         api.request("tab.create", json!({"workspace_id":ws,"cwd":fixture["other"],"focus":true})).await.unwrap();
         let mut state = crate::state::HostState::default();
         state.workspaces.insert(ws.into(), crate::state::WsEntry {local_id:"local-ws".into(), tombstone:None,root_tab_local_id:None,last_remote_label:None});
-        state.panes.insert(pane.into(), crate::state::PaneEntry {local_id:"local-pane".into(),tombstone:None,seq:0,reported:None});
+        state.panes.insert(
+            pane.into(),
+            crate::state::PaneEntry {
+                local_id: "local-pane".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                stream_slot: None,
+                workspace_id: None,
+            },
+        );
         crate::state::save_state(&root,&host.name,&state).unwrap();
         std::env::set_var("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_id":"local-ws","focused_pane_id":"local-pane"}"#);
         for kind in ["tab", "workspace", "split"] {

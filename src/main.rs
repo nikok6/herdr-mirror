@@ -18,6 +18,7 @@ mod config;
 mod cwd_policy;
 mod daemon;
 mod docker;
+mod filelock;
 mod foreground;
 mod grid;
 mod layout_sync;
@@ -31,6 +32,7 @@ mod remote_action;
 mod select;
 mod ssh_relay;
 mod state;
+mod stream_pool;
 mod util;
 
 use util::{Env, Result};

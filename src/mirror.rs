@@ -6,7 +6,7 @@
 // mirror locally" (tombstone — don't recreate) from "remote object went away"
 // (close the mirror).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -300,9 +300,24 @@ pub async fn apply_hidden(
     log: &Logger,
     closes: &crate::closes::Closes,
 ) {
-    // The guard, not the caller's job: this is called on every host_task loop
-    // and before every connected converge, so without it the daemon closes the
-    // mirrors it just created, forever.
+    // Fast, lock-free peek: skip lock acquisition entirely for the
+    // overwhelmingly common "not hidden" case. Not the final answer — see
+    // the re-check below.
+    if !crate::state::is_hidden(state_dir, host_name) {
+        return;
+    }
+    let _lock = match crate::state::lock_host(state_dir, host_name).await {
+        Ok(l) => l,
+        Err(e) => {
+            log.log(&format!("hidden: could not lock state for {host_name}: {e}"));
+            return;
+        }
+    };
+    // Re-read now that this host's state lock is ours alone: `show` (which
+    // clears the marker under the same lock — see remote_action.rs) may have
+    // run between the peek above and acquiring this lock, and closing
+    // mirrors on that stale "hidden" observation would fight the user's
+    // `show` instead of losing the race cleanly.
     let hidden = crate::state::is_hidden(state_dir, host_name);
     if !hidden {
         return;
@@ -433,14 +448,100 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// Whether this pass may create a stream-pool slot master for a freshly
+    /// spawned pooled pane. The daemon (which also runs the post-converge
+    /// `ensure_stream_masters` sweep and holds the process for a master's
+    /// whole `ControlPersist` lifetime) sets this; `cmd_once` does not — a
+    /// one-shot invocation that created a master would leave it running,
+    /// unsupervised, after the process that created it has already exited,
+    /// with nothing left to recover it if it later dies. A pooled streamer
+    /// spawned with no master here still attaches with `ControlMaster=no`
+    /// (see pane.rs::ssh_stream_args): it reuses one if the daemon happens
+    /// to already have created it, or falls back to a direct connection.
+    pub precreate_stream_masters: bool,
+}
+
+/// Build the pane-id -> current-slot map fed to `stream_pool::allocate`.
+///
+/// Starts from every currently-mapped, non-tombstoned pane rather than only
+/// panes present in this pass's `remote_panes` snapshot: the reap-on-absence
+/// logic earlier in `converge_inner` only removes a pane once it has been
+/// missing from two consecutive snapshots (a transient/partial remote
+/// snapshot must not look like a mass removal), so by the time this runs
+/// every pane still in `state_panes` is one that logic chose to keep. The
+/// allocator must honor that same restraint — a pane missing from just this
+/// one snapshot keeps its existing slot rather than looking unassigned, which
+/// would otherwise evict it from its slot and hand that capacity to another
+/// pane for one pass, then move it right back the next. That restraint is
+/// exactly why a pane's own persisted `PaneEntry::workspace_id` (not only
+/// this pass's `remote_panes`) has to gate the seed too: a pane whose
+/// workspace was tombstoned in an EARLIER pass, then goes missing from a
+/// later transient/partial snapshot, would otherwise keep looking like an
+/// ordinary kept pane forever, since it never again appears in
+/// `remote_panes` for the workspace-tombstone check below to catch.
+///
+/// `remote_panes` is `(pane_id, workspace_id)` for this pass's remote
+/// snapshot; a pane whose workspace is `mirror_ws_ids` (another mirror's own
+/// streamer workspace) or a tombstoned workspace in `state_workspaces`, or
+/// that is itself locally tombstoned, is never a candidate — an already-slotted
+/// pane loses its slot as soon as we learn (this pass) that its workspace
+/// qualifies, freeing that capacity for others. A workspace absent from
+/// `state_workspaces` (genuinely new, not yet mapped) is unaffected.
+fn stream_pool_candidates<'a>(
+    state_panes: &BTreeMap<String, PaneEntry>,
+    state_workspaces: &BTreeMap<String, WsEntry>,
+    remote_panes: impl Iterator<Item = (&'a str, &'a str)>,
+    mirror_ws_ids: &HashSet<String>,
+) -> BTreeMap<String, Option<u32>> {
+    let ws_tombstoned = |ws: &str| state_workspaces.get(ws).is_some_and(|w| w.is_tombstoned());
+    let mut candidates: BTreeMap<String, Option<u32>> = state_panes
+        .iter()
+        .filter(|(_, e)| !e.is_tombstoned() && !e.workspace_id.as_deref().is_some_and(ws_tombstoned))
+        .map(|(rid, e)| (rid.clone(), e.stream_slot))
+        .collect();
+    for (pane_id, workspace_id) in remote_panes {
+        if mirror_ws_ids.contains(workspace_id) || ws_tombstoned(workspace_id) {
+            candidates.remove(pane_id);
+            continue;
+        }
+        if state_panes.get(pane_id).is_some_and(|e| e.is_tombstoned()) {
+            continue;
+        }
+        candidates.entry(pane_id.to_string()).or_insert(None);
+    }
+    candidates
+}
+
+/// Shown to the user in a pane's own status row (see
+/// `state::set_pane_hint`/`take_pane_hint`) when its ssh stream-pool slot
+/// assignment changes. Names the only mechanisms that actually pick up a new
+/// slot — a streamer's argv is fixed for its process's life, so an ordinary
+/// ssh reconnect adopts nothing.
+const STREAM_SLOT_CHANGE_HINT: &str =
+    "ssh stream pool slot changed — hide/show or close and reopen this pane to move onto it";
+
+/// Daemon log line for the same event as `STREAM_SLOT_CHANGE_HINT`, with the
+/// pane and slot numbers for operators reading the log.
+fn stream_slot_change_log(host_name: &str, rid: &str, previous: Option<u32>, new_slot: Option<u32>) -> String {
+    format!(
+        "[{host_name}] pane {rid} ssh stream pool slot {previous:?} -> {new_slot:?} — takes effect \
+         when this pane's streamer is recreated (hide/show, or close and reopen the pane)"
+    )
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
 /// known size get no --cols/--rows (the wrapper falls back to a default).
+///
+/// `stream_slots` maps remote pane id -> ssh stream-pool slot (see
+/// `stream_pool`); a pane absent from it, or a host with
+/// `ssh_streams_per_connection <= 1`, gets no `--stream-ctl-path` at all, so
+/// an unconfigured or docker host's argv is byte-identical to before pooling
+/// existed.
 pub(crate) fn cmd_for_pane(
     host: &HostConfig,
     state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
+    stream_slots: &BTreeMap<String, u32>,
 ) -> impl Fn(&str) -> Vec<String> {
     let exe = crate::util::self_exe();
     let target = host.target.clone();
@@ -451,12 +552,16 @@ pub(crate) fn cmd_for_pane(
     let max_rows = host.max_rows;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
+    let ssh_streams_per_connection = host.ssh_streams_per_connection;
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = crate::remote::control_path(state_dir, &host.name)
         .display()
         .to_string();
     let sizes = sizes.clone();
+    let host_name = host.name.clone();
+    let state_dir = state_dir.to_path_buf();
+    let stream_slots = stream_slots.clone();
     move |pane_id: &str| {
         let mut argv = vec![
             exe.clone(),
@@ -489,6 +594,16 @@ pub(crate) fn cmd_for_pane(
         match &kind {
             crate::config::HostKind::Ssh => {
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+                // a *separate* mux master from --ctl-path above: this one is
+                // shared by up to N pane data streams, --ctl-path stays the
+                // control-plane-only master
+                if ssh_streams_per_connection > 1 {
+                    if let Some(&slot) = stream_slots.get(pane_id) {
+                        let stream_ctl =
+                            crate::remote::stream_control_path(&state_dir, &host_name, &target, slot);
+                        argv.extend(["--stream-ctl-path".into(), stream_ctl.display().to_string()]);
+                    }
+                }
             }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
@@ -791,16 +906,52 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
     }
 }
 
-/// Returns the post-converge state so callers don't re-read the state file.
-pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
+/// Returns the post-converge state (when this pass succeeded) alongside the
+/// outcome of any fresh ssh stream-pool slot master this pass pre-created —
+/// unconditionally, independent of whether the rest of converge succeeded,
+/// so a later layout/pane error can't discard a precreate result that
+/// already happened. Deliberately NOT nested inside the `Result`: callers
+/// that drive a persistent per-slot retry backoff (the daemon's
+/// `ensure_stream_masters`) must apply these before propagating the overall
+/// error, or a slot this pass's precreate just tried and failed looks
+/// never-attempted to the immediate post-converge sweep and gets retried in
+/// the same tick.
+///
+/// Holds this host's state lock (`state::lock_host`) for the whole
+/// load → reconcile → save span, so a concurrent `once` (or another host
+/// task, though today only one exists per host) can't interleave a save with
+/// this one and silently discard part of it.
+pub async fn converge(deps: &ConvergeDeps) -> (Result<HostState>, Vec<(u32, Result<()>)>) {
+    let _lock = match crate::state::lock_host(&deps.state_dir, &deps.host.name).await {
+        Ok(l) => l,
+        Err(e) => return (Err(e), Vec::new()),
+    };
     let mut state = load_state(&deps.state_dir, &deps.host.name);
-    let result = converge_inner(deps, &mut state).await;
+    let mut fresh_slot_results: Vec<(u32, Result<()>)> = Vec::new();
+    let result = converge_inner(deps, &mut state, &mut fresh_slot_results).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
-    save_state(&deps.state_dir, &deps.host.name, &state)?;
-    result.map(|()| state)
+    if let Err(e) = save_state(&deps.state_dir, &deps.host.name, &state) {
+        return (Err(e), fresh_slot_results);
+    }
+    (result.map(|()| state), fresh_slot_results)
 }
 
-async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
+/// Whether this converge pass should attempt to pre-create a stream-pool
+/// slot master for a freshly spawned pane: only when pooling is actually in
+/// use for this host AND the caller allows creating one at all (see
+/// `ConvergeDeps::precreate_stream_masters` — `cmd_once` sets this false).
+/// Pulled out of `converge_inner` as its own function because that one
+/// needs a live `ApiClient` this crate has no harness to mock, so the
+/// policy itself is what gets a direct test instead.
+fn should_precreate_fresh_slot_masters(pooling_active: bool, precreate_allowed: bool) -> bool {
+    pooling_active && precreate_allowed
+}
+
+async fn converge_inner(
+    deps: &ConvergeDeps,
+    state: &mut HostState,
+    fresh_slot_results: &mut Vec<(u32, Result<()>)>,
+) -> Result<()> {
     let host = &deps.host;
     let log = &deps.log;
     // Hidden hosts freeze here and go no further. Deliberately BEFORE the
@@ -835,7 +986,6 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             sizes.insert(p.pane_id.clone(), p.rect.clone());
         }
     }
-    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
     // 1. detect mirrors that are gone locally. Always tombstone (never remove)
@@ -977,6 +1127,98 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         };
         if panes.iter().all(|p| pane_is_mirror(p)) {
             mirror_ws_ids.insert(rws.workspace_id.clone());
+        }
+    }
+
+    // Persist which remote workspace each currently-observed, already-mapped
+    // pane belongs to (see `PaneEntry::workspace_id`) — independent of
+    // whether pooling is even on, since a pane created before this field
+    // existed (or before its workspace was known) needs exactly one
+    // observation to backfill it. Set once; a pane never changes workspace.
+    for p in &remote_snap.panes {
+        if let Some(entry) = state.panes.get_mut(&p.pane_id) {
+            if entry.workspace_id.is_none() {
+                entry.workspace_id = Some(p.workspace_id.clone());
+            }
+        }
+    }
+
+    // ssh stream pooling (see `stream_pool`): assign every remote pane that
+    // will have a live mirror by the end of this pass — already-mapped panes
+    // plus ones about to be created below — to a pool slot. Panes inside
+    // another mirror's own streamer workspace are excluded, same as the
+    // creation logic further down never materializes them.
+    let stream_capacity = host.ssh_streams_per_connection;
+    let pooling_active = stream_capacity > 1 && !host.kind.is_docker();
+    let slot_for: BTreeMap<String, u32> = if pooling_active {
+        let candidates = stream_pool_candidates(
+            &state.panes,
+            &state.workspaces,
+            remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())),
+            &mirror_ws_ids,
+        );
+        crate::stream_pool::allocate(&candidates, stream_capacity)
+    } else {
+        BTreeMap::new()
+    };
+    // Reflect the fresh allocation onto already-mapped panes (this loop runs
+    // before any pane is created below, so every entry visited here is a
+    // pre-existing, presumably-already-running pane).
+    //
+    // The pane's running streamer is not restarted: killing it would race a
+    // brand-new stream against whatever the remote pane/agent is mid-doing.
+    // A streamer's argv (and therefore its slot) is fixed for the process's
+    // life, so an ordinary ssh reconnect adopts nothing — only recreating
+    // the streamer PROCESS does (hide/show, or closing and reopening the
+    // pane). `cmd_for` below already reflects the new slot for whichever
+    // comes first; a hint tells the user how to make it happen sooner.
+    for (rid, entry) in state.panes.iter_mut() {
+        let new_slot = slot_for.get(rid).copied();
+        if entry.stream_slot == new_slot {
+            continue;
+        }
+        let previous = entry.stream_slot;
+        entry.stream_slot = new_slot;
+        log.log(&stream_slot_change_log(&host.name, rid, previous, new_slot));
+        crate::state::set_pane_hint(&deps.state_dir, &entry.local_id, STREAM_SLOT_CHANGE_HINT);
+    }
+    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes, &slot_for);
+
+    // Pre-create the ControlMaster for any slot a pane about to be freshly
+    // created (below) will use, BEFORE any such pane is spawned: streamers
+    // never create a master themselves (`ControlMaster=no`, see
+    // pane.rs::ssh_stream_args), so a slot with no live master here means
+    // those panes simply run direct until a later pass creates one. A slot
+    // only ever backing already-existing panes needs no action here; the
+    // daemon's own post-converge sweep (`ensure_stream_masters`) covers
+    // recovering a slot whose master died with no new pane involved.
+    // Non-fatal either way. Gated on `precreate_stream_masters`: `cmd_once`
+    // leaves this false (see its doc comment on `ConvergeDeps`) precisely so
+    // a one-shot run never creates a master nothing then supervises.
+    //
+    // Results are handed back via `fresh_slot_results` rather than only
+    // logged here: the daemon's post-converge sweep runs a persistent
+    // per-slot retry backoff, and without this a slot that just failed here
+    // would look never-attempted to that sweep and get retried immediately
+    // afterward — one failed attempt turning straight into a second.
+    if should_precreate_fresh_slot_masters(pooling_active, deps.precreate_stream_masters) {
+        let fresh_slots: BTreeSet<u32> = slot_for
+            .iter()
+            .filter(|(rid, _)| !state.panes.contains_key(*rid))
+            .map(|(_, slot)| *slot)
+            .collect();
+        for (slot, result) in
+            crate::remote::ensure_stream_masters_concurrent(&deps.state_dir, &deps.host, fresh_slots, log)
+                .await
+        {
+            if let Err(e) = &result {
+                log.log(&format!(
+                    "[{}] could not pre-create ssh stream pool slot {slot} master before \
+                     spawning new pooled panes ({e}) — they will fall back to a direct connection",
+                    host.name
+                ));
+            }
+            fresh_slot_results.push((slot, result));
         }
     }
 
@@ -1213,7 +1455,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq,
+                            reported: None,
+                            stream_slot: slot_for.get(rid).copied(),
+                            workspace_id: Some(rtab.workspace_id.clone()),
+                        },
                     );
                     fresh.push(local_id.clone());
                     to_spawn.push((local_id, rid.clone()));
@@ -1281,7 +1530,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            stream_slot: slot_for.get(&place.pane).copied(),
+                            workspace_id: Some(rtab.workspace_id.clone()),
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
@@ -1317,7 +1573,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                            stream_slot: slot_for.get(&rp.pane_id).copied(),
+                            workspace_id: Some(rtab.workspace_id.clone()),
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
@@ -1520,6 +1783,13 @@ pub async fn apply_remote_closes(
     if closed.is_empty() {
         return;
     }
+    let _lock = match crate::state::lock_host(state_dir, host_name).await {
+        Ok(l) => l,
+        Err(e) => {
+            log.log(&format!("[{host_name}] could not lock state: {e}"));
+            return;
+        }
+    };
     let mut state = load_state(state_dir, host_name);
     let mut changed = false;
     for rid in closed {
@@ -1559,6 +1829,7 @@ pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &
 /// Only panes we actually reported an agent onto; inventing agent rows for
 /// plain mirrored terminals pollutes the agents panel.
 pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, reason: &str) {
+    let Ok(_lock) = crate::state::lock_host(state_dir, host_name).await else { return };
     let mut state = load_state(state_dir, host_name);
     let source = mirror_source(host_name);
     let custom = clamp_status(reason);
@@ -1593,6 +1864,7 @@ pub async fn teardown(
     log: &Logger,
     closes: Option<&crate::closes::Closes>,
 ) -> Result<()> {
+    let _lock = crate::state::lock_host(state_dir, host_name).await?;
     let state = load_state(state_dir, host_name);
     // Wipe the id map BEFORE closing the local windows. teardown (and the
     // restart / zombie-heal that call it) means "stop mirroring here" — never
@@ -1760,6 +2032,7 @@ mod tests {
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
+            ssh_streams_per_connection: 1,
         }
     }
 
@@ -1793,7 +2066,7 @@ mod tests {
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {
-        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None, stream_slot: None, workspace_id: None }
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab
@@ -1807,7 +2080,7 @@ mod tests {
         let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
         panes.insert(
             "p1".into(),
-            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None, stream_slot: None, workspace_id: None },
         );
         let mut ids = Vec::new();
         walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);
@@ -1846,7 +2119,7 @@ mod tests {
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
-        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new());
+        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1864,13 +2137,269 @@ mod tests {
         assert!(argv[0].ends_with("herdr-mirror") || argv[0].contains("herdr_mirror"), "{}", argv[0]);
     }
 
+    /// Capacity 1 (the default) or an unassigned pane must never add
+    /// `--stream-ctl-path`: an unconfigured host's argv must stay
+    /// byte-identical to pre-pooling behavior even if a stale slot map is
+    /// passed in by mistake.
+    #[test]
+    fn unpooled_argv_never_carries_stream_ctl_path() {
+        let state_dir = std::path::Path::new("/state");
+        let mut slots = BTreeMap::new();
+        slots.insert("w1:p1".to_string(), 0u32);
+        // capacity 1: the daemon never builds a non-empty slot map for this
+        // host, but the argv builder itself must still refuse to use one
+        let argv = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), &slots)("w1:p1");
+        assert!(!argv.iter().any(|a| a == "--stream-ctl-path"), "{argv:?}");
+
+        // capacity > 1 but this specific pane has no assigned slot
+        let mut host = ssh_host();
+        host.ssh_streams_per_connection = 4;
+        let argv = cmd_for_pane(&host, state_dir, &HashMap::new(), &BTreeMap::new())("w1:p1");
+        assert!(!argv.iter().any(|a| a == "--stream-ctl-path"), "{argv:?}");
+    }
+
+    /// A pooled pane's argv must carry `--stream-ctl-path`, separate from and
+    /// after `--ctl-path`, and it must round-trip through the pane parser.
+    #[test]
+    fn pooled_argv_carries_stream_ctl_path_separately_from_ctl_path() {
+        let state_dir = std::path::Path::new("/state");
+        let mut host = ssh_host();
+        host.ssh_streams_per_connection = 4;
+        let mut slots = BTreeMap::new();
+        slots.insert("w1:p1".to_string(), 2u32);
+        let argv = cmd_for_pane(&host, state_dir, &HashMap::new(), &slots)("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--always-control",
+                "--ctl-path",
+                "/state/vps.ctl",
+                "--stream-ctl-path",
+                &crate::remote::stream_control_path(state_dir, "vps", "vps", 2).display().to_string(),
+            ]
+        );
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert_eq!(parsed.ctl_path.as_deref(), Some("/state/vps.ctl"));
+        assert_eq!(
+            parsed.stream_ctl_path,
+            Some(crate::remote::stream_control_path(state_dir, "vps", "vps", 2).display().to_string())
+        );
+    }
+
+    fn mapped_pane(local_id: &str, slot: Option<u32>) -> PaneEntry {
+        PaneEntry { local_id: local_id.into(), tombstone: None, seq: 0, reported: None, stream_slot: slot, workspace_id: None }
+    }
+
+    fn mapped_pane_in_ws(local_id: &str, slot: Option<u32>, workspace_id: &str) -> PaneEntry {
+        PaneEntry {
+            local_id: local_id.into(),
+            tombstone: None,
+            seq: 0,
+            reported: None,
+            stream_slot: slot,
+            workspace_id: Some(workspace_id.into()),
+        }
+    }
+
+    fn no_workspaces() -> BTreeMap<String, WsEntry> {
+        BTreeMap::new()
+    }
+
+    /// A hole in one pass's remote snapshot (a transient/partial fetch — the
+    /// exact case the absent-twice reap logic above already guards) must not
+    /// look like a pane removal to the allocator: an already-mapped pane
+    /// missing from `remote_panes` this one pass must keep its slot.
+    #[test]
+    fn candidates_retain_a_mapped_pane_missing_from_one_snapshot() {
+        let mut state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        state_panes.insert("p1".into(), mapped_pane("l1", Some(0)));
+        state_panes.insert("p2".into(), mapped_pane("l2", Some(1)));
+
+        // this pass's snapshot only reports p1 — p2 is a transient hole
+        let remote_panes = vec![("p1", "w1")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &no_workspaces(), remote_panes.into_iter(), &HashSet::new());
+        assert_eq!(candidates.get("p1"), Some(&Some(0)));
+        assert_eq!(candidates.get("p2"), Some(&Some(1)), "a one-pass hole must not evict p2's slot");
+
+        // and once it reappears, it is still simply present with its slot —
+        // not re-added as a fresh unassigned pane
+        let remote_panes = vec![("p1", "w1"), ("p2", "w1")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &no_workspaces(), remote_panes.into_iter(), &HashSet::new());
+        assert_eq!(candidates.get("p2"), Some(&Some(1)));
+        assert_eq!(candidates.len(), 2, "reappearance must not duplicate or add a stray entry");
+    }
+
+    /// A brand-new remote pane not yet mapped is a fresh unassigned
+    /// candidate; a tombstoned (locally-closed) one is never a candidate at
+    /// all, matching the creation logic that never re-materializes it.
+    #[test]
+    fn candidates_add_new_panes_and_skip_tombstoned_ones() {
+        let mut state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        state_panes.insert("p1".into(), mapped_pane("l1", Some(0)));
+        let mut closed = mapped_pane("l2", Some(1));
+        closed.tombstone = Some(true);
+        state_panes.insert("p2".into(), closed);
+
+        let remote_panes = vec![("p1", "w1"), ("p2", "w1"), ("p3", "w1")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &no_workspaces(), remote_panes.into_iter(), &HashSet::new());
+        assert_eq!(candidates.get("p1"), Some(&Some(0)));
+        assert_eq!(candidates.get("p2"), None, "a tombstoned pane is never a candidate");
+        assert_eq!(candidates.get("p3"), Some(&None), "a brand-new pane is unassigned");
+    }
+
+    /// A remote pane belonging to another mirror's own streamer workspace is
+    /// never a candidate, same as the creation logic that never
+    /// materializes it.
+    #[test]
+    fn candidates_skip_panes_in_a_mirror_of_mirror_workspace() {
+        let state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        let mut mirror_ws_ids = HashSet::new();
+        mirror_ws_ids.insert("w9".to_string());
+        let remote_panes = vec![("p1", "w9")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &no_workspaces(), remote_panes.into_iter(), &mirror_ws_ids);
+        assert!(candidates.is_empty());
+    }
+
+    fn tombstoned_ws(local_id: &str) -> WsEntry {
+        WsEntry { local_id: local_id.into(), tombstone: Some(true), root_tab_local_id: None, last_remote_label: None }
+    }
+
+    /// The workspace mirror was closed locally (tombstoned), but its remote
+    /// panes can still show up in a snapshot for a pass or two before the
+    /// cascading pane-tombstone logic catches up — those panes must consume
+    /// no slot, and an already-slotted one must give its slot back up as
+    /// soon as we learn its workspace is tombstoned.
+    #[test]
+    fn candidates_exclude_panes_in_a_tombstoned_workspace() {
+        let mut state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        state_panes.insert("p1".into(), mapped_pane("l1", Some(0))); // already slotted
+        let mut state_workspaces: BTreeMap<String, WsEntry> = BTreeMap::new();
+        state_workspaces.insert("w1".into(), tombstoned_ws("lw1"));
+
+        let remote_panes = vec![("p1", "w1"), ("p2", "w1")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &state_workspaces, remote_panes.into_iter(), &HashSet::new());
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    /// The exact defect an independent review reported: a pane whose
+    /// workspace was tombstoned in an EARLIER pass, then goes missing from a
+    /// later transient/partial snapshot, is never again seen alongside its
+    /// `workspace_id` in `remote_panes` — only `PaneEntry::workspace_id`
+    /// (persisted the first time the pane was observed) can still identify
+    /// it. Without consulting that field, the "retain a one-pass hole"
+    /// restraint (`candidates_retain_a_mapped_pane_missing_from_one_snapshot`)
+    /// would let it keep its slot forever once its workspace is gone.
+    #[test]
+    fn candidates_exclude_a_pane_missing_from_snapshot_whose_persisted_workspace_is_tombstoned() {
+        let mut state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        state_panes.insert("p1".into(), mapped_pane_in_ws("l1", Some(0), "w1"));
+        let mut state_workspaces: BTreeMap<String, WsEntry> = BTreeMap::new();
+        state_workspaces.insert("w1".into(), tombstoned_ws("lw1"));
+
+        // p1 does not appear in this pass's snapshot at all
+        let remote_panes: Vec<(&str, &str)> = vec![];
+        let candidates =
+            stream_pool_candidates(&state_panes, &state_workspaces, remote_panes.into_iter(), &HashSet::new());
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    /// A hole plus reappearance: p1's workspace is tombstoned and it is
+    /// missing this pass (excluded via its persisted workspace_id), but if
+    /// it reappears in a LATER pass it is evicted there too (the existing
+    /// direct-observation path), never resurrected as a candidate in
+    /// between.
+    #[test]
+    fn candidates_stay_excluded_across_a_hole_and_a_reappearance_in_a_tombstoned_workspace() {
+        let mut state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        state_panes.insert("p1".into(), mapped_pane_in_ws("l1", Some(0), "w1"));
+        let mut state_workspaces: BTreeMap<String, WsEntry> = BTreeMap::new();
+        state_workspaces.insert("w1".into(), tombstoned_ws("lw1"));
+
+        let candidates = stream_pool_candidates(
+            &state_panes,
+            &state_workspaces,
+            Vec::<(&str, &str)>::new().into_iter(),
+            &HashSet::new(),
+        );
+        assert!(candidates.is_empty(), "hole: {candidates:?}");
+
+        let candidates = stream_pool_candidates(
+            &state_panes,
+            &state_workspaces,
+            vec![("p1", "w1")].into_iter(),
+            &HashSet::new(),
+        );
+        assert!(candidates.is_empty(), "reappearance: {candidates:?}");
+    }
+
+    /// A workspace that is simply new (not yet in `state_workspaces` at all)
+    /// must not be mistaken for a tombstoned one — its panes still allocate.
+    #[test]
+    fn candidates_still_allocate_panes_in_a_genuinely_new_workspace() {
+        let state_panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        let remote_panes = vec![("p1", "w-new")];
+        let candidates =
+            stream_pool_candidates(&state_panes, &no_workspaces(), remote_panes.into_iter(), &HashSet::new());
+        assert_eq!(candidates.get("p1"), Some(&None), "a new workspace's pane must still be a candidate");
+    }
+
+    /// Migration wording must point at a mechanism that actually adopts a
+    /// new slot (recreating the streamer process), never at reconnect —
+    /// a streamer's argv, and thus its slot, is fixed for the process's life.
+    #[test]
+    fn stream_slot_change_log_names_recreation_not_reconnect() {
+        let msg = stream_slot_change_log("vps", "w1:p1", Some(0), Some(1));
+        assert!(msg.contains("recreated"), "{msg}");
+        assert!(msg.contains("hide/show"), "{msg}");
+        assert!(!msg.to_lowercase().contains("reconnect"), "{msg}");
+    }
+
+    #[test]
+    fn stream_slot_change_hint_directs_to_hide_show_or_reopen() {
+        assert!(STREAM_SLOT_CHANGE_HINT.contains("hide/show"));
+        assert!(STREAM_SLOT_CHANGE_HINT.contains("close and reopen"));
+    }
+
+    /// `cmd_once` must never create a stream-pool master: it has no
+    /// persistent backoff and nothing left running to supervise or recover
+    /// one after the process exits. Only the daemon (pooling active AND
+    /// precreation allowed) precreates.
+    #[test]
+    fn should_precreate_fresh_slot_masters_requires_both_pooling_and_daemon_ownership() {
+        assert!(should_precreate_fresh_slot_masters(true, true), "daemon + pooling: precreates");
+        assert!(!should_precreate_fresh_slot_masters(true, false), "once + pooling: must not precreate");
+        assert!(!should_precreate_fresh_slot_masters(false, true), "daemon, pooling off: nothing to precreate");
+        assert!(!should_precreate_fresh_slot_masters(false, false), "once, pooling off: nothing to precreate");
+    }
+
+    /// Docker panes never carry a stream ctl path: there is no ssh
+    /// ControlMaster to share, so a slot map is simply ignored.
+    #[test]
+    fn docker_argv_ignores_stream_slots() {
+        let mut host = ssh_host();
+        host.ssh_streams_per_connection = 4;
+        host.kind = crate::config::HostKind::DockerContainer("crazy_ride".into());
+        let mut slots = BTreeMap::new();
+        slots.insert("w1:p1".to_string(), 0u32);
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &slots)("w1:p1");
+        assert!(!argv.iter().any(|a| a == "--stream-ctl-path"), "{argv:?}");
+    }
+
     /// When remote_bin is set, it must appear on the argv (cross-process contract
     /// with the pane parser) rather than being re-resolved by the streamer.
     #[test]
     fn ssh_pane_argv_carries_explicit_remote_bin() {
         let mut host = ssh_host();
         host.remote_bin = Some("/opt/herdr".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1891,7 +2420,7 @@ mod tests {
     fn ssh_pane_argv_carries_remote_session() {
         let mut host = ssh_host();
         host.session = Some("work".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1919,7 +2448,7 @@ mod tests {
         host.target = "/Users/n/proj".into();
         host.kind = crate::config::HostKind::DockerFolder("/Users/n/proj".into());
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1949,7 +2478,7 @@ mod tests {
         // absolute path (GUI-launched daemons without /usr/local/bin on PATH)
         // would then silently get "cannot run docker".
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
@@ -1965,7 +2494,7 @@ mod tests {
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
         host.always_control = false;
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1979,12 +2508,12 @@ mod tests {
     fn size_caps_reach_the_streamer_argv() {
         let mut host = ssh_host();
         host.always_control = false;
-        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new())("w1:p1");
         assert!(!uncapped.iter().any(|a| a == "--max-cols" || a == "--max-rows"));
 
         host.max_cols = Some(212);
         host.max_rows = Some(58);
-        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &BTreeMap::new())("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.max_cols, Some(212));
         assert_eq!(parsed.max_rows, Some(58));

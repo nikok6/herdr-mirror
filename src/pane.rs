@@ -19,9 +19,21 @@
 //   --max-rows N        uncapped — control fills the local pane). Set for a
 //                       remote with its own display: the remote keeps its own
 //                       geometry and the rest of the local pane stays blank.
+//   --stream-ctl-path PATH   join the daemon's ssh stream pool at this control
+//                       socket (`ssh_streams_per_connection` in hosts.toml):
+//                       `-S PATH -o ControlMaster=no` on top of the ordinary
+//                       ssh invocation below, so this stream attaches to a
+//                       master the daemon already created (never creating
+//                       one itself) and shares it with up to N others.
+//                       Every other ssh option (ProxyJump, GSSAPI,
+//                       certificates, identity files, agent forwarding, the
+//                       target's own ssh_config) still applies unchanged.
+//                       Distinct from --ctl-path, which stays the daemon's
+//                       own control-plane master.
 //
-// Every stream gets its own direct ssh connection (no shared ControlMaster):
-// isolated, and nothing persists to go stale on a flaky network.
+// Every stream gets its own direct ssh connection by default (no shared
+// ControlMaster): isolated, and nothing persists to go stale on a flaky
+// network. `--stream-ctl-path` is the opt-in exception above.
 //
 // One owner of all state, message-driven: frames, keystrokes, timers, and
 // ssh-child exits arrive on one channel; a session generation number tags
@@ -75,6 +87,12 @@ pub struct Args {
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
     pub ctl_path: Option<String>,
+    /// ssh stream-pool slot's control socket (see module docs). `Some` only
+    /// when the host is configured `ssh_streams_per_connection > 1` and the
+    /// daemon assigned this pane a slot; overrides only the multiplexing
+    /// options on the data-stream ssh invocation in `spawn_session`, never
+    /// `ctl_path` above.
+    pub stream_ctl_path: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
 }
@@ -102,6 +120,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         max_cols: None,
         max_rows: None,
         ctl_path: None,
+        stream_ctl_path: None,
         container: None,
     };
     let mut container_name: Option<String> = None;
@@ -140,6 +159,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     .filter(|&n| n > 0)
             }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
+            "--stream-ctl-path" => args.stream_ctl_path = Some(next("--stream-ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
@@ -234,17 +254,38 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
-    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect();
-    // A pane stream is long-lived and interactive. It must not inherit a
-    // ControlPath from ~/.ssh/config: a stale shared master can hang
-    // the stream before the remote command starts. `-S none` disables control
-    // socket use without changing the daemon's intentional multiplexing.
-    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
-    argv
+/// ssh args for this pane's data-stream connection, ahead of `ssh_target` and
+/// the remote command. Pure and unit-tested on its own (`spawn_session`
+/// itself spawns a real child, which isn't worth mocking just to see its
+/// argv).
+///
+/// Unpooled (the default), a pane stream must not inherit a ControlPath from
+/// ~/.ssh/config: a stale shared master can hang the stream before the
+/// remote command starts, so `-S none` disables control socket use
+/// entirely.
+///
+/// Pooled (`args.stream_ctl_path` is set), the override is ONLY
+/// `-S`/ControlPath and ControlMaster — never `-F none` or anything else —
+/// so every other ssh_config resolution for `args.ssh_target`
+/// (ProxyJump/ProxyCommand, GSSAPI, certificates, identity files, agent
+/// forwarding) rides along unchanged. `ControlMaster=no`, not `auto`: the
+/// streamer must never itself create a slot's master —
+/// `remote::ensure_master_locked` is the sole creator, always under its
+/// cross-process flock, and a streamer racing to create one outside that
+/// lock is exactly the stale-socket race the lock exists to prevent. With
+/// `no`, ssh only ever attaches to an already-listening master, falling back
+/// to an ordinary direct connection if none is listening or the master
+/// refuses (also how a `MaxSessions` refusal behaves) — never failing the
+/// pane, just leaving it unpooled for that connection. `ControlPersist` is
+/// dropped: it only affects a connection that might become a master, which
+/// this one by construction never does.
+fn ssh_stream_args(args: &Args) -> Vec<String> {
+    let mut v: Vec<String> = crate::remote::SSH_COMMON_OPTS.iter().map(|s| s.to_string()).collect();
+    match &args.stream_ctl_path {
+        Some(path) => v.extend(["-S".into(), path.clone(), "-o".into(), "ControlMaster=no".into()]),
+        None => v.extend(["-S".into(), "none".into()]),
+    }
+    v
 }
 
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
@@ -268,7 +309,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &cmd));
+            c.args(ssh_stream_args(args)).arg(&args.ssh_target).arg(cmd);
             c
         }
         Some(ct) => {
@@ -1872,21 +1913,6 @@ mod tests {
         assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
     }
 
-    #[test]
-    fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
-
-        assert_eq!(
-            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
-            [
-                "-S",
-                "none",
-                "work",
-                "exec herdr terminal session observe w5:pM",
-            ]
-        );
-    }
-
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
     /// every existing headless-remote config silently changes behaviour.
     #[test]
@@ -2098,6 +2124,79 @@ mod tests {
         assert_eq!((a.cols, a.rows), (176, 66));
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn stream_ctl_path_parses_separately_from_ctl_path() {
+        let argv: Vec<String> = [
+            "work",
+            "w9:p1",
+            "--ctl-path",
+            "/state/work.ctl",
+            "--stream-ctl-path",
+            "/state/work-s0.ctl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let a = parse_args(&argv).unwrap();
+        assert_eq!(a.ctl_path.as_deref(), Some("/state/work.ctl"));
+        assert_eq!(a.stream_ctl_path.as_deref(), Some("/state/work-s0.ctl"));
+    }
+
+    #[test]
+    fn ssh_stream_args_only_add_multiplexing_options_when_pooled() {
+        let mut args = parse_args(&["work".into(), "w9:p1".into()]).unwrap();
+        let common: Vec<String> = crate::remote::SSH_COMMON_OPTS.iter().map(|s| s.to_string()).collect();
+        let unpooled = ssh_stream_args(&args);
+        // Unpooled, a stream must not inherit a ControlPath from ~/.ssh/config:
+        // a stale shared master can hang it before the remote command starts.
+        let mut expected_unpooled = common.clone();
+        expected_unpooled.extend(["-S".to_string(), "none".into()]);
+        assert_eq!(unpooled, expected_unpooled);
+
+        args.stream_ctl_path = Some("/state/work-s0.ctl".into());
+        let pooled = ssh_stream_args(&args);
+        let mut expected = common;
+        expected.extend(["-S".to_string(), "/state/work-s0.ctl".into(), "-o".into(), "ControlMaster=no".into()]);
+        assert_eq!(pooled, expected);
+        // ControlMaster=no, not auto: the streamer must never create a
+        // master itself, only attach to one the daemon already brought up
+        // under its cross-process lock
+        assert!(!pooled.iter().any(|a| a == "ControlMaster=auto"));
+        // no ControlPersist at all: it only matters for a connection that
+        // might become a master, which this one by construction never does
+        assert!(!pooled.iter().any(|a| a.starts_with("ControlPersist")));
+        // never -F none: ambient ssh_config (ProxyJump, identity files, ...)
+        // must keep resolving normally
+        assert!(!pooled.iter().any(|a| a == "-F"));
+        // never -S none either, once pooled: that would disable control
+        // sockets outright instead of attaching to the pool's socket
+        assert!(!pooled.windows(2).any(|w| w == ["-S", "none"]));
+    }
+
+    /// `spawn_session` appends `ssh_target` then the remote command after
+    /// `ssh_stream_args`'s own argv, unconditionally and in that order — this
+    /// checks the full argv a real ssh invocation sees, for both modes.
+    #[test]
+    fn ssh_stream_full_argv_order_matches_direct_and_pooled_modes() {
+        let full = |args: &Args| -> Vec<String> {
+            let mut v = ssh_stream_args(args);
+            v.push(args.ssh_target.clone());
+            v.push("exec herdr terminal session observe w5:pM".into());
+            v
+        };
+        let mut args = parse_args(&["work".into(), "w9:p1".into()]).unwrap();
+
+        let direct = full(&args);
+        assert_eq!(direct[direct.len() - 4..], ["-S", "none", "work", "exec herdr terminal session observe w5:pM"]);
+
+        args.stream_ctl_path = Some("/state/work-s0.ctl".into());
+        let pooled = full(&args);
+        assert_eq!(
+            pooled[pooled.len() - 6..],
+            ["-S", "/state/work-s0.ctl", "-o", "ControlMaster=no", "work", "exec herdr terminal session observe w5:pM"]
+        );
     }
 
     // --- birth size trust (#23) ---

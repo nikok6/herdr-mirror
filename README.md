@@ -331,10 +331,101 @@ target = "work"
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
+# ssh_streams_per_connection = 1     # opt-in ssh stream pooling — see below.
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
 ```
+
+### SSH stream pooling (opt-in)
+
+Every mirror pane's data stream is, by default, its own direct ssh connection
+— isolated, and nothing shared to go stale. `ssh_streams_per_connection`
+(global or per-host, like `always_control`) instead lets up to N pane streams
+share one ssh connection, multiplexed the same way `ssh -O forward` already
+shares the daemon's own control-plane connection:
+
+```toml
+ssh_streams_per_connection = 4   # up to 4 pane streams per ssh connection
+
+[hosts.vps]
+target = "vps"
+# ssh_streams_per_connection = 8 # per-host override
+```
+
+Absence, or `1`, is today's one-connection-per-pane behavior — nothing
+changes for anyone who doesn't set this. `0` is treated as unset, the same as
+a `max_cols`/`max_rows` typo.
+
+**Capacity, not a hash bucket.** N is a live-stream *ceiling* per connection,
+tracked in each host's `*-map.json` (`streamSlot`) and reassigned only when a
+pane's current slot can no longer hold it — panes are never shuffled around
+just to rebalance. A streamer's argv (and therefore its slot) is fixed for
+its process's life, so an ordinary ssh reconnect adopts nothing; a pane picks
+up a changed slot only when its streamer *process* is recreated — hide/show,
+or closing and reopening the pane — and a one-line hint in the pane says so
+when a change is waiting.
+
+**Isolated from ordinary use.** Pooling only ever overrides the ssh
+multiplexing options (`-S`/ControlPath, `ControlMaster`) on a pane's data
+connection — every other ssh_config resolution for that target (ProxyJump,
+GSSAPI, certificates, identity files, agent forwarding) still applies. It is
+a private socket per host/target/slot, entirely separate from the daemon's
+own `<host>.ctl` control-plane master (foreground polls, paste, clipboard)
+and from plain `ssh <host>`/Auth Buddy, neither of which is ever pointed at a
+pool socket.
+
+**Master lifecycle.** The daemon is the *sole* creator of a slot's
+ControlMaster, always under a cross-process file lock so a concurrent
+converge pass and a separately-invoked `herdr-mirror once` can't race to
+replace the same socket. It pre-creates a slot's master both right before
+spawning newly-created pooled panes and, more broadly, after every converge
+pass — concurrently across slots and on short timeouts, so a single
+unreachable slot can't serialize into a multi-minute stall, and a slot that
+keeps failing is backed off rather than retried on every pass. `once` never
+creates or replaces a master itself, even when it spawns a newly-created
+pooled pane: it is a one-shot client with nothing left running afterward to
+supervise or recover a master it might have started, so its streamers
+attach exactly like the daemon's do — `ControlMaster=no`, reusing whatever
+master the daemon has already brought up for that slot, or falling back to
+a direct connection if there isn't one yet. Pane streams generally connect
+with `ControlMaster=no`: a streamer only ever attaches to a master that
+already exists, never creates one, so it falls back to an ordinary direct
+connection if the slot's master isn't up yet or refuses (same as the
+`MaxSessions` case below) rather than racing to create one outside the
+daemon's lock. Every pool master persists for a bounded idle window rather
+than forever, so a slot no longer used (its panes closed, or a target/N
+change stopped assigning it) lets its master exit and clean up its own
+socket on its own instead of accumulating a permanent background process.
+
+**Failure blast radius.** Every stream sharing a slot's connection dies
+together if that connection drops — the tradeoff for fewer open connections.
+N is your dial on that radius: keep it low if a dropped mux master losing
+several panes at once would be disruptive.
+
+**`MaxSessions` caveat.** N is *Mirror's own* assignment capacity, not a
+guarantee the ssh server will honor it. OpenSSH multiplexes multiple ordinary
+sessions (a plain `ssh host command`, which is what each pooled pane stream
+is) over one connection only up to the server's `MaxSessions` (default 10,
+sometimes lower); current portable OpenSSH's mux client falls through to an
+ordinary direct connection — logging a message, but still succeeding — when a
+session is refused past that limit, verified against upstream source rather
+than documented as a guarantee, so treat it as current-OpenSSH/vendor-
+dependent behavior, not a contract. That fallback is specific to ordinary
+sessions: the `-O check`/`-O forward` administrative commands the daemon's
+own control-plane master relies on have no such fallback and simply fail,
+which is why that code path handles its own errors rather than assuming one.
+
+A pane streaming successfully is therefore **not proof it is actually
+pooled** — a session that quietly fell back to direct looks identical from
+the outside. `herdr-mirror status`'s slot occupancy reflects Mirror's
+*intended* assignment, not a live confirmation of it. Keep N at or below your
+target's effective `MaxSessions` if you want pooling to be reliable rather
+than a best-effort optimization.
+
+**Docker is unaffected.** Docker hosts always `docker exec` a fresh channel
+per stream — there is no ssh connection to share — so this setting is a
+no-op there.
 
 ## Devcontainer
 
