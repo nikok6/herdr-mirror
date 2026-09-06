@@ -212,8 +212,21 @@ enum Msg {
 struct Session {
     gen: u64,
     mode: Mode,
-    pid: i32,
+    process_group: i32,
     stdin: ChildStdin,
+}
+
+/// Stop the transport and every local helper it spawned (notably an ssh
+/// ProxyCommand such as `aws ssm start-session`). Each transport is started as
+/// its own process-group leader, so this cannot signal the pane wrapper itself.
+fn kill_session_process_group(process_group: i32) {
+    if process_group > 0 {
+        unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+}
+
+fn isolate_session_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
@@ -274,12 +287,16 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             c
         }
     };
+    // Keep the transport and all of its local descendants in one independently
+    // killable group. Killing only ssh can orphan a ProxyCommand and leave its
+    // remote terminal controller attached after the mirror pane closes.
+    isolate_session_process_group(&mut builder);
     let mut child = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let pid = child.id().map(|p| p as i32).unwrap_or(0);
+    let process_group = child.id().map(|p| p as i32).unwrap_or(0);
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
@@ -322,7 +339,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, pid, stdin })
+    Ok(Session { gen, mode, process_group, stdin })
 }
 
 // ---------------------------------------------------------------------------
@@ -974,7 +991,7 @@ impl App {
                     let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                kill_session_process_group(s.process_group);
             });
         }
     }
@@ -991,7 +1008,7 @@ impl App {
             Mode::Control => self.control_size(),
         };
         if let Some(s) = self.session.take() {
-            unsafe { libc::kill(s.pid, libc::SIGTERM) };
+            kill_session_process_group(s.process_group);
         }
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
@@ -1764,13 +1781,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // clean shutdown: release control if held, kill the ssh child, restore tty
+    // clean shutdown: release control if held, kill the whole local transport
+    // tree (including any ProxyCommand), restore tty
     if let Some(mut s) = app.session.take() {
         if s.mode == Mode::Control {
             let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        unsafe { libc::kill(s.pid, libc::SIGTERM) };
+        kill_session_process_group(s.process_group);
     }
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
@@ -1789,6 +1807,70 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pane_transport_cleanup_terminates_proxy_command() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid_path = std::env::temp_dir().join(format!(
+            "herdr-mirror-pane-proxy-{}-{nonce}.pid",
+            std::process::id()
+        ));
+        let proxy = format!(
+            "ProxyCommand=sh -c 'echo $$ > {}; exec sleep 30'",
+            pid_path.display()
+        );
+        let mut command = tokio::process::Command::new("ssh");
+        command
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                &proxy,
+                "proxy-test.invalid",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_session_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let process_group = child.id().unwrap() as i32;
+
+        for _ in 0..40 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let proxy_pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        kill_session_process_group(process_group);
+        tokio::time::timeout(Duration::from_secs(1), child.wait())
+            .await
+            .expect("ssh did not exit after its process group was killed")
+            .unwrap();
+
+        let mut proxy_survived = false;
+        for _ in 0..20 {
+            proxy_survived = unsafe { libc::kill(proxy_pid, 0) } == 0;
+            if !proxy_survived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        if proxy_survived {
+            unsafe { libc::kill(proxy_pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(pid_path);
+        assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
+    }
 
     #[test]
     fn pane_ssh_stream_disables_configured_control_sockets() {
@@ -2294,7 +2376,7 @@ mod tests {
             .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
             .spawn().unwrap();
         app.session = Some(Session {
-            gen: 1, mode: Mode::Control, pid: child.id().unwrap() as i32,
+            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
             stdin: child.stdin.take().unwrap(),
         });
         app.mode = Mode::Control;
