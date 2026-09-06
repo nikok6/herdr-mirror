@@ -616,7 +616,7 @@ fn nonempty(e: &str, code: i32) -> String {
 }
 
 /// `Some(true)` = supported, `Some(false)` = too old, `None` = unparseable.
-fn version_supported(version: &str) -> Option<bool> {
+pub(crate) fn version_supported(version: &str) -> Option<bool> {
     let core = version.split(['-', '+']).next()?;
     let mut it = core.split('.');
     let maj: u64 = it.next()?.parse().ok()?;

@@ -19,9 +19,9 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use crate::api::ApiClient;
-use crate::config::{load_config, HostConfig};
-use crate::remote::RemoteHost;
-use crate::util::{Env, Result};
+use crate::config::{load_config, parse_config, remote_herdr_expr, HostConfig};
+use crate::remote::{version_supported, RemoteHost, SSH_COMMON_OPTS};
+use crate::util::{err, Env, Result};
 
 const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
 const PICK_TITLE: &str = "New workspace on...";
@@ -589,7 +589,10 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
         rows.push(Row { main: h.name.clone(), sub });
     }
 
-    rows.push(Row { main: ADD_ROW.into(), sub: "reads ~/.ssh/config".into() });
+    rows.push(Row {
+        main: ADD_ROW.into(),
+        sub: "reads ~/.ssh/config and included files".into(),
+    });
     let add_idx = rows.len() - 1;
 
     // Looped, so leaving the add-a-machine menu returns HERE rather than
@@ -710,29 +713,51 @@ async fn local_workspace_ids(api: &ApiClient) -> Result<std::collections::HashSe
 
 // --- adding a machine from ~/.ssh/config -----------------------------------
 
-/// Aliases from ~/.ssh/config, following `Include` the way ssh does.
-///
-/// Reading only the top file is wrong the moment anyone splits their config,
-/// which is the normal way to organise one: the missing machines simply never
-/// appear in the picker and nothing says why.
-fn ssh_config_hosts() -> Vec<String> {
-    let Ok(home) = std::env::var("HOME") else { return Vec::new() };
+/// Aliases from ~/.ssh/config and its Include files. Discovery is bounded by
+/// both file count and total bytes so a special file or accidental giant glob
+/// cannot strand the picker.
+fn ssh_config_hosts() -> Result<Vec<String>> {
+    const MAX_FILES: usize = 64;
+    const MAX_BYTES: u64 = 1024 * 1024;
+
+    let home = std::env::var("HOME").map_err(|_| err("HOME is not set"))?;
     let home = std::path::PathBuf::from(home);
     let ssh_dir = home.join(".ssh");
+    let root = ssh_dir.join("config");
+    if !root.try_exists()? {
+        return Ok(Vec::new());
+    }
 
-    let mut queue = std::collections::VecDeque::from([ssh_dir.join("config")]);
+    let mut queue = std::collections::VecDeque::from([root]);
     let mut visited = std::collections::HashSet::new();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
+    let mut total_bytes = 0u64;
 
-    // Breadth-first so the main file's hosts come first, and bounded twice over:
-    // a config that includes itself (directly or in a ring) must not spin here,
-    // and neither must a directory full of files.
     while let Some(path) = queue.pop_front() {
-        if visited.len() >= 64 || !visited.insert(path.clone()) {
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !visited.insert(identity) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if visited.len() > MAX_FILES {
+            return Err(err(format!(
+                "ssh config includes more than {MAX_FILES} files; refusing to scan further"
+            )));
+        }
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| err(format!("cannot inspect ssh config {}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(err(format!("ssh config include {} is not a regular file", path.display())));
+        }
+        total_bytes = total_bytes.saturating_add(meta.len());
+        if total_bytes > MAX_BYTES {
+            return Err(err(format!(
+                "ssh config and includes exceed {} KiB; refusing to scan further",
+                MAX_BYTES / 1024
+            )));
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| err(format!("cannot read ssh config {}: {e}", path.display())))?;
         let (hosts, includes) = parse_ssh_config_file(&text);
         for alias in hosts {
             if seen.insert(alias.clone()) {
@@ -740,51 +765,91 @@ fn ssh_config_hosts() -> Vec<String> {
             }
         }
         for pattern in includes {
-            queue.extend(expand_include(&pattern, &home, &ssh_dir));
+            queue.extend(expand_include(&pattern, &home, &ssh_dir)?);
         }
     }
-    out
+    Ok(out)
 }
 
-/// One config file's aliases and its `Include` patterns. Pure, so the rules
-/// stay testable without touching the filesystem.
-///
-/// Patterns are skipped: `*`, `?` and `!` describe a matching RULE, not a
-/// machine you can ssh to by name. Aliases carrying a quote or backslash are
-/// skipped rather than escaped -- they cannot be written as a TOML key without
-/// escaping bugs, and nobody names a host that way on purpose.
+/// OpenSSH-style words: whitespace separates outside quotes, # comments only
+/// begin outside quotes, and backslash quotes the next byte.
+fn ssh_config_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch == '#' {
+            break;
+        } else if ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    if escaped {
+        word.push('\\');
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn importable_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && !alias.starts_with('-')
+        && !alias.contains(['*', '?', '!', '/', '\0'])
+        && !alias.chars().any(char::is_whitespace)
+}
+
+/// One config file's aliases and Include patterns. `keyword=value` and quoted
+/// values are accepted because OpenSSH accepts both forms.
 fn parse_ssh_config_file(text: &str) -> (Vec<String>, Vec<String>) {
     let mut hosts = Vec::new();
     let mut includes = Vec::new();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let mut words = line.split_whitespace();
-        let Some(keyword) = words.next() else { continue };
+        let mut words = ssh_config_words(line).into_iter();
+        let Some(first) = words.next() else { continue };
+        let (keyword, attached) = first.split_once('=').unwrap_or((&first, ""));
+        let mut values: Vec<String> = words.collect();
+        if !attached.is_empty() {
+            values.insert(0, attached.to_string());
+        } else if values.first().is_some_and(|v| v == "=") {
+            values.remove(0);
+        }
         if keyword.eq_ignore_ascii_case("host") {
-            for alias in words {
-                // a backslash cannot appear in a bare TOML key either; compared
-                // as a byte so the source carries no escape to get mangled
-                if alias.contains(['*', '?', '!', '"']) || alias.as_bytes().contains(&92) {
-                    continue;
-                }
-                hosts.push(alias.to_string());
-            }
+            hosts.extend(values.into_iter().filter(|alias| importable_alias(alias)));
         } else if keyword.eq_ignore_ascii_case("include") {
-            includes.extend(words.map(str::to_string));
+            includes.extend(values);
         }
     }
     (hosts, includes)
 }
 
-/// Resolve one `Include` pattern to real files. ssh allows several patterns per
-/// line, `~` for home, paths relative to ~/.ssh, and a glob. There is no glob
-/// crate here, so `*` is handled in the final component, which is where it is
-/// actually used (`Include config.d/*.conf`).
+/// Resolve one Include pattern with the same wildcard vocabulary as glob(3),
+/// across any path component. Metadata follows symlinks, matching ssh's
+/// willingness to read a symlinked config fragment.
 fn expand_include(
     pattern: &str,
     home: &std::path::Path,
     ssh_dir: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
+) -> Result<Vec<std::path::PathBuf>> {
     let path = if let Some(rest) = pattern.strip_prefix("~/") {
         home.join(rest)
     } else if std::path::Path::new(pattern).is_absolute() {
@@ -792,23 +857,86 @@ fn expand_include(
     } else {
         ssh_dir.join(pattern)
     };
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Vec::new() };
-    let Some((prefix, suffix)) = name.split_once('*') else { return vec![path] };
-    let Some(dir) = path.parent() else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut found: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.len() >= prefix.len() + suffix.len()
-                && n.starts_with(prefix)
-                && n.ends_with(suffix)
-        })
-        .map(|e| e.path())
-        .collect();
-    found.sort(); // read_dir order is arbitrary; the menu should not be
-    found
+    let Some(pattern) = path.to_str() else {
+        return Err(err(format!("ssh Include path is not UTF-8: {}", path.display())));
+    };
+    let has_glob = pattern.contains(['*', '?', '[']);
+    let mut found = if has_glob {
+        let mut matches = Vec::new();
+        for entry in glob::glob(pattern)
+            .map_err(|e| err(format!("invalid ssh Include pattern {pattern:?}: {e}")))?
+        {
+            let entry = entry.map_err(|e| err(format!("cannot expand ssh Include {pattern:?}: {e}")))?;
+            let meta = std::fs::metadata(&entry)
+                .map_err(|e| err(format!("cannot inspect ssh config {}: {e}", entry.display())))?;
+            if meta.is_file() {
+                matches.push(entry);
+            }
+        }
+        matches
+    } else {
+        vec![path]
+    };
+    found.sort();
+    Ok(found)
+}
+
+fn probe_ssh_args(target: &str) -> Vec<String> {
+    let cmd = format!("exec {} status --json", remote_herdr_expr(None, None));
+    let mut args = SSH_COMMON_OPTS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    args.extend([
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ControlPath=none".into(),
+        target.into(),
+        cmd,
+    ]);
+    args
+}
+
+fn validate_probe_status(target: &str, stdout: &[u8]) -> Result<()> {
+    let status: Value = serde_json::from_slice(stdout)
+        .map_err(|e| err(format!("{target} returned an invalid herdr status: {e}")))?;
+    if status.pointer("/server/running").and_then(Value::as_bool) != Some(true) {
+        return Err(err(format!("herdr is not running on {target}")));
+    }
+    let version = status
+        .pointer("/server/version")
+        .and_then(Value::as_str)
+        .or_else(|| status.pointer("/client/version").and_then(Value::as_str))
+        .unwrap_or("unknown");
+    match version_supported(version) {
+        Some(true) => Ok(()),
+        Some(false) => Err(err(format!("herdr {version} on {target} is too old for mirroring"))),
+        None => Err(err(format!("cannot parse herdr version {version:?} from {target}"))),
+    }
+}
+
+/// A one-shot check deliberately isolated from RemoteHost: that type owns the
+/// daemon's persistent ControlMaster, which an unsuccessful import must never
+/// leave running in the background.
+async fn probe_machine(target: &str) -> Result<()> {
+    let mut command = tokio::process::Command::new("ssh");
+    command
+        .args(probe_ssh_args(target))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| err(format!("ssh check for {target} timed out")))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(err(if detail.is_empty() {
+            format!("ssh check for {target} exited with {}", output.status)
+        } else {
+            format!("ssh check for {target} failed: {detail}")
+        }));
+    }
+    validate_probe_status(target, &output.stdout)
 }
 
 /// Second leg of the picker: choose an ssh alias, PROVE it works, write it to
@@ -816,10 +944,15 @@ fn expand_include(
 async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
     let known: std::collections::HashSet<&str> =
         existing.iter().flat_map(|h| [h.name.as_str(), h.target.as_str()]).collect();
+    let discovered = ssh_config_hosts()?;
     let candidates: Vec<String> =
-        ssh_config_hosts().into_iter().filter(|a| !known.contains(a.as_str())).collect();
+        discovered.iter().filter(|a| !known.contains(a.as_str())).cloned().collect();
     if candidates.is_empty() {
-        println!("nothing to add: every Host in ~/.ssh/config is already configured");
+        if discovered.is_empty() {
+            println!("nothing to add: no importable Host aliases found in ~/.ssh/config");
+        } else {
+            println!("nothing to add: every Host in ~/.ssh/config is already configured");
+        }
         return Ok(Nav::Back);
     }
     let mut rows: Vec<Row> =
@@ -840,16 +973,13 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
     // never work would otherwise sit in the picker forever, and the picker is
     // the one place that cannot afford a row that lies.
     println!("checking {target}...");
-    let mut remote = RemoteHost::new(&ssh_host(&target), &env.state_dir);
-    let mut probe = remote.connect_api().await;
+    let mut probe = probe_machine(&target).await;
     if probe.is_err() {
-        // First contact with a host that has no live ControlMaster can fail
-        // spuriously -- the control socket does not exist yet, and a multi-hop
-        // ProxyCommand target takes seconds to answer, which surfaces as
-        // "remote herdr server is not running" while it is running perfectly.
-        // A host's first ever use is the worst moment to be strict.
+        // First contact can fail while a key agent wakes up or a multi-hop
+        // ProxyCommand settles. A host's first ever use is the worst moment to
+        // turn one transient into a permanent rejection.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        probe = remote.connect_api().await;
+        probe = probe_machine(&target).await;
     }
     if let Err(e) = probe {
         println!("not added -- {target}: {e}");
@@ -871,40 +1001,57 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
     create_remote(env, added).await.map(|()| Nav::Done)
 }
 
-/// A plain ssh host, used only to probe a candidate before it is written.
-fn ssh_host(target: &str) -> HostConfig {
-    HostConfig {
-        name: target.to_string(),
-        target: target.to_string(),
-        kind: crate::config::HostKind::Ssh,
-        docker_bin: "docker".into(),
-        prefix: target.to_string(),
-        remote_bin: None,
-        session: None,
-        api_transport: crate::config::ApiTransport::Auto,
-        always_control: false,
-        max_cols: None,
-        max_rows: None,
-    }
-}
-
 /// Append a host block to whichever hosts.toml the config actually came from,
-/// creating the file if there is none yet.
+/// creating the file only when none of the searched locations has one.
 ///
 /// The key is always QUOTED. ssh aliases legally contain dots, and a bare
 /// `[hosts.my.host]` nests a table instead of naming a host -- producing a
 /// config that parses fine and contains no such host in it.
 fn append_host(env: &Env, target: &str) -> Result<()> {
-    let path = load_config(&env.config_search)
-        .ok()
-        .and_then(|c| c.source)
-        .unwrap_or_else(|| crate::util::default_config_dir().join("hosts.toml"));
+    let mut existing = None;
+    for path in env.config_search.iter().map(|d| d.join("hosts.toml")) {
+        if path.try_exists()? {
+            existing = Some(path);
+            break;
+        }
+    }
+    let path = match existing {
+        Some(_) => load_config(&env.config_search)?.source.ok_or_else(|| err("config has no source path"))?,
+        None => crate::util::default_config_dir().join("hosts.toml"),
+    };
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(f, "\n[hosts.\"{target}\"]\ntarget = \"{target}\"")?;
-    Ok(())
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(err(format!("cannot read {}: {e}", path.display()))),
+    };
+    let quoted = toml::Value::String(target.to_string()).to_string();
+    let updated = format!("{original}\n[hosts.{quoted}]\ntarget = {quoted}\n");
+    parse_config(&updated).map_err(|e| err(format!("refusing to update {}: {e}", path.display())))?;
+
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("hosts.toml");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{nonce}", std::process::id()));
+    let write = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(updated.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
 }
 
 // --- the menu itself -------------------------------------------------------
@@ -930,7 +1077,7 @@ fn run_menu(rows: &[Row], title: &str, esc_goes_back: bool, note: Option<&str>) 
     let _ = out.write_all(b"\x1b[?25l\x1b[?1000h\x1b[?1006h");
 
     loop {
-        draw(&mut out, rows, sel, title, esc_goes_back, note);
+        let view = draw(&mut out, rows, sel, title, esc_goes_back, note);
         match read_key()? {
             Key::Up => sel = sel.checked_sub(1).unwrap_or(rows.len() - 1),
             Key::Down => sel = (sel + 1) % rows.len(),
@@ -940,8 +1087,9 @@ fn run_menu(rows: &[Row], title: &str, esc_goes_back: bool, note: Option<&str>) 
             }
             // a click on an option row picks it outright; anywhere else ignores
             Key::Click { y } => {
-                if let Some(idx) = (y as usize).checked_sub(FIRST_ROW_Y) {
-                    if idx < rows.len() {
+                if let Some(row) = (y as usize).checked_sub(FIRST_ROW_Y) {
+                    let idx = view.start + row;
+                    if idx < view.end {
                         finish(&mut out);
                         return Ok(Some(idx));
                     }
@@ -967,21 +1115,43 @@ fn run_menu(rows: &[Row], title: &str, esc_goes_back: bool, note: Option<&str>) 
 /// so the two can no longer disagree about where the list actually is.
 const FIRST_ROW_Y: usize = 6;
 
-fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, esc_goes_back: bool, note: Option<&str>) {
+#[derive(Debug, PartialEq)]
+struct Viewport {
+    start: usize,
+    end: usize,
+}
+
+fn viewport(row_count: usize, selected: usize, capacity: usize) -> Viewport {
+    let capacity = capacity.max(1).min(row_count.max(1));
+    let start = selected.saturating_add(1).saturating_sub(capacity).min(row_count.saturating_sub(capacity));
+    Viewport { start, end: (start + capacity).min(row_count) }
+}
+
+fn draw(
+    out: &mut impl Write,
+    rows: &[Row],
+    sel: usize,
+    title: &str,
+    esc_goes_back: bool,
+    note: Option<&str>,
+) -> Viewport {
     // full redraw each keypress: the popup is tiny and this keeps it stateless
     let esc = if esc_goes_back { "esc back" } else { "esc cancel" };
     let cols = term_cols();
+    let footer_rows = if note.is_some() { 3 } else { 2 };
+    let capacity = term_rows().saturating_sub(FIRST_ROW_Y - 1 + footer_rows).max(1);
+    let view = viewport(rows.len(), sel, capacity);
     let name_w = rows.iter().map(|r| r.main.len()).max().unwrap_or(0);
     let rule_w = cols.saturating_sub(8).min(60);
     let _ = out.write_all(b"\x1b[2J\x1b[H");
     let _ = write!(out, "\r\n\r\n    \x1b[1m{title}\x1b[0m\r\n");
     let _ = write!(out, "    \x1b[2m{}\x1b[0m\r\n\r\n", "─".repeat(rule_w));
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().take(view.end).skip(view.start) {
         // Absolute, not "wherever the line feeds landed". The popup used to
         // emit one line more than the pty had rows, so every draw scrolled by
         // one while the click math still assumed the unscrolled layout: every
         // mouse pick selected the row above the one clicked.
-        let _ = write!(out, "\x1b[{};1H", FIRST_ROW_Y + i);
+        let _ = write!(out, "\x1b[{};1H", FIRST_ROW_Y + i - view.start);
         // "    ❯ 1 name   sub" — name column aligned so the subs line up; the
         // sub is dimmed and truncated to the popup width
         let sub_room = cols.saturating_sub(name_w + 14);
@@ -998,12 +1168,23 @@ fn draw(out: &mut impl Write, rows: &[Row], sel: usize, title: &str, esc_goes_ba
             let _ = write!(out, "      {} {:name_w$}\x1b[2m   {}\x1b[0m\r\n", i + 1, row.main, sub);
         }
     }
-    let _ = write!(out, "\r\n    \x1b[2m{}\x1b[0m\r\n", "─".repeat(rule_w));
-    let _ = write!(out, "    \x1b[2mclick or enter pick - up/down move - {esc}\x1b[0m\r\n");
+    let footer_y = FIRST_ROW_Y + view.end - view.start;
+    let _ = write!(out, "\x1b[{};1H    \x1b[2m{}\x1b[0m", footer_y, "─".repeat(rule_w));
+    let position = if rows.len() > capacity {
+        format!(" - {}/{}", sel + 1, rows.len())
+    } else {
+        String::new()
+    };
+    let _ = write!(
+        out,
+        "\x1b[{};1H    \x1b[2mclick or enter pick - up/down move - {esc}{position}\x1b[0m",
+        footer_y + 1
+    );
     if let Some(n) = note {
-        let _ = write!(out, "    \x1b[2m(hosts.toml: {n})\x1b[0m\r\n");
+        let _ = write!(out, "\x1b[{};1H    \x1b[2m(hosts.toml: {n})\x1b[0m", footer_y + 2);
     }
     let _ = out.flush();
+    view
 }
 
 fn term_cols() -> usize {
@@ -1014,6 +1195,16 @@ fn term_cols() -> usize {
         }
     }
     80
+}
+
+fn term_rows() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 {
+            return ws.ws_row as usize;
+        }
+    }
+    15
 }
 
 fn finish(out: &mut impl Write) {
@@ -1210,7 +1401,12 @@ mod cwd_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_include, parse_ssh_config_file};
+    use super::{
+        append_host, expand_include, parse_ssh_config_file, probe_ssh_args,
+        validate_probe_status, viewport, Viewport,
+    };
+    use crate::config::load_config;
+    use crate::util::Env;
 
     #[test]
     fn reads_aliases_skips_patterns_and_keeps_file_order() {
@@ -1255,15 +1451,32 @@ Host with#hash
         // must be ignored: the glob asks for *.conf
         std::fs::write(d.join("notes.txt"), "Host ignored
 ").unwrap();
+        std::os::unix::fs::symlink(d.join("10-work.conf"), d.join("30-linked.conf")).unwrap();
 
-        let got = expand_include("config.d/*.conf", &base, &ssh);
-        assert_eq!(got, vec![d.join("10-work.conf"), d.join("20-home.conf")], "sorted, .txt excluded");
+        let got = expand_include("config.d/*.conf", &base, &ssh).unwrap();
+        assert_eq!(
+            got,
+            vec![d.join("10-work.conf"), d.join("20-home.conf"), d.join("30-linked.conf")],
+            "sorted, .txt excluded, symlinked regular files included"
+        );
+
+        let nested = ssh.join("group-a");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("node.conf"), "Host nested\n").unwrap();
+        assert_eq!(
+            expand_include("group-?/node.[ch]onf", &base, &ssh).unwrap(),
+            vec![nested.join("node.conf")],
+            "wildcards work in directory components and include ? and []"
+        );
 
         // ~ and absolute forms resolve too
-        assert_eq!(expand_include("~/x", &base, &ssh), vec![base.join("x")]);
-        assert_eq!(expand_include("/etc/y", &base, &ssh), vec![std::path::PathBuf::from("/etc/y")]);
+        assert_eq!(expand_include("~/x", &base, &ssh).unwrap(), vec![base.join("x")]);
+        assert_eq!(
+            expand_include("/etc/y", &base, &ssh).unwrap(),
+            vec![std::path::PathBuf::from("/etc/y")]
+        );
         // a relative literal hangs off ~/.ssh, like ssh does
-        assert_eq!(expand_include("extra", &base, &ssh), vec![ssh.join("extra")]);
+        assert_eq!(expand_include("extra", &base, &ssh).unwrap(), vec![ssh.join("extra")]);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1293,5 +1506,75 @@ User bob
 ").0.is_empty());
         assert!(parse_ssh_config_file("Host
 ").0.is_empty(), "a bare Host names nothing");
+    }
+
+    #[test]
+    fn parser_handles_quotes_comments_and_equals_form() {
+        let (hosts, includes) = parse_ssh_config_file(
+            "Host=\"quoted#name\" other # real comment\nInclude=\"config dir/*.conf\"\n",
+        );
+        assert_eq!(hosts, vec!["quoted#name", "other"]);
+        assert_eq!(includes, vec!["config dir/*.conf"]);
+    }
+
+    #[test]
+    fn a_long_menu_keeps_the_selection_inside_a_scrolling_viewport() {
+        assert_eq!(viewport(24, 0, 8), Viewport { start: 0, end: 8 });
+        assert_eq!(viewport(24, 7, 8), Viewport { start: 0, end: 8 });
+        assert_eq!(viewport(24, 8, 8), Viewport { start: 1, end: 9 });
+        assert_eq!(viewport(24, 23, 8), Viewport { start: 16, end: 24 });
+    }
+
+    #[test]
+    fn candidate_probe_explicitly_disables_persistent_ssh_masters() {
+        let args = probe_ssh_args("work");
+        assert!(args.windows(2).any(|a| a == ["-o", "ControlMaster=no"]));
+        assert!(args.windows(2).any(|a| a == ["-o", "ControlPath=none"]));
+        assert_eq!(args[args.len() - 2], "work");
+        assert!(validate_probe_status(
+            "work",
+            br#"{"server":{"running":true,"version":"0.7.2"}}"#
+        )
+        .is_ok());
+        assert!(validate_probe_status(
+            "work",
+            br#"{"server":{"running":false,"version":"0.7.2"}}"#
+        )
+        .is_err());
+        assert!(validate_probe_status(
+            "work",
+            br#"{"server":{"running":true,"version":"0.7.1"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn host_append_validates_and_updates_the_selected_config_atomically() {
+        let base = std::env::temp_dir().join(format!(
+            "hm-pick-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("hosts.toml");
+        std::fs::write(&path, "[hosts.existing]\ntarget = \"existing\"\n").unwrap();
+        let env = Env {
+            config_search: vec![base.clone()],
+            state_dir: base.join("state"),
+            local_socket: base.join("local.sock"),
+        };
+
+        append_host(&env, "new.host").unwrap();
+        let loaded = load_config(&env.config_search).unwrap();
+        assert!(loaded.hosts.iter().any(|h| h.name == "new.host" && h.target == "new.host"));
+
+        let broken = "this is not toml = [";
+        std::fs::write(&path, broken).unwrap();
+        assert!(append_host(&env, "must-not-land").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
