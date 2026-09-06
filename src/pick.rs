@@ -27,7 +27,6 @@ const CWD_ENV: &str = "HERDR_MIRROR_PICK_CWD";
 const PICK_TITLE: &str = "New workspace on...";
 const ADD_TITLE: &str = "Add a machine from ~/.ssh/config";
 const ADD_ROW: &str = "+ add a machine...";
-const BACK_ROW: &str = "< back";
 
 /// Plugin-action leg: open the popup that runs the menu below.
 pub async fn summon(env: Env) -> Result<()> {
@@ -591,7 +590,7 @@ pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
 
     rows.push(Row {
         main: ADD_ROW.into(),
-        sub: "reads ~/.ssh/config and included files".into(),
+        sub: "reads ssh config".into(),
     });
     let add_idx = rows.len() - 1;
 
@@ -955,14 +954,12 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
         }
         return Ok(Nav::Back);
     }
-    let mut rows: Vec<Row> =
+    let rows: Vec<Row> =
         candidates.iter().map(|c| Row { main: c.clone(), sub: String::new() }).collect();
-    rows.push(Row { main: BACK_ROW.into(), sub: "return to the host list".into() });
-    let back_idx = rows.len() - 1;
     // Esc backs out one level here rather than closing the popup: this menu was
     // itself reached by a choice, so the thing to undo is that choice.
     let choice = run_menu(&rows, ADD_TITLE, true, None)?;
-    let Some(i) = choice.filter(|i| *i != back_idx) else {
+    let Some(i) = choice else {
         return Ok(Nav::Back);
     };
     let target = candidates[i].clone();
