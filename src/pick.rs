@@ -19,7 +19,7 @@ use std::io::Write;
 use serde_json::{json, Value};
 
 use crate::api::ApiClient;
-use crate::config::{load_config, parse_config, remote_herdr_expr, HostConfig};
+use crate::config::{load_config, load_config_for_env, parse_config, remote_herdr_expr, HostConfig};
 use crate::remote::{version_supported, RemoteHost, SSH_COMMON_OPTS};
 use crate::util::{err, Env, Result};
 
@@ -39,7 +39,7 @@ async fn open_popup(api: &ApiClient, env: &Env) -> Result<()> {
     // tracks the longest row (name + its dim subtitle) so targets and the cwd
     // hint aren't truncated the moment they matter.
     let cwd = invoking_cwd();
-    let (n_hosts, widest) = match load_config(&env.config_search) {
+    let (n_hosts, widest) = match load_config_for_env(env) {
         Ok(c) => {
             let w = c
                 .hosts
@@ -198,7 +198,7 @@ pub async fn intercept(env: Env, what: &str) -> Result<()> {
     // event — so there is nothing here a user would want to opt out of that
     // they would not rather have fixed. An unreadable config still stops us,
     // because without hosts we cannot tell a mirror workspace from any other.
-    let Ok(config) = load_config(&env.config_search) else { return Ok(()) };
+    let Ok(config) = load_config_for_env(&env) else { return Ok(()) };
     // Nothing to recreate the object on if the daemon cannot act: with it
     // stopped or paused we would close the local tab, create a real one on the
     // remote, and no mirror would ever come back — the failure being silent
@@ -565,7 +565,7 @@ fn tilde(path: &str) -> String {
 pub fn menu(rt: &tokio::runtime::Runtime, env: Env) -> Result<()> {
     // a broken hosts.toml must not brick the picker: local creation needs no
     // hosts, so degrade to a local-only menu and show why
-    let (hosts, default_host, config_note) = match load_config(&env.config_search) {
+    let (hosts, default_host, config_note) = match load_config_for_env(&env) {
         Ok(c) => {
             let d = c.default_host().map(|h| h.name.clone());
             (c.hosts, d, None)
@@ -989,7 +989,7 @@ async fn add_machine(env: &Env, existing: &[HostConfig]) -> Result<Nav> {
     // Re-read rather than reuse the probe's hand-built config, so the workspace
     // opened now uses exactly the HostConfig every later run will parse. It also
     // proves the block just appended round-trips.
-    let cfg = load_config(&env.config_search)?;
+    let cfg = load_config_for_env(env)?;
     let Some(added) = cfg.hosts.iter().find(|h| h.name == target).cloned() else {
         return Err(crate::util::err(format!(
             "{target} was written to hosts.toml but did not parse back"

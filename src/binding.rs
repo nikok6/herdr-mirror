@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
-use crate::config::load_config;
+use crate::config::load_config_for_env;
 use crate::remote::RemoteHost;
 use crate::util::{err, herdr_config_path, Env, Result};
 
@@ -121,7 +121,7 @@ pub async fn remote_actions(env: Env, host_arg: Option<&str>) -> Result<()> {
     if host_arg != Some("local") {
         // remote-actions is a discovery command, so unlike remote-invoke a
         // missing/broken hosts.toml only matters when hosts were asked for
-        let hosts = match load_config(&env.config_search) {
+        let hosts = match load_config_for_env(&env) {
             Ok(c) => c.hosts,
             Err(e) if host_arg.is_none() => {
                 println!("(no hosts listed: {e})");

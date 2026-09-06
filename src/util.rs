@@ -69,7 +69,11 @@ impl Env {
                 PathBuf::from(sock)
             }
         };
-        Ok(Env { config_search, state_dir, local_socket })
+        Ok(Env {
+            config_search,
+            state_dir,
+            local_socket,
+        })
     }
 }
 
@@ -173,9 +177,11 @@ pub fn cli_link_state() -> CliLink {
 pub fn cli_link_problem() -> Option<String> {
     match cli_link_state() {
         CliLink::Missing => Some(format!("{} is missing", cli_link_path().display())),
-        CliLink::Dangling(t) => {
-            Some(format!("{} dangles (-> {})", cli_link_path().display(), t.display()))
-        }
+        CliLink::Dangling(t) => Some(format!(
+            "{} dangles (-> {})",
+            cli_link_path().display(),
+            t.display()
+        )),
         _ => None,
     }
 }
@@ -233,12 +239,19 @@ pub struct Logger {
 
 impl Logger {
     pub fn new(state_dir: &Path, also_stdout: bool) -> Logger {
-        Logger { file: state_dir.join("daemon.log"), also_stdout }
+        Logger {
+            file: state_dir.join("daemon.log"),
+            also_stdout,
+        }
     }
 
     pub fn log(&self, msg: &str) {
         let line = format!("{} {}\n", now_iso(), msg);
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&self.file) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+        {
             let _ = f.write_all(line.as_bytes());
         }
         if self.also_stdout {
@@ -297,13 +310,151 @@ pub fn pid_alive(pid: i32) -> bool {
 /// took, and retype it when it didn't.
 /// Squash anything that isn't `[A-Za-z0-9]` so an id can name a file.
 pub fn sane_component(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// FNV-1a, 64-bit, as 16 hex chars.
+///
+/// NOT `DefaultHasher`: values derived from this land in paths the daemon
+/// and every streamer must derive identically, and it has to survive a
+/// toolchain upgrade. std's hasher is explicitly unstable across Rust
+/// releases, so a bump would silently move a host's socket and orphan its
+/// live ControlMaster. FNV-1a is a published algorithm, so the output is
+/// fixed by spec rather than by implementation detail. Full 64-bit output
+/// (not truncated to 32) keeps a real collision astronomically unlikely.
+/// `short_hash_is_stable` (below) pins the exact value so a future swap
+/// cannot move anyone's paths unnoticed. Not used for the control-plane
+/// `.ctl` socket of a long SAFE host name — see `remote::legacy_socket_hash`
+/// for why that one path stays on the original 32-bit value.
+///
+/// Hashes the raw bytes rather than going through `Hash for str`, which
+/// appends a terminator byte and would give a different (still stable, but
+/// arbitrary) value.
+pub fn short_hash(s: &str) -> String {
+    use std::hash::Hasher;
+
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(s.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+/// Whether `s` is safe to use as a host-artifact stem at the root of
+/// `state_dir`: every artifact this crate derives from a host name (state
+/// map, hidden marker, host lock, atomic temp file, control-plane socket)
+/// always appends a suffix (`.ctl`, `-map.json`, `.hidden`, `.state.lock`)
+/// — and the atomic temp file a leading `.` too — before joining, so the
+/// bare stem is never the WHOLE path component by itself. That is what
+/// makes `.`/`..`/empty harmless here even though `Path::join` would
+/// resolve a BARE `.`/`..` component as "here"/"parent": `format!("{stem}.ctl")`
+/// with stem `.` or `..` produces the literal filenames `..ctl`/`...ctl`
+/// (or `.ctl` for an empty stem), never the actual one/two-character
+/// special components. A raw `/` is the one thing no suffix can
+/// neutralize — it embeds a component boundary in the MIDDLE of a
+/// filename, wherever it falls — and NUL is invalid in a Unix filename at
+/// all, so those two are the only bytes that require hashing away instead
+/// (see `unsafe_host_artifacts_dir`). A backslash is an ordinary character
+/// on this crate's only supported platforms (macOS/Linux), not a
+/// separator, so it does not need excluding either.
+///
+/// Nothing is reserved beyond that: an unusual-but-safe name (an
+/// `h#`-prefixed one, an empty one, a bare `.`/`..` one, all included) is
+/// exactly as safe as any other and stays at the root of `state_dir` with
+/// its untouched v0.4.1 path. Disjointness between a root-level safe name
+/// and an internal hashed artifact comes from directory structure
+/// (`unsafe_host_artifacts_dir`, `remote`'s `.s`) — see their doc comments
+/// — never from excluding any particular name.
+pub fn is_safe_path_component(s: &str) -> bool {
+    !s.contains('/') && !s.contains('\0')
+}
+
+/// Directory for every artifact derived from an UNSAFE host name (state
+/// map, hidden marker, host lock, atomic temp file, control-plane socket):
+/// a host name is a user-chosen TOML table key, so nothing stops it from
+/// containing a `/` or embedding a NUL, neither of which any suffix can
+/// keep contained to one literal filename (see `is_safe_path_component`).
+/// Named `.h`, not `.hosts`, to leave more of the sockaddr_un budget for
+/// the hashed stem itself once this is nested under `state_dir` (see
+/// `remote::control_socket_base`, which validates the result against that
+/// budget). Private (mode 0700, via `ensure_private_dir`) and, critically,
+/// structurally disjoint from every root-level safe-name path right next
+/// to it: two different directories can never produce the same full path
+/// no matter what either one's stem looks like, which is what makes this
+/// safe as the sole disjointness mechanism — no reserved filename prefix
+/// needed, and so no safe name (an `h#`-prefixed, empty, or dot-only one
+/// included) is ever diverted from its exact v0.4.1 path.
+pub fn unsafe_host_artifacts_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(".h")
+}
+
+/// Stable stem for an unsafe host name's artifacts within
+/// `unsafe_host_artifacts_dir`: its 64-bit hash. Two DIFFERENT unsafe host
+/// names sharing this stem would be a real (astronomically unlikely) 64-bit
+/// collision; `config::validate_unique_host_stems` checks for it at config
+/// load.
+pub fn unsafe_host_stem(host_name: &str) -> String {
+    short_hash(host_name)
+}
+
+/// Create `dir` (and its ancestors) with mode 0700 if it doesn't already
+/// exist: every internal-artifacts subdirectory (`unsafe_host_artifacts_dir`,
+/// `remote`'s `.s`) holds hashed-but-still-identifying material for hosts
+/// that couldn't safely live at the root, so it shouldn't be
+/// group/world-traversable even if `state_dir` itself is looser. A no-op,
+/// not an error, if the directory already exists (mirrors `create_dir_all`);
+/// mode only applies at creation, so a pre-existing directory's permissions
+/// are left alone.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Base directory + filename stem for a host-derived artifact (state map,
+/// hidden marker, host lock, atomic temp file): the root of `state_dir`
+/// with the host name used verbatim when it's safe — the common case, and
+/// the one every existing install's paths already use, completely
+/// unmodified — or `unsafe_host_artifacts_dir` with its hashed stem
+/// otherwise. Config resolution additionally rejects two configured unsafe
+/// hosts whose hash collides outright (see
+/// `config::validate_unique_host_stems`), so that check is defense in
+/// depth, not the only guard against a real (astronomically unlikely)
+/// 64-bit collision. NOT used for the control-plane socket — see
+/// `remote::control_socket_base`, which has a separate, sockaddr_un-budget-
+/// aware path for a safe but overlong name.
+pub fn host_artifact_base(state_dir: &Path, host_name: &str) -> (PathBuf, String) {
+    if is_safe_path_component(host_name) {
+        (state_dir.to_path_buf(), host_name.to_string())
+    } else {
+        let dir = unsafe_host_artifacts_dir(state_dir);
+        let _ = ensure_private_dir(&dir);
+        (dir, unsafe_host_stem(host_name))
+    }
+}
+
+/// 64-bit hash identifying one host+target stream-pool namespace — the set
+/// of slot sockets a pooled ssh host's pane streams for one target can use
+/// — shared by `remote::stream_control_path` (which appends a fixed-width
+/// slot suffix on top, see there) and `config::validate_unique_stream_namespaces`
+/// (checked once per pooled host, not per slot: `ssh_streams_per_connection`
+/// is a per-slot pane-count *capacity*, not a slot count, so a config-time
+/// check can never enumerate "every slot" — the number of slots actually
+/// used depends on how many panes are open, not on this number, and can
+/// exceed it) — one implementation so the two can never drift on what "the
+/// same namespace" means.
+pub fn stream_namespace_hash(host_name: &str, target: &str) -> String {
+    short_hash(&format!("{host_name}\u{0}{target}"))
 }
 
 pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
-    state_dir
-        .join("streamer-pids")
-        .join(format!("{}--{}.pid", sane_component(ssh_target), sane_component(pane_target)))
+    state_dir.join("streamer-pids").join(format!(
+        "{}--{}.pid",
+        sane_component(ssh_target),
+        sane_component(pane_target)
+    ))
 }
 
 /// A launch claim exists from the first local `pane.send_text` until the
@@ -311,7 +462,9 @@ pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) 
 /// that pane during this interval: the first streamer can already own stdin
 /// even when herdr's process snapshot still reports the shell.
 pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
-    state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
+    state_dir
+        .join("streamer-spawns")
+        .join(format!("{}.pending", sane_component(local_pane_id)))
 }
 
 /// How long a `.pending` claim may block another launch. The retype loop is
@@ -340,7 +493,9 @@ pub enum StreamerSpawnClaim {
 /// pane). This addresses one by where it is showing it, which is the only handle
 /// a herdr event hook has: the hook is told a local pane id and nothing else.
 pub fn pane_pid_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
-    state_dir.join("pane-pids").join(format!("{}.pid", sane_component(local_pane_id)))
+    state_dir
+        .join("pane-pids")
+        .join(format!("{}.pid", sane_component(local_pane_id)))
 }
 
 pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> bool {
@@ -381,7 +536,11 @@ pub fn claim_streamer_spawn(
     }
     // one retry: a stale file we just unlinked can lose create_new to a racer
     for _ in 0..2 {
-        let mut claim = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut claim = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if pending_is_fresh(&path) {
@@ -524,7 +683,10 @@ mod tests {
             .unwrap()
             .as_secs() as libc::time_t;
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let times = libc::utimbuf { actime: past, modtime: past };
+        let times = libc::utimbuf {
+            actime: past,
+            modtime: past,
+        };
         assert_eq!(unsafe { libc::utime(cpath.as_ptr(), &times) }, 0);
 
         assert_eq!(
@@ -558,6 +720,19 @@ mod tests {
     }
 
     #[test]
+    fn short_hash_is_stable() {
+        // Golden values. These bytes are baked into live socket/state paths,
+        // so a change here silently relocates every host derived from an
+        // unsafe or overlong name. If a hashing swap ever moves them, this
+        // must fail first.
+        assert_eq!(short_hash("vps"), "693e19194f02d738");
+        assert_eq!(
+            short_hash("prod-us-east-1-application-server-cluster-node-alpha"),
+            "18b2f02acbd62d65"
+        );
+    }
+
+    #[test]
     fn replacement_path_must_exist_and_be_executable() {
         let root = test_state_dir("replacement-exe");
         fs::create_dir_all(&root).unwrap();
@@ -566,5 +741,139 @@ mod tests {
         let reported = PathBuf::from(format!("{} (deleted)", candidate.display()));
         assert_eq!(resolve_reported_exe(&reported), None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_artifact_base_keeps_ordinary_names_at_the_root_verbatim() {
+        for name in ["azure", "rdev", "prod-us-east-1", "vps.example.com", "a_b"] {
+            let dir = tmpdir("artifact-base");
+            let (base, stem) = host_artifact_base(&dir, name);
+            assert_eq!(base, dir, "{name}");
+            assert_eq!(stem, name, "{name}");
+        }
+    }
+
+    /// The exact compatibility break a later review reported: an `h#`-
+    /// prefixed name is just an ordinary safe TOML table key (quoted), not a
+    /// reserved one — it keeps the exact v0.4.1 root-level path, same as any
+    /// other safe name.
+    #[test]
+    fn host_artifact_base_keeps_an_h_hash_prefixed_name_at_the_root_verbatim() {
+        let dir = tmpdir("artifact-base");
+        let (base, stem) = host_artifact_base(&dir, "h#prod");
+        assert_eq!(base, dir);
+        assert_eq!(stem, "h#prod");
+    }
+
+    #[test]
+    fn host_artifact_base_hashes_traversal_and_separator_names_under_the_private_subdir() {
+        let dir = tmpdir("artifact-base");
+        for unsafe_name in ["a/b", "/etc/passwd", "../../escape", "a/../b"] {
+            let (base, stem) = host_artifact_base(&dir, unsafe_name);
+            assert_eq!(base, unsafe_host_artifacts_dir(&dir), "{unsafe_name}");
+            assert!(is_safe_path_component(&stem), "{unsafe_name} -> {stem}");
+            assert_eq!(stem, unsafe_host_stem(unsafe_name), "{unsafe_name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact compatibility break a later review reported: `.`/`..`/
+    /// empty are NOT unsafe here — every artifact appends a suffix before
+    /// joining (see `is_safe_path_component`'s doc comment), so these stay
+    /// at the root with their host name used verbatim, same as any other
+    /// safe name.
+    #[test]
+    fn host_artifact_base_keeps_dot_and_empty_names_at_the_root_verbatim() {
+        let dir = tmpdir("artifact-base");
+        for name in ["", ".", ".."] {
+            let (base, stem) = host_artifact_base(&dir, name);
+            assert_eq!(base, dir, "{name:?}");
+            assert_eq!(stem, name, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn host_artifact_base_keeps_unicode_names_at_the_root_verbatim() {
+        let dir = tmpdir("artifact-base");
+        let name = "réservé-hôte-日本語";
+        let (base, stem) = host_artifact_base(&dir, name);
+        assert_eq!(base, dir);
+        assert_eq!(stem, name);
+    }
+
+    #[test]
+    fn host_artifact_base_is_deterministic_for_distinct_unsafe_names() {
+        let dir = tmpdir("artifact-base");
+        assert_eq!(
+            host_artifact_base(&dir, "a/b"),
+            host_artifact_base(&dir, "a/b")
+        );
+        assert_ne!(
+            host_artifact_base(&dir, "a/b"),
+            host_artifact_base(&dir, "c/d")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The exact bug an earlier review reported (a plain, ordinary-looking
+    /// safe host name equal to another host's hashed stem) cannot reproduce
+    /// at all now: the two live in different directories, so their full
+    /// paths are never equal regardless of what either stem looks like.
+    #[test]
+    fn reported_collision_no_longer_reproduces() {
+        let dir = tmpdir("artifact-base");
+        let unsafe_name = "x/EaL2b7VcKy";
+        let lookalike_safe_name = "92f037a4";
+        let (unsafe_base, _unsafe_stem) = host_artifact_base(&dir, unsafe_name);
+        let (safe_base, safe_stem) = host_artifact_base(&dir, lookalike_safe_name);
+        assert_eq!(safe_base, dir);
+        assert_eq!(safe_stem, lookalike_safe_name);
+        assert_ne!(
+            unsafe_base, safe_base,
+            "different directories: can never collide"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The compatibility break a later review reported: a host literally
+    /// named to look like a hashed artifact (`h#...`) is still just a safe
+    /// name — it must never be diverted into `.h/`.
+    #[test]
+    fn a_name_that_looks_like_a_hashed_stem_still_stays_at_the_root() {
+        let dir = tmpdir("artifact-base");
+        let lookalike = "h#deadbeefdeadbeef";
+        let (base, stem) = host_artifact_base(&dir, lookalike);
+        assert_eq!(base, dir);
+        assert_eq!(stem, lookalike);
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir("private-dir").join("nested").join("child");
+        ensure_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "must not be group/world-traversable");
+        // idempotent: calling again on an existing dir must not error
+        ensure_private_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let salt = &counter as *const u64 as usize;
+        let unique = short_hash(&format!(
+            "{}-{nanos}-{counter}-{salt:x}",
+            std::process::id()
+        ));
+        std::env::temp_dir().join(format!("hm-util-{tag}-{unique}"))
     }
 }
