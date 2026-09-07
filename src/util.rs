@@ -314,6 +314,38 @@ pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> Pat
     state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
 }
 
+/// Desired stream state for one local mirror pane. Its existence means the
+/// pane wrapper must not retain an ssh/observe session.
+pub fn streamer_pause_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir.join("streamer-pause").join(format!("{}.pause", sane_component(local_pane_id)))
+}
+
+pub fn streamer_paused(state_dir: &Path, local_pane_id: &str) -> bool {
+    streamer_pause_path(state_dir, local_pane_id).exists()
+}
+
+/// Set one streamer's desired state. The caller sends SIGUSR1 after this write
+/// or removal so a live wrapper observes it immediately.
+pub fn set_streamer_paused(
+    state_dir: &Path,
+    local_pane_id: &str,
+    paused: bool,
+) -> std::io::Result<()> {
+    let path = streamer_pause_path(state_dir, local_pane_id);
+    if paused {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(path, "")
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// How long a `.pending` claim may block another launch. The retype loop is
 /// 3s+4s+4s; anything older is leftover from a crashed or abandoned attempt
 /// and must not freeze heal forever.
@@ -509,6 +541,15 @@ mod tests {
             StreamerSpawnClaim::Claimed
         );
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn streamer_pause_path_is_sane_and_separate() {
+        let state_dir = test_state_dir("pause-path");
+        let pause = streamer_pause_path(&state_dir, "w1:p1/unsafe");
+        assert_eq!(pause, state_dir.join("streamer-pause").join("w1_p1_unsafe.pause"));
+        assert_eq!(pause.parent(), Some(state_dir.join("streamer-pause").as_path()));
+        assert_ne!(pause, streamer_spawn_pending_path(&state_dir, "w1:p1/unsafe"));
     }
 
     #[test]

@@ -13,12 +13,12 @@
 // arrive through one select loop, so converge and the status fast-path never
 // interleave.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
@@ -28,11 +28,12 @@ use tokio::time::Instant;
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
-    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
+    apply_remote_closes, converge, fetch_snapshot, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
     teardown, AgentInfo, ConvergeDeps,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
+use crate::visibility::{self, PaneStreamState, StreamAction, StreamPolicy};
 
 // --- pidfile / pause marker ---
 
@@ -162,7 +163,189 @@ struct HostCtx {
     local: ApiClient,
     log: Logger,
     close_remote_on_local_close: bool,
+    stream_policy: StreamPolicy,
     closes: crate::closes::Closes,
+}
+
+/// Per-host, process-lifetime visibility bookkeeping. The desired stream state
+/// itself lives in pause files so a pane wrapper can survive daemon restarts;
+/// only the grace timestamp is intentionally ephemeral.
+#[derive(Default)]
+struct StreamTracker {
+    panes: HashMap<String, PaneStreamState>,
+    orphan_reap: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for StreamTracker {
+    fn drop(&mut self) {
+        if let Some(task) = self.orphan_reap.take() {
+            task.abort();
+        }
+    }
+}
+
+impl StreamTracker {
+    fn refresh(
+        &mut self,
+        state: &HostState,
+        state_dir: &std::path::Path,
+        policy: &StreamPolicy,
+        visible: &HashSet<String>,
+        now: StdInstant,
+    ) {
+        let mapped: HashSet<String> = state
+            .panes
+            .values()
+            .filter(|entry| !entry.is_tombstoned())
+            .map(|entry| entry.local_id.clone())
+            .collect();
+        self.panes.retain(|local_id, _| mapped.contains(local_id));
+        for local_id in mapped {
+            let stream = self.panes.entry(local_id.clone()).or_insert_with(|| PaneStreamState {
+                local_id: local_id.clone(),
+                streaming: !crate::util::streamer_paused(state_dir, &local_id),
+                hidden_since: None,
+            });
+            // The marker is the source of truth across daemon restarts and
+            // after a streamer is recreated by the zombie-heal path.
+            stream.streaming = !crate::util::streamer_paused(state_dir, &local_id);
+            if policy.visible_only && !visible.contains(&local_id) {
+                stream.hidden_since.get_or_insert(now);
+            } else {
+                stream.hidden_since = None;
+            }
+        }
+    }
+
+    fn tracked(&self) -> Vec<PaneStreamState> {
+        let mut tracked: Vec<PaneStreamState> = self.panes.values().cloned().collect();
+        tracked.sort_by(|left, right| left.local_id.cmp(&right.local_id));
+        tracked
+    }
+
+    fn set_streaming(&mut self, local_id: &str, streaming: bool) {
+        if let Some(stream) = self.panes.get_mut(local_id) {
+            stream.streaming = streaming;
+        }
+    }
+
+    /// One host-level delayed reaper naturally batches all detachments in a
+    /// focus transition. Do not await it from converge: cleanup is best-effort
+    /// and must not hold up normal mirror reconciliation.
+    fn schedule_orphan_reap(
+        &mut self,
+        log: Logger,
+        host_name: String,
+        reaper: crate::remote::OrphanReaper,
+    ) {
+        if self.orphan_reap.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        self.orphan_reap = Some(tokio::spawn(async move {
+            // Let sshd finish reparenting the remote observe child before its
+            // ppid is inspected. A disconnected link cannot be reaped here;
+            // the next successful connection runs its own early sweep.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Err(e) = reaper.reap_orphans().await {
+                log.log(&format!("[{host_name}] batched remote orphan reap failed: {e}"));
+            }
+        }));
+    }
+
+    fn cancel_orphan_reap(&mut self) {
+        if let Some(task) = self.orphan_reap.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Apply visibility policy after a complete converge. The map remains intact:
+/// this only changes each wrapper's desired remote-session state, then wakes
+/// that wrapper to carry out the transition.
+async fn reconcile_streamers(
+    ctx: &HostCtx,
+    state: &HostState,
+    tracker: &mut StreamTracker,
+    remote_host: &crate::remote::RemoteHost,
+) -> Option<Instant> {
+    let local_snapshot = match fetch_snapshot(&ctx.local).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            // Do not turn a transient local API failure into a mass pause. The
+            // next event/poll retries the decision with a fresh snapshot.
+            ctx.log.log(&format!("[{}] cannot read local focus for stream policy: {e}", ctx.host.name));
+            return None;
+        }
+    };
+    let visible = visibility::visible_local_panes(&local_snapshot);
+    let now = StdInstant::now();
+    tracker.refresh(state, &ctx.env_state_dir, &ctx.stream_policy, &visible, now);
+
+    let mut stopped = false;
+    for action in visibility::plan_streams(&ctx.stream_policy, true, &visible, &tracker.tracked(), now) {
+        let (local_id, paused) = match action {
+            StreamAction::Start(local_id) => (local_id, false),
+            StreamAction::Stop(local_id) => (local_id, true),
+        };
+        match crate::util::set_streamer_paused(&ctx.env_state_dir, &local_id, paused) {
+            Ok(()) => {
+                tracker.set_streaming(&local_id, !paused);
+                let _ = crate::util::poke_pane_streamer(&ctx.env_state_dir, &local_id);
+                if paused {
+                    stopped = true;
+                }
+            }
+            Err(e) => ctx.log.log(&format!(
+                "[{}] cannot {} streamer {local_id}: {e}",
+                ctx.host.name,
+                if paused { "pause" } else { "resume" }
+            )),
+        }
+    }
+
+    if stopped {
+        // A batch intentionally uses no pane filter: a focus move commonly
+        // pauses dozens of panes, but the ppid-1 and configured-session
+        // predicates still keep the remote command scoped to abandoned work.
+        tracker.schedule_orphan_reap(
+            ctx.log.clone(),
+            ctx.host.name.clone(),
+            remote_host.orphan_reaper(),
+        );
+    }
+
+    visibility::next_deadline(&ctx.stream_policy, &tracker.tracked()).map(Instant::from_std)
+}
+
+/// A disconnected host must not leave any remote observe client behind. This
+/// is intentionally unconditional: link loss overrides `visible_only = false`
+/// and skips the normal grace period.
+fn pause_host_streamers(ctx: &HostCtx, tracker: &mut StreamTracker) {
+    // Do not run a delayed normal-path reaper while the link is known down;
+    // the post-connect sweep recovers those remote orphans once reachable.
+    tracker.cancel_orphan_reap();
+    let state = load_state(&ctx.env_state_dir, &ctx.host.name);
+    for entry in state.panes.values().filter(|entry| !entry.is_tombstoned()) {
+        let local_id = &entry.local_id;
+        match crate::util::set_streamer_paused(&ctx.env_state_dir, local_id, true) {
+            Ok(()) => {
+                tracker
+                    .panes
+                    .entry(local_id.clone())
+                    .or_insert_with(|| PaneStreamState {
+                        local_id: local_id.clone(),
+                        streaming: false,
+                        hidden_since: None,
+                    })
+                    .streaming = false;
+                let _ = crate::util::poke_pane_streamer(&ctx.env_state_dir, local_id);
+            }
+            Err(e) => ctx.log.log(&format!(
+                "[{}] cannot pause streamer {local_id} after link loss: {e}",
+                ctx.host.name
+            )),
+        }
+    }
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -284,6 +467,8 @@ async fn run_connected(
     backoff_idx: &mut usize,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    stream_tracker: &mut StreamTracker,
+    startup_reap_pending: &mut bool,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -292,6 +477,14 @@ async fn run_connected(
     // for the life of the daemon
     remote_host.hint_transport(*remembered_transport);
     let (remote, _status) = remote_host.connect_api().await?;
+    // The first successful connection is both the daemon-start sweep and a
+    // normal post-connect sweep. One command covers both; every reconnect
+    // repeats it to recover orphans that could not be reached during link loss.
+    let reap_phase = if *startup_reap_pending { "daemon-start" } else { "post-connect" };
+    if let Err(e) = remote_host.reap_orphans(None).await {
+        ctx.log.log(&format!("[{}] {reap_phase} orphan reap failed: {e}", ctx.host.name));
+    }
+    *startup_reap_pending = false;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
     *backoff_idx = 0;
     let deps = ConvergeDeps {
@@ -301,6 +494,7 @@ async fn run_connected(
         state_dir: ctx.env_state_dir.clone(),
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
+        stream_policy: ctx.stream_policy.clone(),
         closes: ctx.closes.clone(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
@@ -308,6 +502,7 @@ async fn run_connected(
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
     let state = converge(&deps).await?;
+    let mut stream_at = reconcile_streamers(ctx, &state, stream_tracker, &remote_host).await;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
@@ -318,7 +513,7 @@ async fn run_connected(
     let mut pending_closes: Vec<String> = Vec::new();
 
     loop {
-        let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
+        let sleep = sleep_until_earliest([converge_at, status_at, closes_at, stream_at]);
         tokio::select! {
             ev = stream.next() => {
                 match ev {
@@ -355,6 +550,11 @@ async fn run_connected(
             }
             _ = sleep => {
                 let now = Instant::now();
+                if stream_at.is_some_and(|deadline| deadline <= now) {
+                    stream_at = None;
+                    // A grace expiry must not wait for unrelated remote traffic.
+                    converge_at.get_or_insert(now);
+                }
                 if status_at.is_some_and(|t| t <= now) {
                     status_at = None;
                     let pending = std::mem::take(&mut pending_status);
@@ -383,6 +583,7 @@ async fn run_connected(
                     )
                     .await;
                     let state = converge(&deps).await?;
+                    stream_at = reconcile_streamers(ctx, &state, stream_tracker, &remote_host).await;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
@@ -407,6 +608,8 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    let mut stream_tracker = StreamTracker::default();
+    let mut startup_reap_pending = true;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -426,6 +629,8 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &mut backoff_idx,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut stream_tracker,
+            &mut startup_reap_pending,
         )
         .await
         {
@@ -434,6 +639,7 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         };
         mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
             .await;
+        pause_host_streamers(&ctx, &mut stream_tracker);
         // starts_with, not contains: the marker is always emitted as a prefix,
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
@@ -594,6 +800,12 @@ async fn local_events_task(
     loop {
         let subs = vec![
             json!({ "type": "workspace.created" }),
+            // Focus events are named snake_case on the wire, but subscribe
+            // with the API's dotted event type just like every other hook.
+            // They fan out to every host below so visibility changes promptly.
+            json!({ "type": "workspace.focused" }),
+            json!({ "type": "tab.focused" }),
+            json!({ "type": "pane.focused" }),
             json!({ "type": "workspace.closed" }),
             json!({ "type": "pane.closed" }),
             // closing a TAB emits only tab_closed — no pane_closed for the
@@ -698,6 +910,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             local: local.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            stream_policy: config.stream.clone(),
             closes: closes.clone(),
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
@@ -923,6 +1136,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             state_dir: env.state_dir.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            stream_policy: config.stream.clone(),
             // one-shot: no local event stream, so there is no authoritative
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default

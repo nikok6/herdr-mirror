@@ -23,8 +23,8 @@ A remote can be another machine over **ssh**, or a **container** on this one
 
 > **How it works.** One Rust binary (`herdr-mirror`) with subcommand modes: a
 > `daemon` (control plane — reconciles remote workspaces into local mirrors
-> and pushes agent status) and one `pane` process per mirror pane (data plane
-> — streams the remote terminal).
+> and pushes agent status) and one `pane` wrapper per mirror pane (data plane
+> — streams a visible remote terminal).
 
 ## Requirements
 
@@ -133,11 +133,17 @@ the action locally, so one key covers both worlds. The plugin must be
 installed on whichever end runs it. See
 [Remote plugin keys](#remote-plugin-keys) for binding it.
 
-**Continuous streaming** — every mirror pane streams its remote pane live for
-its whole lifetime, each over its own connection, so panes are never
-blank and a busy pane can't contend with or drop another's stream. Sidebar
-agent status is daemon-driven, not stream-derived, so every agent's state stays
-live regardless of what any stream is doing.
+### Visible-pane streaming
+
+Every remote pane still has a local pane and a durable mapping, but by default
+only panes in the focused local workspace and tab keep a remote observe
+connection. A pane that leaves view waits 30 seconds before its stream pauses;
+focus it again and its wrapper reconnects immediately. While paused it shows
+`paused — focus to resume`. Sidebar agent status is daemon-driven, so every
+agent's state stays live regardless of which terminal streams are paused.
+
+Set `[stream].visible_only = false` to retain the legacy all-pane streaming
+behaviour, or change `[stream].pause_after_secs` to tune the grace period.
 
 ### Keybinds
 
@@ -314,6 +320,11 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+
+[stream]
+# visible_only = true    # default. Keep remote observe sessions only for panes
+                         # visible in the focused local workspace and tab.
+# pause_after_secs = 30  # grace period before an out-of-view pane pauses.
 
 [hosts.work]
 target = "work"

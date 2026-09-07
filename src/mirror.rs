@@ -24,8 +24,11 @@ pub struct WsInfo {
     pub workspace_id: String,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
     pub tab_count: Option<u64>,
+    #[serde(default)]
     pub pane_count: Option<u64>,
+    #[serde(default)]
     pub active_tab_id: Option<String>,
     /// custom metadata tokens the remote publishes. `default` on purpose: a
     /// pre-0.7.4 remote never sends this.
@@ -49,8 +52,11 @@ pub struct PaneInfo {
     /// unread today, but part of the pane wire shape — kept so the struct
     /// documents what the API actually returns
     #[allow(dead_code)]
+    #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
     pub foreground_cwd: Option<String>,
 }
 
@@ -126,11 +132,19 @@ pub struct LayoutSnapshot {
     #[allow(dead_code)]
     pub tab_id: String,
     #[serde(default)]
+    pub zoomed: bool,
+    #[serde(default)]
+    pub focused_pane_id: Option<String>,
+    #[serde(default)]
     pub panes: Vec<LayoutPaneSnapshot>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub focused_workspace_id: Option<String>,
+    #[serde(default)]
+    pub focused_tab_id: Option<String>,
     #[serde(default)]
     pub workspaces: Vec<WsInfo>,
     #[serde(default)]
@@ -429,10 +443,39 @@ pub struct ConvergeDeps {
     pub log: Logger,
     /// mirror closing a workspace/pane locally onto the remote (see MirrorConfig)
     pub close_remote_on_local_close: bool,
+    /// Desired remote-session policy. New panes need their pause marker before
+    /// their wrapper is exec'd, otherwise an initially hidden pane races one
+    /// unnecessary observe connection into existence.
+    pub stream_policy: crate::visibility::StreamPolicy,
     /// event-confirmed local closes. Absence from the local snapshot is
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+}
+
+/// Establish a newly-created pane wrapper's desired stream state before it is
+/// launched. A snapshot failure deliberately fails open: an older/temporary
+/// local API gap must not create a pane that can never show its remote.
+async fn prepare_streamer_pause(deps: &ConvergeDeps, local_pane_id: &str) {
+    let paused = if deps.stream_policy.visible_only {
+        match fetch_snapshot(&deps.local).await {
+            Ok(snapshot) => !crate::visibility::visible_local_panes(&snapshot).contains(local_pane_id),
+            Err(e) => {
+                deps.log.log(&format!(
+                    "cannot read local focus before launching streamer {local_pane_id}: {e}; starting visible"
+                ));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if let Err(e) = crate::util::set_streamer_paused(&deps.state_dir, local_pane_id, paused) {
+        deps.log.log(&format!(
+            "cannot set initial {} state for streamer {local_pane_id}: {e}",
+            if paused { "paused" } else { "running" }
+        ));
+    }
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -1221,6 +1264,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 note_mapped(deps, state, &fresh);
                 for (local_id, rid) in &to_spawn {
                     // plain pane created above; exec the streamer into it
+                    prepare_streamer_pause(deps, local_id).await;
                     spawn_streamer_pane(&deps.local, &deps.state_dir, local_id, &cmd_for(rid), &deps.log).await;
                 }
             } else {
@@ -1284,6 +1328,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    prepare_streamer_pause(deps, &local_id).await;
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
                         .await;
                 }
@@ -1320,6 +1365,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
+                    prepare_streamer_pause(deps, &local_id).await;
                     spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
                         .await;
                 }

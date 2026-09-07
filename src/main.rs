@@ -32,6 +32,7 @@ mod select;
 mod ssh_relay;
 mod state;
 mod util;
+mod visibility;
 
 use util::{Env, Result};
 
