@@ -21,7 +21,13 @@ pub(crate) fn cw(ch: char) -> usize {
 /// the renderer, the prediction overlay and the selection overlay all call here
 /// rather than each keeping the formula.
 pub fn window_offset(grid: &Grid, out_rows: usize) -> usize {
-    let bottom = grid.content_bottom.max(grid.cursor_row);
+    // Observe frames may park a hidden cursor in their padded bottom row.
+    // It is not visible content: anchoring to it crops the top of document TUIs.
+    let bottom = if grid.cursor_visible {
+        grid.content_bottom.max(grid.cursor_row)
+    } else {
+        grid.content_bottom
+    };
     (bottom + 1).saturating_sub(out_rows)
 }
 
@@ -606,6 +612,20 @@ mod tests {
         // unchanged rows are not repainted
         let out3 = r.paint(&g, 5, 3);
         assert!(!out3.contains("last"));
+    }
+
+    #[test]
+    fn hidden_cursor_in_observe_padding_does_not_crop_the_document_header() {
+        let mut grid = Grid::new();
+        grid.resize(120, 50);
+        grid.apply("\x1b[2;1HDOC_HEADER\x1b[39;1Hdocument footer\x1b[50;1H\x1b[?25l");
+        let mut renderer = Renderer::new();
+        let output = renderer.paint(&grid, 67, 41);
+        assert!(output.contains("DOC_HEADER"));
+        assert!(output.contains("document footer"));
+        // A visible shell cursor below the text must still remain in view.
+        grid.apply("\x1b[50;1H\x1b[?25h");
+        assert_eq!(window_offset(&grid, 41), 9);
     }
 
     const LINK: &str = "\x1b]8;;https://example.com/x\x1b\\";
