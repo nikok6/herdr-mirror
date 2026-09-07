@@ -200,7 +200,13 @@ struct Frame {
 
 enum Msg {
     Frame { gen: u64, frame: Frame },
-    SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
+    SessionExit {
+        gen: u64,
+        mode: Mode,
+        reason: String,
+        local_ssh_stderr: bool,
+        uptime: Duration,
+    },
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
@@ -247,6 +253,24 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
     argv
 }
 
+fn session_exit_reason<'a>(
+    close_reason: &'a str,
+    stderr_tail: &'a str,
+    direct_ssh: bool,
+    saw_remote_frame: bool,
+) -> (&'a str, bool) {
+    if close_reason.is_empty() {
+        (stderr_tail, direct_ssh && !saw_remote_frame)
+    } else {
+        (close_reason, false)
+    }
+}
+
+/// How long to let ssh's stderr finish arriving after the child is reaped.
+/// Generous: the bytes are already in the pipe, so this only ever costs the
+/// scheduler a poll.
+const STDERR_DRAIN: Duration = Duration::from_millis(200);
+
 fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
@@ -265,6 +289,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     );
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
+    let direct_ssh = args.container.is_none();
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
@@ -307,7 +332,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         // a terminal.closed frame on STDOUT — capture both
         let err_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let err_tail2 = err_tail.clone();
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(l)) = lines.next_line().await {
                 let mut buf = err_tail2.lock().unwrap();
@@ -320,9 +345,11 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             }
         });
         let mut close_reason = String::new();
+        let mut saw_remote_frame = false;
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
+            saw_remote_frame = true;
             if frame.kind == "terminal.closed" {
                 if let Some(r) = &frame.reason {
                     close_reason = r.clone();
@@ -333,10 +360,30 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             }
         }
         let _ = child.wait().await;
-        stderr_task.abort();
+        // Drain rather than cancel outright. A pre-connect ssh failure writes
+        // its one explanatory line and exits at once, and the child having been
+        // reaped says nothing about that line having been read yet — aborting
+        // here can discard the very text session_exit_reason classifies, which
+        // would put the failure back on the fast ladder with no explanation.
+        // The read loop ends at EOF on its own once ssh closes the pipe; the
+        // bound is for the case where something inherited that stderr and
+        // outlived ssh, so EOF never comes and this would otherwise hang the
+        // task and strand the pane with no SessionExit at all.
+        if tokio::time::timeout(STDERR_DRAIN, &mut stderr_task).await.is_err() {
+            stderr_task.abort();
+        }
         let tail = err_tail.lock().unwrap().trim().to_string();
-        let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let (reason, local_ssh_stderr) =
+            session_exit_reason(&close_reason, &tail, direct_ssh, saw_remote_frame);
+        let _ = tx
+            .send(Msg::SessionExit {
+                gen,
+                mode,
+                reason: reason.to_string(),
+                local_ssh_stderr,
+                uptime: started.elapsed(),
+            })
+            .await;
     });
 
     Ok(Session { gen, mode, process_group, stdin })
@@ -720,6 +767,15 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 /// restarting renumbers pane ids while session restore runs.
 const GONE_BACKOFF_MS: u64 = 60_000;
 
+/// Rung used while local OpenSSH cannot resolve our own uid. Slower than the
+/// fast ladder, because every attempt fails identically and instantly and
+/// retrying at 1s only spins — but deliberately far short of
+/// GONE_BACKOFF_MS. Nothing reaps this one: the remote pane is still there,
+/// so unlike a gone target there is no daemon-side recovery to wait for, and
+/// Directory Services often comes back on its own within seconds. A full
+/// minute would leave the pane blank long after the machine was healthy.
+const USER_LOOKUP_BACKOFF_MS: u64 = 10_000;
+
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 
@@ -747,6 +803,21 @@ fn target_gone(reason: &str, pane_target: &str) -> bool {
         .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
 }
 
+/// Did local OpenSSH fail before connecting because macOS could not resolve
+/// the current uid through Directory Services?
+///
+/// Keep this exact: a remote command mentioning a uid is unrelated and must
+/// stay on the ordinary retry path.
+fn local_user_lookup_failed(reason: &str, local_ssh_stderr: bool) -> bool {
+    if !local_ssh_stderr {
+        return false;
+    }
+    let Some(uid) = reason.trim().strip_prefix("No user exists for uid ") else {
+        return false;
+    };
+    !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Delay before the next attempt, and the ladder position to keep.
 ///
 /// Pure so the rung and the ladder-resume are testable without a live pane.
@@ -758,6 +829,49 @@ fn reconnect_delay(gone: bool, idx: usize) -> (u64, usize) {
         return (GONE_BACKOFF_MS, idx);
     }
     (BACKOFF[idx.min(BACKOFF.len() - 1)], idx + 1)
+}
+
+/// What kind of failure we are reconnecting from. Classified once, so the
+/// rung we wait and the status line we print can never disagree about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Failure {
+    /// The remote pane is gone and the daemon will reap it.
+    Gone,
+    /// Local OpenSSH failed before connecting: macOS could not resolve our uid.
+    UserLookup,
+    /// Anything else, including everything seen in control mode.
+    Transient,
+}
+
+/// Only slow down once we are back in observe. In control the existing
+/// quick-failure fallback needs its fast retries to reach two failures and
+/// drop the pane to observe within seconds; a slow rung there would leave an
+/// always_control pane stuck in control.
+fn classify_failure(
+    m: Mode,
+    reason: &str,
+    local_ssh_stderr: bool,
+    pane_target: &str,
+) -> Failure {
+    if m != Mode::Observe {
+        Failure::Transient
+    } else if target_gone(reason, pane_target) {
+        Failure::Gone
+    } else if local_user_lookup_failed(reason, local_ssh_stderr) {
+        Failure::UserLookup
+    } else {
+        Failure::Transient
+    }
+}
+
+/// Neither slow rung consumes a ladder position: once the cause clears, a
+/// later transient failure resumes where the fast ladder left off.
+fn reconnect_delay_for(failure: Failure, idx: usize) -> (u64, usize) {
+    match failure {
+        Failure::Gone => (GONE_BACKOFF_MS, idx),
+        Failure::UserLookup => (USER_LOOKUP_BACKOFF_MS, idx),
+        Failure::Transient => reconnect_delay(false, idx),
+    }
 }
 
 struct App {
@@ -1035,33 +1149,39 @@ impl App {
                     },
                 );
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(e) => self.schedule_reconnect(m, &e.to_string(), false),
         }
     }
 
-    fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        // Only slow down once we are back in observe. In control the existing
-        // quick-failure fallback needs its fast retries to reach two failures
-        // and drop the pane to observe within seconds; a 60s rung there would
-        // leave an always_control pane stuck in control for a minute.
-        let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
-        let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
+    fn schedule_reconnect(&mut self, m: Mode, reason: &str, local_ssh_stderr: bool) {
+        let failure = classify_failure(m, reason, local_ssh_stderr, &self.args.pane_target);
+        let (delay, idx) = reconnect_delay_for(failure, self.backoff_idx);
         self.backoff_idx = idx;
 
-        if gone {
-            // Repainted every cycle on purpose: handle_frame paints herdr's
-            // raw close reason before us on each attempt, so saying this once
-            // would leave the misleading "terminal closed" line on screen from
-            // the second cycle onward. The renderer diffs rows, so an
-            // unchanged line costs one row write a minute.
-            self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
-            // and nothing may expire it out from under us: the control→observe
-            // fallback sets a 1.5s hint just before this path runs
-            self.hint_clear_at = None;
-        } else {
-            let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-            self.renderer
-                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+        match failure {
+            Failure::Gone => {
+                // Repainted every cycle on purpose: handle_frame paints herdr's
+                // raw close reason before us on each attempt, so saying this once
+                // would leave the misleading "terminal closed" line on screen from
+                // the second cycle onward. The renderer diffs rows, so an
+                // unchanged line costs one row write a minute.
+                self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
+                // and nothing may expire it out from under us: the control→observe
+                // fallback sets a 1.5s hint just before this path runs
+                self.hint_clear_at = None;
+            }
+            Failure::UserLookup => {
+                self.renderer.status(&format!(
+                    "local ssh user lookup failed — run herdr-mirror stop, then herdr-mirror start; retrying in {}s",
+                    delay / 1000
+                ));
+                self.hint_clear_at = None;
+            }
+            Failure::Transient => {
+                let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
+                self.renderer
+                    .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+            }
         }
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
@@ -1139,7 +1259,14 @@ impl App {
         }
     }
 
-    fn handle_exit(&mut self, gen: u64, exited_mode: Mode, reason: String, uptime: Duration) {
+    fn handle_exit(
+        &mut self,
+        gen: u64,
+        exited_mode: Mode,
+        reason: String,
+        local_ssh_stderr: bool,
+        uptime: Duration,
+    ) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
             return; // an old child we already replaced/killed
         }
@@ -1159,7 +1286,7 @@ impl App {
                 return;
             }
         }
-        self.schedule_reconnect(exited_mode, &reason_line);
+        self.schedule_reconnect(exited_mode, &reason_line, local_ssh_stderr);
     }
 
     async fn send(&mut self, msg: serde_json::Value) {
@@ -1696,7 +1823,9 @@ pub async fn run(args: Args) -> Result<()> {
                 match msg {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
-                    Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::SessionExit { gen, mode, reason, local_ssh_stderr, uptime }) => {
+                        app.handle_exit(gen, mode, reason, local_ssh_stderr, uptime)
+                    }
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
@@ -2309,6 +2438,62 @@ mod tests {
         assert!(!target_gone("", "w9Z:p99"));
         // an empty target must not turn `contains` into "matches everything"
         assert!(!target_gone("terminal target w1:p1 not found", ""));
+    }
+
+    #[test]
+    fn local_user_lookup_failure_is_recognized_and_retried_slowly_only_in_observe() {
+        assert!(local_user_lookup_failed("No user exists for uid 501", true));
+        assert!(local_user_lookup_failed("No user exists for uid 502", true));
+        assert!(!local_user_lookup_failed("remote user has uid 501", true));
+        assert!(!local_user_lookup_failed("No user exists for uid ", true));
+        assert!(!local_user_lookup_failed("No user exists for uid 501 (remote)", true));
+        assert!(!local_user_lookup_failed("No user exists for uid 501", false));
+
+        assert!(session_exit_reason("", "No user exists for uid 501", true, false).1);
+        assert!(
+            !session_exit_reason("No user exists for uid 501", "ssh stderr", true, false).1,
+            "a remote terminal.closed reason must override SSH stderr provenance"
+        );
+        assert!(!session_exit_reason("", "No user exists for uid 501", false, false).1);
+        assert!(
+            !session_exit_reason("", "No user exists for uid 501", true, true).1,
+            "stderr after a remote frame is not a pre-connect OpenSSH failure"
+        );
+
+        assert_eq!(
+            classify_failure(Mode::Observe, "No user exists for uid 501", true, "w9Z:p99"),
+            Failure::UserLookup
+        );
+        assert_eq!(
+            classify_failure(Mode::Control, "No user exists for uid 501", true, "w9Z:p99"),
+            Failure::Transient,
+            "control must stay fast enough to reach its existing observe fallback"
+        );
+        assert_eq!(
+            classify_failure(Mode::Observe, "No user exists for uid 501", false, "w9Z:p99"),
+            Failure::Transient,
+            "an identical remote close reason is not a local OpenSSH failure"
+        );
+        assert_eq!(
+            classify_failure(Mode::Observe, "terminal target w9Z:p99 not found", true, "w9Z:p99"),
+            Failure::Gone,
+            "a gone target outranks stderr provenance"
+        );
+
+        assert_eq!(
+            reconnect_delay_for(Failure::UserLookup, 2),
+            (USER_LOOKUP_BACKOFF_MS, 2),
+            "retry quietly, but without consuming the retry ladder"
+        );
+        assert_eq!(reconnect_delay_for(Failure::Gone, 2), (GONE_BACKOFF_MS, 2));
+        assert_eq!(reconnect_delay_for(Failure::Transient, 2), (BACKOFF[2], 3));
+
+        // Nothing reaps this failure the way the daemon reaps a gone pane, and
+        // Directory Services usually recovers on its own, so it must come back
+        // sooner than a gone target does — while still being slower than the
+        // fast ladder, which would only spin against an instant local failure.
+        const { assert!(USER_LOOKUP_BACKOFF_MS < GONE_BACKOFF_MS) };
+        const { assert!(USER_LOOKUP_BACKOFF_MS >= BACKOFF[BACKOFF.len() - 1]) };
     }
 
     #[test]
