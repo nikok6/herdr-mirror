@@ -133,6 +133,12 @@ the action locally, so one key covers both worlds. The plugin must be
 installed on whichever end runs it. See
 [Remote plugin keys](#remote-plugin-keys) for binding it.
 
+When the action prints Herdr's focused `plugin_pane` JSON result, Mirror waits
+for that pane's mapping and focuses it locally. It follows the specific action's
+completion, not the remote server's global focus, and leaves your focus alone
+if you navigated away while the action started. Plugins should use a split with
+the translated target pane: remote overlays/popups are not mirrored as overlays.
+
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
 blank and a busy pane can't contend with or drop another's stream. Sidebar

@@ -50,6 +50,8 @@ use crate::remote::RemoteHost;
 use crate::state::load_state;
 use crate::util::{err, Env, Result};
 
+mod focus;
+
 #[derive(Debug, Default, Deserialize)]
 struct InvocationContext {
     workspace_id: Option<String>,
@@ -256,30 +258,46 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
     let mut remote = RemoteHost::new(&resolved.host, &env.state_dir);
     let (api, _status) = remote.connect_api().await?;
 
-    // the remote action sees the REMOTE objects behind the invoking mirror,
-    // including the real cwd of the pane it will act on
-    let mut context = json!({ "invocation_source": "mirror" });
-    if let Some(ws) = &resolved.remote_ws_id {
-        context["workspace_id"] = json!(ws);
-    }
-    if let Some(pane_id) = &resolved.remote_pane_id {
-        context["focused_pane_id"] = json!(pane_id);
-        let snap = fetch_snapshot(&api).await?;
-        if let Some(pane) = snap.panes.iter().find(|p| &p.pane_id == pane_id) {
-            if let Some(cwd) = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone()) {
-                context["focused_pane_cwd"] = json!(cwd);
-            }
-        }
-    }
+    // Resolve the whole location from the live remote pane. The remote's
+    // globally active tab may belong to a different workspace/client.
+    let snapshot = api.request("session.snapshot", json!({})).await?;
+    let context = remote_context(&snapshot["snapshot"], resolved.remote_pane_id.as_deref().unwrap())?;
     let params = json!({ "action_id": spec, "context": context });
-    api.request("plugin.action.invoke", params).await.map_err(|e| {
+    let invocation = api.request("plugin.action.invoke", params).await.map_err(|e| {
         err(format!(
             "remote invoke {spec} on {}: {e} (needs the plugin installed there, and a herdr with plugin.action.invoke)",
             resolved.host.name
         ))
     })?;
+    focus::follow(env, &ctx, &resolved.host.name, &api, &invocation).await?;
     println!("invoked {spec} on {}", resolved.host.name);
     Ok(())
+}
+
+fn remote_context(snapshot: &Value, pane_id: &str) -> Result<Value> {
+    let rows = |key: &str| snapshot[key].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let pane = rows("panes").iter().find(|p| p["pane_id"] == pane_id)
+        .ok_or_else(|| err(format!("remote pane {pane_id} disappeared before invoking the plugin")))?;
+    let ws = rows("workspaces").iter().find(|w| w["workspace_id"] == pane["workspace_id"]);
+    let tab = rows("tabs").iter().find(|t| t["tab_id"] == pane["tab_id"]);
+    // Herdr 0.8.2 backfills null/omitted fields from its global focus. Empty
+    // strings prevent a shell pane from inheriting another pane's agent/cwd.
+    let text = |v: &Value, key: &str| v[key].as_str().unwrap_or("").to_owned();
+    Ok(json!({
+        "invocation_source": "mirror",
+        "workspace_id": pane["workspace_id"],
+        "workspace_label": ws.map(|w| text(w, "label")).unwrap_or_default(),
+        "workspace_cwd": ws.map(|w| text(w, "cwd")).unwrap_or_default(),
+        "tab_id": pane["tab_id"],
+        "tab_label": tab.map(|t| text(t, "label")).unwrap_or_default(),
+        "focused_pane_id": pane_id,
+        "focused_pane_cwd": pane["foreground_cwd"].as_str().or(pane["cwd"].as_str()).unwrap_or(""),
+        "focused_pane_agent": text(pane, "agent"),
+        "focused_pane_status": text(pane, "agent_status"),
+        "selected_text": "",
+        "clicked_url": "",
+        "link_handler_id": "",
+    }))
 }
 
 async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
