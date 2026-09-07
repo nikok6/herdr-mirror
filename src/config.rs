@@ -7,6 +7,9 @@ use serde::Deserialize;
 
 use crate::util::{err, Result};
 
+const DEFAULT_VISIBLE_ONLY: bool = true;
+const DEFAULT_PAUSE_AFTER_SECS: u64 = 30;
+
 /// Shell expression for `exec <expr> <command> ...` on the remote.
 ///
 /// A configured path is used as-is (unquoted so remote-shell `~` expands).
@@ -129,6 +132,8 @@ pub struct MirrorConfig {
     /// also closes the matching object on the remote. Set false to make a local
     /// close only stop mirroring, leaving the remote — and any agent — running.
     pub close_remote_on_local_close: bool,
+    /// Which mapped panes retain a live remote observe session.
+    pub stream: crate::visibility::StreamPolicy,
     pub hosts: Vec<HostConfig>,
     /// which hosts.toml this came from. `None` when parsed from a string
     /// (tests). Logged at startup so "which config won?" is never a guess.
@@ -160,10 +165,18 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    #[serde(default)]
+    stream: RawStream,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
     hosts: toml::Table,
+}
+
+#[derive(Default, Deserialize)]
+struct RawStream {
+    visible_only: Option<bool>,
+    pause_after_secs: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -348,6 +361,12 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
         close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
+        stream: crate::visibility::StreamPolicy {
+            visible_only: raw.stream.visible_only.unwrap_or(DEFAULT_VISIBLE_ONLY),
+            pause_after: std::time::Duration::from_secs(
+                raw.stream.pause_after_secs.unwrap_or(DEFAULT_PAUSE_AFTER_SECS),
+            ),
+        },
         hosts,
         source: None,
         shadowed: Vec::new(),
@@ -373,6 +392,21 @@ mod tests {
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert_eq!(h.session, None); // default remote session
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn stream_policy_parses_and_defaults() {
+        let configured = parse_config(
+            "[stream]\nvisible_only = false\npause_after_secs = 7\n\
+             [hosts.work]\ntarget = \"work\"\n",
+        )
+        .unwrap();
+        assert!(!configured.stream.visible_only);
+        assert_eq!(configured.stream.pause_after, std::time::Duration::from_secs(7));
+
+        let defaults = parse_config("[hosts.work]\ntarget = \"work\"\n").unwrap();
+        assert!(defaults.stream.visible_only);
+        assert_eq!(defaults.stream.pause_after, std::time::Duration::from_secs(30));
     }
 
     #[test]

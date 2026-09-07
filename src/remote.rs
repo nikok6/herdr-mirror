@@ -167,6 +167,41 @@ pub struct RemoteHost {
     log: Logger,
 }
 
+/// A small, cloneable view of an already-connected host for a detached
+/// best-effort orphan reap. It carries the established ControlMaster path (or
+/// resolved container) rather than creating another transport.
+#[derive(Clone)]
+pub(crate) struct OrphanReaper {
+    cfg: HostConfig,
+    ctl_path: PathBuf,
+    container: Option<crate::docker::Container>,
+}
+
+impl OrphanReaper {
+    pub async fn reap_orphans(&self) -> Result<()> {
+        let command = reap_orphans_command(self.cfg.session.as_deref(), None);
+        if let Some(container) = &self.container {
+            return container.exec(&command, 10_000).await.map(|_| ());
+        }
+        let args = vec![
+            "-S".into(),
+            self.ctl_path.display().to_string(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            self.cfg.target.clone(),
+            command,
+        ];
+        let result = ssh(&args, 10_000).await;
+        if result.code != 0 {
+            return Err(err(format!(
+                "ssh orphan reap failed: {}",
+                nonempty(&result.err, result.code)
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// FNV-1a, truncated to 8 hex chars.
 ///
 /// NOT `DefaultHasher`: this value lands in a path the daemon and every
@@ -243,6 +278,33 @@ pub(crate) fn control_path(state_dir: &std::path::Path, host_name: &str) -> Path
     state_dir.join(format!("{}.ctl", socket_stem(state_dir, host_name)))
 }
 
+/// Shell command which reaps only abandoned terminal-session observers.
+///
+/// A local ssh process can disappear while its remote `observe` child is
+/// reparented to init, so this deliberately selects *only* ppid 1. Session and
+/// pane filters narrow the cleanup without ever matching a healthy observer
+/// still parented by sshd.
+pub fn reap_orphans_command(session: Option<&str>, pane: Option<&str>) -> String {
+    let mut awk_vars = String::new();
+    let mut predicate = String::from("$2==1 && /terminal session observe/");
+    if let Some(session) = session {
+        awk_vars.push_str(&format!(
+            " -v session={}",
+            crate::pane::sh_quote(&format!("--session {session}"))
+        ));
+        predicate.push_str(" && index($0, session)");
+    }
+    if let Some(pane) = pane {
+        awk_vars.push_str(&format!(" -v pane={}", crate::pane::sh_quote(pane)));
+        predicate.push_str(" && index($0, pane)");
+    }
+    let program = format!("{predicate} {{print $1}}");
+    format!(
+        "ps -eo pid=,ppid=,args= 2>/dev/null | awk{awk_vars} {} | while read p; do kill \"$p\" 2>/dev/null; done",
+        crate::pane::sh_quote(&program)
+    )
+}
+
 impl RemoteHost {
     pub fn new(cfg: &HostConfig, state_dir: &std::path::Path) -> RemoteHost {
         let stem = socket_stem(state_dir, &cfg.name);
@@ -312,6 +374,16 @@ impl RemoteHost {
         ]
     }
 
+    /// A cloneable executor for a delayed cleanup task. It deliberately keeps
+    /// the current ControlMaster/container instead of forcing a second dial.
+    pub(crate) fn orphan_reaper(&self) -> OrphanReaper {
+        OrphanReaper {
+            cfg: self.cfg.clone(),
+            ctl_path: self.ctl_path.clone(),
+            container: self.container.clone(),
+        }
+    }
+
     pub async fn ensure_master(&mut self) -> Result<()> {
         let mut check = self.base_args();
         check.extend(["-O".into(), "check".into(), self.cfg.target.clone()]);
@@ -369,6 +441,16 @@ impl RemoteHost {
             )));
         }
         Ok(res.out)
+    }
+
+    /// Best-effort remote cleanup after a streamer transport is torn down.
+    /// `exec` reuses the daemon's ControlMaster for ssh hosts and its existing
+    /// container execution path for docker hosts; callers log failure rather
+    /// than making cleanup availability a connection failure.
+    pub async fn reap_orphans(&self, pane: Option<&str>) -> Result<()> {
+        self.exec(&reap_orphans_command(self.cfg.session.as_deref(), pane), 10_000)
+            .await
+            .map(|_| ())
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
@@ -660,6 +742,38 @@ mod tests {
             api_transport: ApiTransport::Auto,
             always_control: true,
         }
+    }
+
+    #[test]
+    fn reap_command_always_scopes_to_orphaned_processes() {
+        let command = reap_orphans_command(None, None);
+        assert!(command.contains("$2==1"));
+        assert!(!command.contains("$2!=1"));
+    }
+
+    #[test]
+    fn reap_command_scopes_to_the_configured_session() {
+        let scoped = reap_orphans_command(Some("session-alpha"), None);
+        let unscoped = reap_orphans_command(None, None);
+        assert!(scoped.contains("--session session-alpha"));
+        assert!(!unscoped.contains("--session"));
+    }
+
+    #[test]
+    fn reap_command_quotes_a_session_name_safely() {
+        let command = reap_orphans_command(Some("blue room's session"), None);
+        assert!(command.contains("--session blue room"));
+        assert!(command.contains("'\\''"));
+        assert!(!command.contains("--session blue room's session;"));
+    }
+
+    #[test]
+    fn reap_command_narrows_to_one_pane_when_given() {
+        let narrowed = reap_orphans_command(None, Some("w1:p2"));
+        let broad = reap_orphans_command(None, None);
+        assert!(narrowed.contains("-v pane="));
+        assert!(narrowed.contains("w1:p2"));
+        assert!(!broad.contains("-v pane="));
     }
 
     #[test]
