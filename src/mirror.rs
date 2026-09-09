@@ -447,6 +447,7 @@ pub(crate) fn cmd_for_pane(
     let remote_bin = host.remote_bin.clone();
     let session = host.session.clone();
     let always_control = host.always_control;
+    let takeover = host.takeover;
     let max_cols = host.max_cols;
     let max_rows = host.max_rows;
     let kind = host.kind.clone();
@@ -474,6 +475,9 @@ pub(crate) fn cmd_for_pane(
         }
         if always_control {
             argv.push("--always-control".into());
+        }
+        if takeover {
+            argv.push("--takeover".into());
         }
         // absent when uncapped, so the argv of an unconfigured host is unchanged
         if let Some(c) = max_cols {
@@ -1757,6 +1761,7 @@ mod tests {
             remote_bin: None,
             session: None,
             always_control: true,
+            takeover: false,
             max_cols: None,
             max_rows: None,
             api_transport: crate::config::ApiTransport::Auto,
@@ -1971,6 +1976,21 @@ mod tests {
             argv[1..],
             ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
         );
+    }
+
+    /// takeover is off by default, so an unconfigured host's argv is unchanged;
+    /// on, it reaches the pane parser.
+    #[test]
+    fn takeover_reaches_the_streamer_argv() {
+        let mut host = ssh_host();
+        host.always_control = false;
+        let off = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        assert!(!off.iter().any(|a| a == "--takeover"));
+
+        host.takeover = true;
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
+        assert!(parsed.takeover);
     }
 
     /// An uncapped host's argv must not grow, and a capped one must round-trip
