@@ -234,16 +234,34 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
+fn ssh_stream_args(ssh_target: &str, cmd: &str, ctl_path: Option<&str>) -> Vec<String> {
     let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-    // A pane stream is long-lived and interactive. It must not inherit a
-    // ControlPath from ~/.ssh/config: a stale shared master can hang
-    // the stream before the remote command starts. `-S none` disables control
-    // socket use without changing the daemon's intentional multiplexing.
-    argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]);
+    match ctl_path {
+        // Ride the daemon's managed master: one auth per host (done once, by the
+        // daemon), instant attach, and immune to a stale SSH_AUTH_SOCK in the
+        // spawning environment — pane processes are spawned by the herdr server,
+        // whose env ages independently of the user's login session. This is NOT
+        // the ~/.ssh/config socket #80 guarded against: the daemon owns this
+        // socket's lifecycle and recreates it, so it cannot be stale-and-wedged.
+        // ControlMaster=no keeps the stream from becoming a master at the
+        // daemon's path; if the master is down, ssh falls back to a direct
+        // connection and the next reconnect retry finds the master recreated.
+        Some(path) => argv.extend([
+            "-S".into(),
+            path.into(),
+            "-o".into(),
+            "ControlMaster=no".into(),
+            ssh_target.into(),
+            cmd.into(),
+        ]),
+        // No daemon master in play (standalone streamer). Still refuse the
+        // user's configured ControlPath: a stale shared master can hang the
+        // stream before the remote command starts (#80).
+        None => argv.extend(["-S".into(), "none".into(), ssh_target.into(), cmd.into()]),
+    }
     argv
 }
 
@@ -268,7 +286,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &cmd));
+            c.args(ssh_stream_args(&args.ssh_target, &cmd, args.ctl_path.as_deref()));
             c
         }
         Some(ct) => {
@@ -1874,13 +1892,34 @@ mod tests {
 
     #[test]
     fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM", None);
 
         assert_eq!(
             &argv[crate::remote::SSH_COMMON_OPTS.len()..],
             [
                 "-S",
                 "none",
+                "work",
+                "exec herdr terminal session observe w5:pM",
+            ]
+        );
+    }
+
+    #[test]
+    fn pane_ssh_stream_rides_daemon_master_when_given() {
+        let argv = ssh_stream_args(
+            "work",
+            "exec herdr terminal session observe w5:pM",
+            Some("/state/work.ctl"),
+        );
+
+        assert_eq!(
+            &argv[crate::remote::SSH_COMMON_OPTS.len()..],
+            [
+                "-S",
+                "/state/work.ctl",
+                "-o",
+                "ControlMaster=no",
                 "work",
                 "exec herdr terminal session observe w5:pM",
             ]
