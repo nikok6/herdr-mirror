@@ -66,6 +66,10 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// ask herdr to evict the remote pane's current controller when entering
+    /// control (`terminal session control --takeover`). Set by the daemon from
+    /// per-host config.
+    pub takeover: bool,
     /// upper bound on the size control asks the remote for. `None` = uncapped
     /// (fill the local pane). Set by the daemon from per-host config; observe
     /// is never capped, since it doesn't resize anything.
@@ -99,6 +103,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         session: None,
         control_idle_secs: 3600,
         always_control: false,
+        takeover: false,
         max_cols: None,
         max_rows: None,
         ctl_path: None,
@@ -127,6 +132,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--takeover" => args.takeover = true,
             // 0 is unset here for the same reason config treats it that way:
             // a zero cap would ask the remote for a zero-column terminal, which
             // herdr rejects outright, killing the session twice over and
@@ -255,11 +261,15 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
+    // a stale controller (an orphaned ssh from a closed mirror pane, say) makes
+    // control fail twice and drop the pane to observe; takeover evicts it
+    let takeover = if mode == Mode::Control && args.takeover { " --takeover" } else { "" };
     let cmd = format!(
-        "exec {} terminal session {} {} --cols {} --rows {}",
+        "exec {} terminal session {} {}{} --cols {} --rows {}",
         bin,
         mode.as_str(),
         sh_quote(&args.pane_target),
+        takeover,
         cols,
         rows
     );

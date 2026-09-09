@@ -314,6 +314,11 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# takeover = false       # default. Set true to evict whoever holds a remote
+                         # pane's controller when a mirror takes control (an
+                         # orphaned ssh from a closed mirror, say) instead of
+                         # showing "control unavailable — viewing only". Leave
+                         # off for a host a human drives directly.
 
 [hosts.work]
 target = "work"
@@ -325,6 +330,7 @@ target = "work"
 # max_rows = 58                      # always_control = false
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
+# takeover = true                    # per-host override; see global above
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 # api_transport = "auto"             # how to reach the remote API socket:
