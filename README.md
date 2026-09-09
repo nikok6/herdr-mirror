@@ -242,7 +242,12 @@ Mirror panes adapt to what's running on the remote pane:
 
 - at a **shell**, the mouse stays local — drag-select and copy work natively, and
   nothing leaks into the prompt;
-- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+- in a **TUI** (vim, htop, lazygit, Claude Code, …), clicks and wheel forward to
+  the app, and a plain left drag selects locally: the mirror highlights the
+  dragged cells of the decoded frame and, on release, copies their text to your
+  desktop clipboard through OSC 52. A remote app's own copy cannot reach you
+  (herdr streams cells, not the app's clipboard writes), so the drag is owned
+  on this side; a press released in place is still forwarded as a click.
 
 herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
 from the remote pane's foreground process — anything that isn't a known shell is

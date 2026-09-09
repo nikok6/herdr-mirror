@@ -40,6 +40,7 @@ use tokio::time::Instant;
 use crate::util::{err, Result};
 use crate::grid::{Grid, Renderer};
 use crate::predict::Predictor;
+use crate::select::{SelAction, Selection};
 
 // ---------------------------------------------------------------------------
 // args
@@ -489,6 +490,8 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
+    /// local drag-select over the decoded grid (see select.rs)
+    select: Selection,
     /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
     /// Some(false)=TUI (forward clicks), None=unknown (fail safe to local).
     /// Refreshed lazily on mouse activity via `herdr pane process-info`.
@@ -520,14 +523,17 @@ impl App {
         if !self.tty {
             return;
         }
-        if self.predict.take_dirty() {
-            // cleared predictions may have left ghost chars — full repaint
+        if self.predict.take_dirty() | self.select.take_dirty() {
+            // cleared predictions may have left ghost chars, and a moved or
+            // cleared selection leaves stale reverse video — full repaint
             self.renderer.invalidate();
         }
         let (cols, rows) = term_size();
         let mut out = self.renderer.paint(&self.grid, cols, rows);
-        // inject the prediction overlay inside the synchronized-update block
-        let overlay = self.predict.overlay(&self.grid, cols, rows);
+        // inject the prediction and selection overlays inside the
+        // synchronized-update block
+        let mut overlay = self.predict.overlay(&self.grid, cols, rows);
+        overlay.push_str(&self.select.overlay(&self.grid, cols, rows));
         if !overlay.is_empty() {
             const SYNC_END: &str = "\x1b[?2026l";
             if let Some(pos) = out.rfind(SYNC_END) {
@@ -778,7 +784,59 @@ impl App {
         }
     }
 
+    /// Route left-button gestures through the local selection before anything
+    /// else sees them. Returns the input with selection events removed and a
+    /// press-released-in-place put back as one click gesture; a finished drag
+    /// copies to the clipboard here. Any keystroke drops a retained highlight.
+    fn route_selection(&mut self, buf: Vec<u8>) -> Vec<u8> {
+        if !self.tty {
+            return buf;
+        }
+        let (_, rows) = term_size();
+        let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
+        let mut keyed = false;
+        let mut i = 0usize;
+        while i < buf.len() {
+            if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
+                let raw = &buf[i..i + len];
+                match self.select.on_mouse(btn, x, y, press, raw, &self.grid, rows) {
+                    SelAction::Pass => rest.extend_from_slice(raw),
+                    SelAction::Consumed => {}
+                    SelAction::Click(bytes) => rest.extend_from_slice(&bytes),
+                    SelAction::Copy(text) => self.copy_to_clipboard(&text),
+                }
+                i += len;
+            } else {
+                keyed = true;
+                rest.push(buf[i]);
+                i += 1;
+            }
+        }
+        if keyed {
+            self.select.clear();
+        }
+        if self.select.is_dirty() {
+            self.paint();
+        }
+        rest
+    }
+
+    /// OSC 52 to the hosting terminal: herdr relays it from a local pane the
+    /// same way it relays its own copies, so this lands on the desktop clipboard.
+    fn copy_to_clipboard(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        write_stdout(&format!("\x1b]52;c;{}\x07", B64.encode(text)));
+        let n = text.chars().count();
+        self.hint(&format!("copied {n} chars"));
+    }
+
     async fn handle_stdin(&mut self, buf: Vec<u8>) {
+        let buf = self.route_selection(buf);
+        if buf.is_empty() {
+            return;
+        }
         if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
             // no quit key: the wrapper's lifecycle belongs to the hosting pane
             if has_mouse_seq(&buf) {
@@ -950,6 +1008,7 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
+        select: Selection::new(),
         remote_is_shell: None,
         fg_poll_at: None,
         settle_at: None,

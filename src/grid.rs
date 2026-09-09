@@ -10,7 +10,7 @@ use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 
 /// Terminal display width of a char (CJK/Hangul are 2 columns).
-fn cw(ch: char) -> usize {
+pub(crate) fn cw(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
@@ -118,6 +118,14 @@ impl Grid {
             .unwrap_or(0);
     }
 
+    /// First grid row shown in an `out_rows`-tall local pane. Bottom-anchored:
+    /// agent TUIs live at the bottom of the screen. Shared by the renderer and
+    /// every overlay so their coordinates agree.
+    pub fn window_offset(&self, out_rows: usize) -> usize {
+        let bottom = self.content_bottom.max(self.cursor_row);
+        (bottom + 1).saturating_sub(out_rows)
+    }
+
     pub fn text_lines(&self) -> Vec<String> {
         self.rows
             .iter()
@@ -205,8 +213,7 @@ impl Renderer {
     /// Build the ANSI to paint the grid into an out_cols × out_rows terminal.
     /// Bottom-anchored window: agent TUIs live at the bottom of the screen.
     pub fn paint(&mut self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
-        let bottom = grid.content_bottom.max(grid.cursor_row);
-        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let offset_r = grid.window_offset(out_rows);
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         // paint every local row (missing rows blank-fill), or the pane stays
         // blank before the first frame and the status row is unreachable
