@@ -247,7 +247,9 @@ Mirror panes adapt to what's running on the remote pane:
   dragged cells of the decoded frame and, on release, copies their text to your
   desktop clipboard through OSC 52. A remote app's own copy cannot reach you
   (herdr streams cells, not the app's clipboard writes), so the drag is owned
-  on this side; a press released in place is still forwarded as a click.
+  on this side; a press released in place is still forwarded as a click, and a
+  double-click copies the token under the pointer. Set `local_select = false`
+  (globally or per host) to forward drags to the remote app instead.
 
 herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
 from the remote pane's foreground process — anything that isn't a known shell is
@@ -279,6 +281,8 @@ shell and a TUI there's a brief lag before the mouse mode catches up.
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on the remote PATH
+# local_select = false               # per-host override: forward drags to the
+                                     # remote TUI instead of selecting locally
 # always_control = false             # per-host override, e.g. a host you use
                                      # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without

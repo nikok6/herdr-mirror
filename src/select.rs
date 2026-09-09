@@ -14,8 +14,12 @@
 // forwarded as one gesture, so TUI clicks keep working.
 
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 
 use crate::grid::{cw, Grid};
+
+/// Two left presses on the same cell within this window are a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pos {
@@ -32,7 +36,7 @@ pub enum SelAction {
     /// a press released in place: the held press plus its release, to forward
     /// as one click gesture
     Click(Vec<u8>),
-    /// a drag ended: copy this text
+    /// a drag ended or a token was double-clicked: copy this text
     Copy(String),
 }
 
@@ -48,6 +52,10 @@ pub struct Selection {
     head: Option<Pos>,
     dragging: bool,
     dirty: bool,
+    /// the previous left press, to recognize a double-click
+    last_press: Option<(Pos, Instant)>,
+    /// a double-click already acted; its release carries nothing
+    swallow_release: bool,
 }
 
 impl Selection {
@@ -67,6 +75,7 @@ impl Selection {
         raw: &[u8],
         grid: &Grid,
         out_rows: usize,
+        now: Instant,
     ) -> SelAction {
         let pos = Pos {
             row: (y.max(1) as usize - 1) + grid.window_offset(out_rows),
@@ -74,7 +83,22 @@ impl Selection {
         };
         match (btn, press) {
             (LEFT, true) => {
+                let double = self
+                    .last_press
+                    .is_some_and(|(p, at)| p == pos && now.duration_since(at) <= DOUBLE_CLICK);
                 self.clear();
+                self.last_press = Some((pos, now));
+                if double {
+                    // herdr copies a double-clicked token; do the same over the grid
+                    if let Some((c0, c1)) = token_span(grid, pos) {
+                        self.anchor = Some(Pos { row: pos.row, col: c0 });
+                        self.head = Some(Pos { row: pos.row, col: c1 });
+                        self.dirty = true;
+                        self.swallow_release = true;
+                        self.last_press = None;
+                        return SelAction::Copy(self.text(grid));
+                    }
+                }
                 self.pending_press = Some((pos, raw.to_vec()));
                 SelAction::Consumed
             }
@@ -101,6 +125,9 @@ impl Selection {
                 }
             }
             (LEFT, false) => {
+                if std::mem::take(&mut self.swallow_release) {
+                    return SelAction::Consumed;
+                }
                 if let Some((_, mut bytes)) = self.pending_press.take() {
                     bytes.extend_from_slice(raw);
                     return SelAction::Click(bytes);
@@ -128,6 +155,7 @@ impl Selection {
         self.anchor = None;
         self.head = None;
         self.dragging = false;
+        self.swallow_release = false;
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -234,6 +262,29 @@ impl Selection {
     }
 }
 
+/// Inclusive column span of the whitespace-delimited token under `pos`, if any.
+fn token_span(grid: &Grid, pos: Pos) -> Option<(usize, usize)> {
+    let cells = grid.rows.get(pos.row)?;
+    let ch_at = |c: usize| cells.get(c).and_then(|c| c.as_ref()).map(|c| c.ch);
+    // the spacer after a wide char is None; treat it as part of that char
+    let is_token = |c: usize| match ch_at(c) {
+        Some(ch) => !ch.is_whitespace(),
+        None => c > 0 && ch_at(c - 1).is_some_and(|p| cw(p) == 2),
+    };
+    if pos.col >= grid.width || !is_token(pos.col) {
+        return None;
+    }
+    let mut c0 = pos.col;
+    while c0 > 0 && is_token(c0 - 1) {
+        c0 -= 1;
+    }
+    let mut c1 = pos.col;
+    while c1 + 1 < grid.width && is_token(c1 + 1) {
+        c1 += 1;
+    }
+    Some((c0, c1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,8 +306,40 @@ mod tests {
     }
 
     fn feed(s: &mut Selection, g: &Grid, rows: usize, btn: u32, x: u32, y: u32, press: bool) -> SelAction {
+        feed_at(s, g, rows, btn, x, y, press, Instant::now())
+    }
+
+    fn feed_at(s: &mut Selection, g: &Grid, rows: usize, btn: u32, x: u32, y: u32, press: bool, now: Instant) -> SelAction {
         let raw = sgr(btn, x, y, press);
-        s.on_mouse(btn, x, y, press, &raw, g, rows)
+        s.on_mouse(btn, x, y, press, &raw, g, rows, now)
+    }
+
+    #[test]
+    fn double_click_copies_the_token_and_swallows_its_release() {
+        let g = grid(&["path/to/file.rs:42 next"]);
+        let mut s = Selection::new();
+        let t0 = Instant::now();
+        assert_eq!(feed_at(&mut s, &g, 1, 0, 5, 1, true, t0), SelAction::Consumed);
+        assert!(matches!(feed_at(&mut s, &g, 1, 0, 5, 1, false, t0), SelAction::Click(_)));
+        let t1 = t0 + Duration::from_millis(200);
+        assert_eq!(feed_at(&mut s, &g, 1, 0, 5, 1, true, t1), SelAction::Copy("path/to/file.rs:42".into()));
+        assert_eq!(feed_at(&mut s, &g, 1, 0, 5, 1, false, t1), SelAction::Consumed);
+        assert!(s.overlay(&g, 30, 1).contains("\x1b[0;7mpath/to/file.rs:42\x1b[0m"));
+        // a third press after the window is an ordinary click again
+        let t2 = t1 + Duration::from_millis(900);
+        assert_eq!(feed_at(&mut s, &g, 1, 0, 5, 1, true, t2), SelAction::Consumed);
+        assert!(matches!(feed_at(&mut s, &g, 1, 0, 5, 1, false, t2), SelAction::Click(_)));
+    }
+
+    #[test]
+    fn double_click_on_blank_is_a_plain_click() {
+        let g = grid(&["ab   cd"]);
+        let mut s = Selection::new();
+        let t0 = Instant::now();
+        feed_at(&mut s, &g, 1, 0, 4, 1, true, t0);
+        feed_at(&mut s, &g, 1, 0, 4, 1, false, t0);
+        assert_eq!(feed_at(&mut s, &g, 1, 0, 4, 1, true, t0 + Duration::from_millis(100)), SelAction::Consumed);
+        assert!(matches!(feed_at(&mut s, &g, 1, 0, 4, 1, false, t0 + Duration::from_millis(100)), SelAction::Click(_)));
     }
 
     #[test]

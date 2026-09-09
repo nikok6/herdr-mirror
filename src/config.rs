@@ -95,6 +95,9 @@ pub struct HostConfig {
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
     pub always_control: bool,
+    /// plain left drags and double-clicks select locally in mirror panes
+    /// (default). Off forwards them to the remote app instead.
+    pub local_select: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +141,7 @@ struct RawConfig {
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
     always_control: Option<bool>,
+    local_select: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -156,6 +160,7 @@ struct RawHost {
     remote_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    local_select: Option<bool>,
     api_transport: Option<String>,
 }
 
@@ -236,6 +241,7 @@ pub fn load_config(candidates: &[PathBuf]) -> Result<MirrorConfig> {
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
     let global_always_control = raw.always_control.unwrap_or(true);
+    let global_local_select = raw.local_select.unwrap_or(true);
     let mut hosts: Vec<HostConfig> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for (name, value) in raw.hosts {
@@ -272,6 +278,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
             remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
             always_control: h.always_control.unwrap_or(global_always_control),
+            local_select: h.local_select.unwrap_or(global_local_select),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -324,6 +331,20 @@ mod tests {
         assert_eq!(h.prefix, "work");
         assert_eq!(h.remote_bin, None); // auto: PATH then ~/.local/bin/herdr
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn local_select_global_default_and_per_host_override() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert!(c.hosts[0].local_select); // default on
+        let c = parse_config(
+            "local_select = false\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nlocal_select = true\n",
+        )
+        .unwrap();
+        assert!(!c.hosts[0].local_select);
+        assert!(c.hosts[1].local_select);
     }
 
     #[test]

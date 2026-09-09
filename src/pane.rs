@@ -63,6 +63,9 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// own plain left drags and double-clicks locally (select.rs); off forwards
+    /// them to the remote app like any other click
+    pub local_select: bool,
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     ///
@@ -92,6 +95,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         size_fixed: false,
         always_control: false,
+        local_select: true,
         ctl_path: None,
         container: None,
     };
@@ -120,6 +124,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--no-local-select" => args.local_select = false,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
@@ -789,9 +794,10 @@ impl App {
     /// press-released-in-place put back as one click gesture; a finished drag
     /// copies to the clipboard here. Any keystroke drops a retained highlight.
     fn route_selection(&mut self, buf: Vec<u8>) -> Vec<u8> {
-        if !self.tty {
+        if !self.tty || !self.args.local_select {
             return buf;
         }
+        let now = Instant::now().into_std();
         let (_, rows) = term_size();
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut keyed = false;
@@ -799,7 +805,7 @@ impl App {
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
                 let raw = &buf[i..i + len];
-                match self.select.on_mouse(btn, x, y, press, raw, &self.grid, rows) {
+                match self.select.on_mouse(btn, x, y, press, raw, &self.grid, rows, now) {
                     SelAction::Pass => rest.extend_from_slice(raw),
                     SelAction::Consumed => {}
                     SelAction::Click(bytes) => rest.extend_from_slice(&bytes),

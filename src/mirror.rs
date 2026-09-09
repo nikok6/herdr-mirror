@@ -355,6 +355,7 @@ pub(crate) fn cmd_for_pane(
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let always_control = host.always_control;
+    let local_select = host.local_select;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
@@ -375,6 +376,9 @@ pub(crate) fn cmd_for_pane(
         }
         if always_control {
             argv.push("--always-control".into());
+        }
+        if !local_select {
+            argv.push("--no-local-select".into());
         }
         // ssh only: the pane reuses the daemon's ControlMaster for cheap
         // foreground polls. Docker has no ControlMaster, and healing no longer
@@ -1510,8 +1514,21 @@ mod tests {
             prefix: "vps".into(),
             remote_bin: None,
             always_control: true,
+            local_select: true,
             api_transport: crate::config::ApiTransport::Auto,
         }
+    }
+
+    #[test]
+    fn ssh_pane_argv_carries_no_local_select_only_when_off() {
+        let mut host = ssh_host();
+        host.local_select = false;
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            ["pane", "vps", "w1:p1", "--always-control", "--no-local-select", "--ctl-path", "/state/vps.ctl"]
+        );
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {
