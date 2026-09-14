@@ -16,12 +16,10 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, Write};
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -31,6 +29,7 @@ use crate::mirror::{
     apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
     teardown, AgentInfo, ConvergeDeps,
 };
+use crate::platform;
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
 
@@ -54,14 +53,10 @@ fn open_daemon_lock(env: &Env) -> Result<fs::File> {
 }
 
 fn try_lock(file: &fs::File) -> Result<bool> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(true);
-    }
-    let e = std::io::Error::last_os_error();
-    if e.kind() == std::io::ErrorKind::WouldBlock {
-        Ok(false)
-    } else {
-        Err(e.into())
+    match platform::try_lock(file) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -77,13 +72,15 @@ enum DaemonLockState {
 fn daemon_lock_state(env: &Env) -> Result<DaemonLockState> {
     let mut file = open_daemon_lock(env)?;
     if try_lock(&file)? {
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = platform::unlock(&file);
         return Ok(DaemonLockState::Unlocked);
     }
     let mut contents = String::new();
     file.rewind()?;
     file.read_to_string(&mut contents)?;
-    let pid = contents.trim().parse().ok().filter(|pid| pid_alive(*pid));
+    let pid = contents.trim().parse().ok();
+    #[cfg(unix)]
+    let pid = pid.filter(|pid| pid_alive(*pid));
     Ok(DaemonLockState::Locked(pid))
 }
 
@@ -103,27 +100,37 @@ impl Drop for DaemonLifetime {
         if ours {
             let _ = fs::remove_file(&self.pid_file);
         }
-        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+        let _ = platform::unlock(&self._lock);
     }
 }
 
 fn acquire_daemon_lifetime(env: &Env) -> Result<DaemonLifetime> {
     let mut lock = open_daemon_lock(env)?;
     if !try_lock(&lock)? {
-        return Err(err("mirror daemon already running for this state directory"));
+        return Err(err(
+            "mirror daemon already running for this state directory",
+        ));
     }
     let pid = std::process::id() as i32;
     lock.set_len(0)?;
     lock.rewind()?;
     writeln!(lock, "{pid}")?;
     lock.flush()?;
-    let guard = DaemonLifetime { _lock: lock, pid_file: pid_path(env), pid };
+    let guard = DaemonLifetime {
+        _lock: lock,
+        pid_file: pid_path(env),
+        pid,
+    };
     fs::write(&guard.pid_file, pid.to_string())?;
     Ok(guard)
 }
 
 fn legacy_running_pid(env: &Env) -> Option<i32> {
-    let pid: i32 = fs::read_to_string(pid_path(env)).ok()?.trim().parse().ok()?;
+    let pid: i32 = fs::read_to_string(pid_path(env))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     pid_alive(pid).then_some(pid)
 }
 
@@ -183,8 +190,15 @@ const BROADCAST_SUBS: &[&str] = &[
 ];
 
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
-    let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
-    subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
+    let mut subs: Vec<Value> = BROADCAST_SUBS
+        .iter()
+        .map(|t| json!({ "type": t }))
+        .collect();
+    subs.extend(
+        pane_ids
+            .iter()
+            .map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })),
+    );
     subs
 }
 
@@ -243,10 +257,19 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         }
         let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
         let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
+        push_pane_status(
+            &ctx.local,
+            &ctx.host.name,
+            &remote_id,
+            entry,
+            agent,
+            &ctx.log,
+        )
+        .await;
     }
     if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
-        ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
+        ctx.log
+            .log(&format!("[{}] state save failed: {e}", ctx.host.name));
     }
     need_converge
 }
@@ -309,7 +332,8 @@ async fn run_connected(
     let mut subscribed_key = String::from("<broadcast>");
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
-    ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
+    ctx.log
+        .log(&format!("[{}] connected and synced", ctx.host.name));
 
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
@@ -432,8 +456,13 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
-        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
-            .await;
+        mark_unknown(
+            &ctx.local,
+            &ctx.env_state_dir,
+            &ctx.host.name,
+            "mirror: connection lost",
+        )
+        .await;
         // starts_with, not contains: the marker is always emitted as a prefix,
         // while the error text can embed user strings (target, remote_bin). A
         // substring test would make an ssh host named `dormant-box` back off
@@ -453,7 +482,10 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         }
         // log dormancy once on entry, not on every poll of a stopped container
         if !dormant || !was_dormant {
-            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+            ctx.log.log(&format!(
+                "[{}] disconnected ({e}) — retrying in {delay}s",
+                ctx.host.name
+            ));
         }
         was_dormant = dormant;
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
@@ -491,14 +523,23 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
 ///
 /// Generation-agnostic by construction — every streamer ever shipped is
 /// `herdr-mirror pane …`, whatever flags follow.
+#[cfg_attr(windows, allow(dead_code))]
 async fn has_live_streamer(local: &ApiClient, pane_id: &str) -> Option<bool> {
-    let v = local.request("pane.process_info", json!({ "pane_id": pane_id })).await.ok()?;
-    let procs = v.pointer("/process_info/foreground_processes")?.as_array()?;
+    let v = local
+        .request("pane.process_info", json!({ "pane_id": pane_id }))
+        .await
+        .ok()?;
+    let procs = v
+        .pointer("/process_info/foreground_processes")?
+        .as_array()?;
     Some(procs.iter().any(|p| {
-        p.get("argv").and_then(|a| a.as_array()).is_some_and(|argv| is_streamer_argv(argv))
+        p.get("argv")
+            .and_then(|a| a.as_array())
+            .is_some_and(|argv| is_streamer_argv(argv))
     }))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn streamer_recovery_needed(process_info_live: Option<bool>, pidfile_live: bool) -> bool {
     process_info_live == Some(false) && !pidfile_live
 }
@@ -509,9 +550,12 @@ fn streamer_recovery_needed(process_info_live: Option<bool>, pidfile_live: bool)
 /// plugin checkout, `cargo run`), so it is matched by suffix. argv[1] pins the
 /// subcommand so an unrelated `herdr-mirror status` in the pane is not mistaken
 /// for a live stream.
+#[cfg_attr(windows, allow(dead_code))]
 fn is_streamer_argv(argv: &[Value]) -> bool {
-    argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
-        && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
+    argv.first().and_then(|s| s.as_str()).is_some_and(|e| {
+        let e = e.trim_end_matches(".exe");
+        e.ends_with("herdr-mirror")
+    }) && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
 }
 
 /// After a local herdr server restart, session-restore resurrects mirror panes
@@ -527,56 +571,69 @@ async fn heal_zombie_mirrors(
     pokers: &[mpsc::Sender<()>],
     log: &Logger,
 ) {
-    for (i, h) in hosts.iter().enumerate() {
-        let state = load_state(state_dir, &h.name);
-        let panes: Vec<(String, String)> = state
-            .panes
-            .iter()
-            .filter(|(_, e)| !e.is_tombstoned())
-            .map(|(rid, e)| (rid.clone(), e.local_id.clone()))
-            .collect();
-        if panes.is_empty() {
-            continue;
-        }
-        // Ask per pane, so one live streamer no longer blocks healing every
-        // other dead pane on the same host.
-        //
-        // Fail SAFE: anything other than a definite "nothing running there" is
-        // treated as alive. Leaving a frozen mirror is recoverable and visible;
-        // exec'ing into a pane whose streamer owns stdin writes the command
-        // line into the user's live remote session instead.
-        let mut dead: Vec<(String, String)> = Vec::new();
-        for (remote_pane_id, local_pane_id) in panes {
-            let process_info_live = has_live_streamer(local, &local_pane_id).await;
-            let pidfile_live = crate::util::streamer_alive(state_dir, &h.target, &remote_pane_id)
-                || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
-            if streamer_recovery_needed(process_info_live, pidfile_live) {
-                dead.push((remote_pane_id, local_pane_id));
+    // The attended Windows pane path is validated, but daemon re-exec still
+    // needs a live process-tree/claim test before it can be made automatic.
+    #[cfg(windows)]
+    {
+        let _ = (local, state_dir, hosts, pokers);
+        log.log("Windows zombie streamer healing is disabled");
+    }
+
+    #[cfg(not(windows))]
+    {
+        for (i, h) in hosts.iter().enumerate() {
+            let state = load_state(state_dir, &h.name);
+            let panes: Vec<(String, String)> = state
+                .panes
+                .iter()
+                .filter(|(_, e)| !e.is_tombstoned())
+                .map(|(rid, e)| (rid.clone(), e.local_id.clone()))
+                .collect();
+            if panes.is_empty() {
+                continue;
             }
-        }
-        if dead.is_empty() {
-            continue;
-        }
-        log.log(&format!(
+            // Ask per pane, so one live streamer no longer blocks healing every
+            // other dead pane on the same host.
+            //
+            // Fail SAFE: anything other than a definite "nothing running there" is
+            // treated as alive. Leaving a frozen mirror is recoverable and visible;
+            // exec'ing into a pane whose streamer owns stdin writes the command
+            // line into the user's live remote session instead.
+            let mut dead: Vec<(String, String)> = Vec::new();
+            for (remote_pane_id, local_pane_id) in panes {
+                let process_info_live = has_live_streamer(local, &local_pane_id).await;
+                let pidfile_live =
+                    crate::util::streamer_alive(state_dir, &h.target, &remote_pane_id)
+                        || crate::util::pane_streamer_alive(state_dir, &local_pane_id);
+                if streamer_recovery_needed(process_info_live, pidfile_live) {
+                    dead.push((remote_pane_id, local_pane_id));
+                }
+            }
+            if dead.is_empty() {
+                continue;
+            }
+            log.log(&format!(
             "[{}] {} mirror pane(s) mapped but not streaming (server restart?) — re-exec'ing streamers",
             h.name,
             dead.len()
         ));
-        // Surgical on purpose: session-restore brought the workspace, tabs, panes
-        // and layout back intact — only the streamer processes died. Exec the
-        // streamer back into each existing pane rather than closing the workspace
-        // and rebuilding it: that rebuild raced its own close (the fresh snapshot
-        // still listed the dying workspace, so the adopt path reused it and
-        // layout.apply then failed on its dead tab).
-        //
-        // Sizes live in the remote layout, which we don't have here; the wrapper
-        // falls back to its default and the next converge reconciles.
-        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
-        for (remote_pane_id, local_pane_id) in dead {
-            let argv = cmd_for(&remote_pane_id);
-            crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;
+            // Surgical on purpose: session-restore brought the workspace, tabs, panes
+            // and layout back intact — only the streamer processes died. Exec the
+            // streamer back into each existing pane rather than closing the workspace
+            // and rebuilding it: that rebuild raced its own close (the fresh snapshot
+            // still listed the dying workspace, so the adopt path reused it and
+            // layout.apply then failed on its dead tab).
+            //
+            // Sizes live in the remote layout, which we don't have here; the wrapper
+            // falls back to its default and the next converge reconciles.
+            let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
+            for (remote_pane_id, local_pane_id) in dead {
+                let argv = cmd_for(&remote_pane_id);
+                crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log)
+                    .await;
+            }
+            let _ = pokers[i].try_send(());
         }
-        let _ = pokers[i].try_send(());
     }
 }
 
@@ -658,12 +715,24 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     log.log(&format!(
         "daemon starting (pid {}, hosts: {}, config: {})",
         std::process::id(),
-        config.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>().join(", "),
-        config.source.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "?".into())
+        config
+            .hosts
+            .iter()
+            .map(|h| h.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        config
+            .source
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?".into())
     ));
     // two configs on disk is a silent trap: the loser is ignored with no sign
     for ignored in &config.shadowed {
-        log.log(&format!("warning: ignoring shadowed config at {}", ignored.display()));
+        log.log(&format!(
+            "warning: ignoring shadowed config at {}",
+            ignored.display()
+        ));
     }
     // a skipped host would otherwise just be quietly absent from the sidebar
     for w in &config.warnings {
@@ -675,7 +744,9 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     // it dies silently, but the repair stays behind the explicit `start`
     // command — the daemon never rewrites the filesystem in the background.
     if let Some(problem) = crate::util::cli_link_problem() {
-        log.log(&format!("warning: {problem} — keybindings using it can't fire; run start to repair"));
+        log.log(&format!(
+            "warning: {problem} — keybindings using it can't fire; run start to repair"
+        ));
         let _ = local
             .request(
                 "notification.show",
@@ -713,9 +784,8 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         closes.clone(),
     )));
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
+    let mut shutdown = platform::ShutdownWaiter::new(&env.state_dir)?;
+    let mut poke = platform::PokeWaiter::new(&env.state_dir)?;
     let mut poll = tokio::time::interval(Duration::from_secs(config.poll_seconds.max(5)));
     poll.tick().await; // consume the immediate first tick (initial sync already runs)
 
@@ -726,15 +796,14 @@ pub async fn cmd_run(env: Env) -> Result<()> {
                     let _ = p.try_send(());
                 }
             }
-            _ = sigusr1.recv() => {
+            _ = poke.recv() => {
                 // restore pokes us instead of converging itself — single writer
                 log.log("sync poke received");
                 for p in &pokers {
                     let _ = p.try_send(());
                 }
             }
-            _ = sigterm.recv() => break,
-            _ = sigint.recv() => break,
+            _ = shutdown.recv() => break,
         }
     }
 
@@ -769,13 +838,18 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .truncate(false)
         .write(true)
         .open(env.state_dir.join("daemon.start.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if platform::try_lock(&lock).is_err() {
         return Err(err("cannot lock daemon.start.lock"));
     }
     if running_pid(env).is_some() {
         println!("mirror daemon already running");
         return Ok(());
     }
+    // A pause/teardown that raced the daemon's exit can leave a `daemon.stop`
+    // behind; without this a daemon spawned now would consume it and quit
+    // immediately. (Unix signals leave no such marker, so this is a no-op
+    // there.)
+    platform::clear_lifecycle_requests(&env.state_dir);
     let exe = crate::util::self_exe_path()
         .ok_or_else(|| err("cannot locate the herdr-mirror binary to respawn"))?;
     let log = fs::OpenOptions::new()
@@ -783,15 +857,15 @@ pub fn cmd_start(env: &Env) -> Result<()> {
         .append(true)
         .open(env.state_dir.join("daemon.log"))?;
     let log2 = log.try_clone()?;
-    use std::os::unix::process::CommandExt;
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(log2)
-        .env("HERDR_MIRROR_DETACHED", "1")
-        .process_group(0)
-        .spawn()?;
+        .env("HERDR_MIRROR_DETACHED", "1");
+    platform::configure_detached_command(&mut command);
+    let mut child = command.spawn()?;
     let expected = child.id() as i32;
     for _ in 0..100 {
         if running_pid(env) == Some(expected) {
@@ -799,20 +873,26 @@ pub fn cmd_start(env: &Env) -> Result<()> {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
-            return Err(err(format!("mirror daemon exited during startup ({status})")));
+            return Err(err(format!(
+                "mirror daemon exited during startup ({status})"
+            )));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Err(err(format!("mirror daemon did not become ready (pid {expected})")))
+    Err(err(format!(
+        "mirror daemon did not become ready (pid {expected})"
+    )))
 }
 
 pub fn cmd_pause(env: &Env) {
     // sticky: mirrors stay, only the sync loop halts; resume with start
     set_paused(env, true);
     match running_pid(env) {
-        None => println!("mirror daemon already stopped; paused (won't autostart until you run start)"),
+        None => {
+            println!("mirror daemon already stopped; paused (won't autostart until you run start)")
+        }
         Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let _ = platform::request_stop(&env.state_dir, pid);
             println!("paused mirror daemon (pid {pid}); mirrors stay, resume with start");
         }
     }
@@ -836,20 +916,35 @@ pub fn cmd_status(env: &Env) -> Result<()> {
         Some(pid) => println!("daemon: running (pid {pid})"),
         None => println!(
             "daemon: not running{}",
-            if is_paused(env) { " (paused — resume with start)" } else { "" }
+            if is_paused(env) {
+                " (paused — resume with start)"
+            } else {
+                ""
+            }
         ),
     }
     match crate::util::cli_link_state() {
         crate::util::CliLink::Ok(t) => println!("cli link: ok (-> {})", t.display()),
         crate::util::CliLink::Missing => {
-            println!("cli link: MISSING ({}) — keybindings using it can't fire; start repairs it", crate::util::cli_link_path().display())
+            println!(
+                "cli link: MISSING ({}) — keybindings using it can't fire; start repairs it",
+                crate::util::cli_link_path().display()
+            )
         }
         crate::util::CliLink::Dangling(t) => {
-            println!("cli link: BROKEN (-> {}) — keybindings using it can't fire; start repairs it", t.display())
+            println!(
+                "cli link: BROKEN (-> {}) — keybindings using it can't fire; start repairs it",
+                t.display()
+            )
         }
-        crate::util::CliLink::Other(t) => println!("cli link: -> {} (not this binary; left alone)", t.display()),
+        crate::util::CliLink::Other(t) => {
+            println!("cli link: -> {} (not this binary; left alone)", t.display())
+        }
         crate::util::CliLink::File => {
-            println!("cli link: {} is a regular file (not managed)", crate::util::cli_link_path().display())
+            println!(
+                "cli link: {} is a regular file (not managed)",
+                crate::util::cli_link_path().display()
+            )
         }
     }
     let config = load_config(&env.config_search)?;
@@ -864,7 +959,11 @@ pub fn cmd_status(env: &Env) -> Result<()> {
     }
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);
-        let ws = state.workspaces.values().filter(|w| !w.is_tombstoned()).count();
+        let ws = state
+            .workspaces
+            .values()
+            .filter(|w| !w.is_tombstoned())
+            .count();
         let panes = state.panes.values().filter(|p| !p.is_tombstoned()).count();
         // `hidden` persists across reboots, so without this a host hidden weeks
         // ago is indistinguishable from one whose remote is unreachable: both
@@ -887,7 +986,13 @@ pub fn cmd_status(env: &Env) -> Result<()> {
             .iter()
             .filter(|(_, e)| e.is_tombstoned())
             .map(|(rid, _)| format!("workspace {rid}"))
-            .chain(state.panes.iter().filter(|(_, e)| e.is_tombstoned()).map(|(rid, _)| format!("pane {rid}")))
+            .chain(
+                state
+                    .panes
+                    .iter()
+                    .filter(|(_, e)| e.is_tombstoned())
+                    .map(|(rid, _)| format!("pane {rid}")),
+            )
             .collect();
         if !tombs.is_empty() {
             println!("  closed mirrors (restorable): {}", tombs.join(", "));
@@ -896,7 +1001,15 @@ pub fn cmd_status(env: &Env) -> Result<()> {
     let log_file = env.state_dir.join("daemon.log");
     if let Ok(text) = fs::read_to_string(&log_file) {
         println!("recent log:");
-        for l in text.trim_end().lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+        for l in text
+            .trim_end()
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             println!("  {l}");
         }
     }
@@ -987,10 +1100,12 @@ pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>
     }
     match running_pid(env) {
         Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            let _ = platform::request_poke(&env.state_dir, pid);
             println!("restored {cleared} mirror(s) — daemon syncing now");
         }
-        None => println!("restored {cleared} mirror(s) — they will reappear when the daemon starts"),
+        None => {
+            println!("restored {cleared} mirror(s) — they will reappear when the daemon starts")
+        }
     }
     Ok(())
 }
@@ -998,7 +1113,7 @@ pub fn cmd_restore(env: &Env, filter_host: Option<&str>, filter_id: Option<&str>
 pub async fn cmd_teardown(env: Env) -> Result<()> {
     let log = Logger::new(&env.state_dir, true);
     if let Some(pid) = running_pid(&env) {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let _ = platform::request_stop(&env.state_dir, pid);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     set_paused(&env, true); // torn down stays down until an explicit start
@@ -1039,7 +1154,11 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&state_dir).unwrap();
-        Env { config_search: Vec::new(), state_dir, local_socket: PathBuf::new() }
+        Env {
+            config_search: Vec::new(),
+            state_dir,
+            local_socket: PathBuf::new(),
+        }
     }
 
     #[test]
@@ -1053,6 +1172,7 @@ mod tests {
         let _ = fs::remove_dir_all(&env.state_dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn locked_owner_is_recovered_when_pidfile_disappears() {
         let env = lock_test_env("missing-pidfile");
@@ -1082,12 +1202,21 @@ mod tests {
         let mut streak = 0u32;
 
         // transient: fell back once, then the forward worked again
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
-        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Exec), &mut streak),
+            None
+        );
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Socket), &mut streak),
+            Some(ApiTransport::Socket)
+        );
         assert_eq!(streak, 0);
 
         // genuinely broken: two in a row sticks, and stays stuck
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Exec), &mut streak),
+            None
+        );
         assert_eq!(
             remember_transport(Some(ApiTransport::Exec), &mut streak),
             Some(ApiTransport::Exec)
@@ -1098,8 +1227,14 @@ mod tests {
         );
 
         // a later success clears it, so a fixed host returns to the forward
-        assert_eq!(remember_transport(Some(ApiTransport::Socket), &mut streak), Some(ApiTransport::Socket));
-        assert_eq!(remember_transport(Some(ApiTransport::Exec), &mut streak), None);
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Socket), &mut streak),
+            Some(ApiTransport::Socket)
+        );
+        assert_eq!(
+            remember_transport(Some(ApiTransport::Exec), &mut streak),
+            None
+        );
     }
 
     fn argv(parts: &[&str]) -> Vec<Value> {
@@ -1120,7 +1255,13 @@ mod tests {
         assert!(is_streamer_argv(&streamer));
 
         // the ssh child sharing the same pane is not itself a streamer
-        let ssh_child = argv(&["ssh", "-o", "BatchMode=yes", "vps", "exec ~/.local/bin/herdr ..."]);
+        let ssh_child = argv(&[
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "vps",
+            "exec ~/.local/bin/herdr ...",
+        ]);
         assert!(!is_streamer_argv(&ssh_child));
     }
 
@@ -1137,7 +1278,12 @@ mod tests {
             "/Users/n/proj",
         ])));
         // and a pre-v0.1.7 streamer, which carried no identity flag at all
-        assert!(is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"])));
+        assert!(is_streamer_argv(&argv(&[
+            "/usr/local/bin/herdr-mirror",
+            "pane",
+            "vps",
+            "w1:p1"
+        ])));
     }
 
     /// A shell left behind by session-restore is what healing must act on.
@@ -1151,7 +1297,10 @@ mod tests {
     /// Another subcommand in the pane must not read as a live stream.
     #[test]
     fn other_subcommands_are_not_streamers() {
-        assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "status"])));
+        assert!(!is_streamer_argv(&argv(&[
+            "/usr/local/bin/herdr-mirror",
+            "status"
+        ])));
         assert!(!is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror"])));
     }
 

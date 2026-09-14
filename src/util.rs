@@ -2,11 +2,15 @@
 
 use std::fs;
 use std::io::Write;
-use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+use crate::platform;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -15,6 +19,15 @@ pub fn err(msg: impl Into<String>) -> Error {
     msg.into().into()
 }
 
+#[cfg(windows)]
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(unix)]
 pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
@@ -69,7 +82,11 @@ impl Env {
                 PathBuf::from(sock)
             }
         };
-        Ok(Env { config_search, state_dir, local_socket })
+        Ok(Env {
+            config_search,
+            state_dir,
+            local_socket,
+        })
     }
 }
 
@@ -79,19 +96,32 @@ pub fn default_config_dir() -> PathBuf {
     home_dir().join(".config").join("herdr-mirror")
 }
 
+#[cfg(unix)]
 const DELETED_MARKER: &[u8] = b" (deleted)";
 
 /// `/proc/self/exe` gains a literal " (deleted)" suffix once the file behind it
 /// is replaced or unlinked. Returns the path without it, or None when there is
 /// no marker to strip. Pure, so the rule is testable without unlinking a binary.
+#[cfg(windows)]
+fn strip_deleted_marker(_p: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
 fn strip_deleted_marker(p: &Path) -> Option<PathBuf> {
     let stripped = p.as_os_str().as_bytes().strip_suffix(DELETED_MARKER)?;
     Some(PathBuf::from(OsString::from_vec(stripped.to_vec())))
 }
 
+#[cfg(windows)]
 fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Resolve the path a future child should execute from a path reported for the
@@ -128,10 +158,21 @@ pub fn self_exe_path() -> Option<PathBuf> {
 /// `self_exe_path` as a command string, falling back to a bare name so PATH
 /// lookup still gives a streamer something to try.
 pub fn self_exe() -> String {
-    self_exe_path().map(|p| p.display().to_string()).unwrap_or_else(|| "herdr-mirror".into())
+    self_exe_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "herdr-mirror".into())
 }
 
 /// The stable CLI path install.sh links and the README's keybindings use.
+#[cfg(windows)]
+pub fn cli_link_path() -> PathBuf {
+    home_dir()
+        .join(".local")
+        .join("bin")
+        .join("herdr-mirror.exe")
+}
+
+#[cfg(not(windows))]
 pub fn cli_link_path() -> PathBuf {
     home_dir().join(".local").join("bin").join("herdr-mirror")
 }
@@ -173,9 +214,11 @@ pub fn cli_link_state() -> CliLink {
 pub fn cli_link_problem() -> Option<String> {
     match cli_link_state() {
         CliLink::Missing => Some(format!("{} is missing", cli_link_path().display())),
-        CliLink::Dangling(t) => {
-            Some(format!("{} dangles (-> {})", cli_link_path().display(), t.display()))
-        }
+        CliLink::Dangling(t) => Some(format!(
+            "{} dangles (-> {})",
+            cli_link_path().display(),
+            t.display()
+        )),
         _ => None,
     }
 }
@@ -190,7 +233,11 @@ pub fn repair_cli_link() -> Option<String> {
     let exe = self_exe_path()?;
     let _ = fs::create_dir_all(link.parent()?);
     let _ = fs::remove_file(&link);
-    Some(match std::os::unix::fs::symlink(&exe, &link) {
+    #[cfg(unix)]
+    let result = std::os::unix::fs::symlink(&exe, &link);
+    #[cfg(windows)]
+    let result = fs::copy(&exe, &link).map(|_| ());
+    Some(match result {
         Ok(()) => format!("relinked {} -> {}", link.display(), exe.display()),
         Err(e) => format!("could not relink {}: {e}", link.display()),
     })
@@ -233,12 +280,19 @@ pub struct Logger {
 
 impl Logger {
     pub fn new(state_dir: &Path, also_stdout: bool) -> Logger {
-        Logger { file: state_dir.join("daemon.log"), also_stdout }
+        Logger {
+            file: state_dir.join("daemon.log"),
+            also_stdout,
+        }
     }
 
     pub fn log(&self, msg: &str) {
         let line = format!("{} {}\n", now_iso(), msg);
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&self.file) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+        {
             let _ = f.write_all(line.as_bytes());
         }
         if self.also_stdout {
@@ -286,7 +340,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// Is a pid alive? (signal 0)
 pub fn pid_alive(pid: i32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+    platform::pid_alive(pid)
 }
 
 /// Pidfile a pane streamer writes at startup. The daemon starts streamers by
@@ -297,28 +351,37 @@ pub fn pid_alive(pid: i32) -> bool {
 /// took, and retype it when it didn't.
 /// Squash anything that isn't `[A-Za-z0-9]` so an id can name a file.
 pub fn sane_component(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
 }
 
 pub fn streamer_pid_path(state_dir: &Path, ssh_target: &str, pane_target: &str) -> PathBuf {
-    state_dir
-        .join("streamer-pids")
-        .join(format!("{}--{}.pid", sane_component(ssh_target), sane_component(pane_target)))
+    state_dir.join("streamer-pids").join(format!(
+        "{}--{}.pid",
+        sane_component(ssh_target),
+        sane_component(pane_target)
+    ))
 }
 
 /// A launch claim exists from the first local `pane.send_text` until the
 /// streamer writes its pidfile. Recovery must not type another command into
 /// that pane during this interval: the first streamer can already own stdin
 /// even when herdr's process snapshot still reports the shell.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn streamer_spawn_pending_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
-    state_dir.join("streamer-spawns").join(format!("{}.pending", sane_component(local_pane_id)))
+    state_dir
+        .join("streamer-spawns")
+        .join(format!("{}.pending", sane_component(local_pane_id)))
 }
 
 /// How long a `.pending` claim may block another launch. The retype loop is
 /// 3s+4s+4s; anything older is leftover from a crashed or abandoned attempt
 /// and must not freeze heal forever.
+#[cfg_attr(windows, allow(dead_code))]
 const SPAWN_PENDING_TTL: Duration = Duration::from_secs(30);
 
+#[cfg_attr(windows, allow(dead_code))]
 fn pending_is_fresh(path: &Path) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
@@ -328,6 +391,7 @@ fn pending_is_fresh(path: &Path) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 pub enum StreamerSpawnClaim {
     Claimed,
     Active,
@@ -340,21 +404,89 @@ pub enum StreamerSpawnClaim {
 /// pane). This addresses one by where it is showing it, which is the only handle
 /// a herdr event hook has: the hook is told a local pane id and nothing else.
 pub fn pane_pid_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
-    state_dir.join("pane-pids").join(format!("{}.pid", sane_component(local_pane_id)))
+    state_dir
+        .join("pane-pids")
+        .join(format!("{}.pid", sane_component(local_pane_id)))
 }
 
+#[cfg(windows)]
+fn windows_process_start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = std::mem::zeroed();
+        let mut exit = std::mem::zeroed();
+        let mut kernel = std::mem::zeroed();
+        let mut user = std::mem::zeroed();
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
+}
+
+/// The process identity written into Windows streamer files. A PID alone is
+/// not safe there: Windows can reuse it after a streamer exits.
+#[cfg(windows)]
+pub fn current_process_identity() -> Option<String> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    let pid = unsafe { GetCurrentProcessId() };
+    let start = windows_process_start_time(pid)?;
+    // Keep the format deliberately simple so a damaged file is fail-closed.
+    Some(format!("{pid} {start}"))
+}
+
+#[cfg(not(windows))]
+pub fn current_process_identity() -> Option<String> {
+    Some(std::process::id().to_string())
+}
+
+#[cfg(windows)]
+#[cfg_attr(windows, allow(dead_code))]
+fn process_identity_alive(identity: &str) -> bool {
+    let mut fields = identity.split_whitespace();
+    let Some(pid) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+        return false;
+    };
+    let Some(start) = fields.next().and_then(|s| s.parse::<u64>().ok()) else {
+        return false;
+    };
+    fields.next().is_none() && windows_process_start_time(pid) == Some(start)
+}
+
+#[cfg(not(windows))]
+fn process_identity_alive(identity: &str) -> bool {
+    identity.trim().parse::<i32>().ok().is_some_and(pid_alive)
+}
+
+pub fn write_current_process_identity(path: &Path) -> std::io::Result<()> {
+    let identity = current_process_identity()
+        .ok_or_else(|| std::io::Error::other("cannot determine current process identity"))?;
+    fs::write(path, identity)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 pub fn streamer_alive(state_dir: &Path, ssh_target: &str, pane_target: &str) -> bool {
     fs::read_to_string(streamer_pid_path(state_dir, ssh_target, pane_target))
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .is_some_and(pid_alive)
+        .is_some_and(|s| process_identity_alive(&s))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub fn pane_streamer_alive(state_dir: &Path, local_pane_id: &str) -> bool {
     fs::read_to_string(pane_pid_path(state_dir, local_pane_id))
         .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        .is_some_and(pid_alive)
+        .is_some_and(|s| process_identity_alive(&s))
 }
 
 /// Claim the right to type one streamer launcher into a local pane.
@@ -363,6 +495,7 @@ pub fn pane_streamer_alive(state_dir: &Path, local_pane_id: &str) -> bool {
 /// the startup interval before the streamer can publish its pid. A claim older
 /// than `SPAWN_PENDING_TTL` is treated as abandoned so a later heal can type
 /// again (session-restore after a spawn that never published a pid).
+#[cfg_attr(windows, allow(dead_code))]
 pub fn claim_streamer_spawn(
     state_dir: &Path,
     ssh_target: &str,
@@ -381,7 +514,11 @@ pub fn claim_streamer_spawn(
     }
     // one retry: a stale file we just unlinked can lose create_new to a racer
     for _ in 0..2 {
-        let mut claim = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut claim = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if pending_is_fresh(&path) {
@@ -417,6 +554,7 @@ pub fn clear_streamer_spawn_pending(state_dir: &Path, local_pane_id: &str) {
 /// Checks the pid really is one of ours before signalling. A pid file outlives a
 /// streamer that was SIGKILLed, pids get reused, and SIGUSR1's default
 /// disposition is *terminate* — so acting on a stale file could kill a stranger.
+#[cfg(unix)]
 pub fn poke_pane_streamer(state_dir: &Path, local_pane_id: &str) -> bool {
     let Some(pid) = fs::read_to_string(pane_pid_path(state_dir, local_pane_id))
         .ok()
@@ -466,7 +604,7 @@ mod tests {
         let state_dir = test_state_dir("active-spawn");
         let pid_path = streamer_pid_path(&state_dir, "host", "w1:p1");
         fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        fs::write(&pid_path, current_process_identity().unwrap()).unwrap();
 
         assert_eq!(
             claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
@@ -481,7 +619,7 @@ mod tests {
         let state_dir = test_state_dir("active-local-pane");
         let pid_path = pane_pid_path(&state_dir, "w2:p2");
         fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        fs::write(&pid_path, current_process_identity().unwrap()).unwrap();
 
         assert_eq!(
             claim_streamer_spawn(&state_dir, "host", "w1:p1", "w2:p2").unwrap(),
@@ -511,6 +649,20 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_identity_rejects_pid_reuse_shape() {
+        let identity = current_process_identity().expect("current process identity");
+        assert!(process_identity_alive(&identity));
+
+        let mut fields = identity.split_whitespace();
+        let pid = fields.next().unwrap();
+        let start = fields.next().unwrap().parse::<u64>().unwrap();
+        let stale = format!("{pid} {}", start.saturating_add(1));
+        assert!(!process_identity_alive(&stale));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_stale_pending_claim_can_be_replaced() {
         let state_dir = test_state_dir("stale-pending");
@@ -524,7 +676,10 @@ mod tests {
             .unwrap()
             .as_secs() as libc::time_t;
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
-        let times = libc::utimbuf { actime: past, modtime: past };
+        let times = libc::utimbuf {
+            actime: past,
+            modtime: past,
+        };
         assert_eq!(unsafe { libc::utime(cpath.as_ptr(), &times) }, 0);
 
         assert_eq!(
@@ -534,6 +689,7 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn deleted_marker_is_stripped_only_when_it_is_a_real_suffix() {
         use super::{resolve_reported_exe, strip_deleted_marker};
@@ -541,9 +697,15 @@ mod tests {
             strip_deleted_marker(Path::new("/usr/bin/herdr-mirror (deleted)")),
             Some(PathBuf::from("/usr/bin/herdr-mirror"))
         );
-        assert_eq!(strip_deleted_marker(Path::new("/usr/bin/herdr-mirror")), None);
+        assert_eq!(
+            strip_deleted_marker(Path::new("/usr/bin/herdr-mirror")),
+            None
+        );
         // the words appearing mid-path are a directory name, not the kernel marker
-        assert_eq!(strip_deleted_marker(Path::new("/tmp/x (deleted)/herdr-mirror")), None);
+        assert_eq!(
+            strip_deleted_marker(Path::new("/tmp/x (deleted)/herdr-mirror")),
+            None
+        );
 
         // Model the real replacement case without unlinking the test runner:
         // the reported path is gone, while the original path names the new,

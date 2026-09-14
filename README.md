@@ -30,9 +30,12 @@ A remote can be another machine over **ssh**, or a **container** on this one
 
 - **Both ends**: herdr with the `terminal session` streams — preview build
   `2026-06-30` or newer (`herdr channel set preview`), until the next stable.
-- **Local machine**: macOS or Linux on x86_64/aarch64 — install fetches the
-  prebuilt binary from Releases (dev installs via `herdr plugin link` build
-  from source with `cargo build --release`).
+- **Local machine**: macOS or Linux on x86_64/aarch64 for the full data plane.
+  Windows x86_64 supports attended `pane` streaming, named-pipe control, remote
+  actions, and the ssh exec relay. Automatic daemon streamer launch and zombie
+  healing remain disabled pending live lifecycle validation. Install fetches the
+  prebuilt binary from Releases (dev installs via `herdr plugin link` build from
+  source with `cargo build --release`).
 - **ssh hosts**: non-interactive key auth to each remote
   (`ssh -o BatchMode=yes <host> true` must succeed without a prompt).
 - **Container hosts**: a working `docker` CLI, plus `socat` and herdr inside
@@ -415,6 +418,11 @@ identified as disposable merely because their directory matches.
 
 ## Limitations
 
+- **Windows is staged support**: named-pipe IPC, the daemon lifecycle, remote
+  actions, and the ssh exec relay work, but the pane/PTY data plane (ConPTY)
+  and the interactive host picker are not ported. `api_transport = "socket"`
+  is rejected on Windows (no OpenSSH ControlMaster), and mirror panes report
+  "not supported on Windows" instead of streaming.
 - **Version-locked to preview** until the `terminal session` streams reach
   stable; keep both ends on the same build.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so

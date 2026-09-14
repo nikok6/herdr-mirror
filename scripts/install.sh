@@ -25,6 +25,7 @@ SLUG="$(git config --get remote.origin.url 2>/dev/null |
 case "$(uname -s)" in
   Darwin) OS="darwin" ;;
   Linux) OS="linux" ;;
+  MINGW* | MSYS* | CYGWIN*) OS="windows" ;;
   *) fail "unsupported OS: $(uname -s)" ;;
 esac
 case "$(uname -m)" in
@@ -33,6 +34,10 @@ case "$(uname -m)" in
   *) fail "unsupported architecture: $(uname -m)" ;;
 esac
 ASSET="herdr-mirror-${OS}-${ARCH}"
+[ "$OS" = "windows" ] && ASSET="${ASSET}.exe"
+if [ "$OS" = "windows" ]; then
+  DEST="target/release/herdr-mirror.exe"
+fi
 BASE="https://github.com/${SLUG}/releases/download/v${VERSION}"
 
 # SHA-256 verifier. coreutils `sha256sum` on Linux and recent macOS; `shasum`
@@ -104,7 +109,11 @@ final_bin_path() {
   done
   echo "$(pwd)/${DEST}"
 }
-LINK="${HOME}/.local/bin/herdr-mirror"
+if [ "$OS" = "windows" ]; then
+  LINK="${HOME}/.local/bin/herdr-mirror.exe"
+else
+  LINK="${HOME}/.local/bin/herdr-mirror"
+fi
 TARGET="$(final_bin_path)"
 
 # A link is foreign when it's live, isn't our target, and points outside a
@@ -121,7 +130,16 @@ is_foreign_link() {
   return 0
 }
 
-if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+if [ "$OS" = "windows" ]; then
+  # Windows symlinks need Developer Mode/admin and MSYS `ln -s` may silently
+  # write a plain copy instead; either way a symlink check is unreliable, so
+  # the stable CLI path is a refreshed copy on every install.
+  if mkdir -p "${HOME}/.local/bin" && rm -f "$LINK" && cp "$TARGET" "$LINK"; then
+    echo "copied ${LINK}"
+  else
+    echo "note: could not install ${LINK}; run the plugin's Mirror: start action to repair it"
+  fi
+elif [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
   echo "note: ${LINK} exists and is not a symlink; left untouched (README keybindings expect herdr-mirror there)"
 elif is_foreign_link; then
   echo "note: ${LINK} -> ${CUR} left untouched; not managed by this install"

@@ -66,13 +66,15 @@ struct Resolved {
 fn resolve_context(env: &Env, hosts: &[HostConfig], ctx: &InvocationContext) -> Option<Resolved> {
     for host in hosts {
         let state = load_state(&env.state_dir, &host.name);
-        let ws_hit = state.workspaces.iter().find(|(_, e)| {
-            Some(&e.local_id) == ctx.workspace_id.as_ref() && !e.is_tombstoned()
-        });
+        let ws_hit = state
+            .workspaces
+            .iter()
+            .find(|(_, e)| Some(&e.local_id) == ctx.workspace_id.as_ref() && !e.is_tombstoned());
         let Some((ws_rid, _)) = ws_hit else { continue };
-        let pane_hit = state.panes.iter().find(|(_, e)| {
-            Some(&e.local_id) == ctx.focused_pane_id.as_ref() && !e.is_tombstoned()
-        });
+        let pane_hit = state
+            .panes
+            .iter()
+            .find(|(_, e)| Some(&e.local_id) == ctx.focused_pane_id.as_ref() && !e.is_tombstoned());
         return Some(Resolved {
             host: host.clone(),
             remote_ws_id: Some(ws_rid.clone()),
@@ -103,14 +105,16 @@ fn invocation_context() -> InvocationContext {
 /// cwd for a local fallback, inherited the way native new_tab/split do: shell
 /// bindings carry it directly, plugin actions don't, so fall back to the
 /// focused pane's cwd from the local snapshot.
-async fn local_cwd(
-    api: &crate::api::ApiClient,
-    ctx: &InvocationContext,
-) -> Result<Option<String>> {
-    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty()) {
+async fn local_cwd(api: &crate::api::ApiClient, ctx: &InvocationContext) -> Result<Option<String>> {
+    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return Ok(Some(cwd));
     }
-    let Some(pane_id) = &ctx.focused_pane_id else { return Ok(None) };
+    let Some(pane_id) = &ctx.focused_pane_id else {
+        return Ok(None);
+    };
     let snap = fetch_snapshot(api).await?;
     Ok(snap
         .panes
@@ -132,7 +136,9 @@ async fn local_tab(env: &Env, ctx: &InvocationContext) -> Result<()> {
     let res: Value = api.request("tab.create", params).await?;
     println!(
         "created local tab {}",
-        res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?")
+        res.pointer("/tab/tab_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
     );
     Ok(())
 }
@@ -154,7 +160,9 @@ async fn local_split(env: &Env, ctx: &InvocationContext, direction: &str) -> Res
     println!(
         "split local pane {} {direction} → {}",
         ctx.focused_pane_id.as_deref().unwrap_or("focused"),
-        res.pointer("/pane/pane_id").and_then(|v| v.as_str()).unwrap_or("?")
+        res.pointer("/pane/pane_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
     );
     Ok(())
 }
@@ -208,7 +216,10 @@ fn local_context_value(ctx: &InvocationContext) -> Value {
     if let Some(pane) = &ctx.focused_pane_id {
         out["focused_pane_id"] = json!(pane);
     }
-    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|s| !s.is_empty()) {
+    if let Some(cwd) = std::env::var("HERDR_ACTIVE_PANE_CWD")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         out["focused_pane_cwd"] = json!(cwd);
     }
     out
@@ -232,7 +243,10 @@ async fn invoke(env: &Env, spec: &str) -> Result<()> {
     let ctx = invocation_context();
     // Same deliberate non-`?` as run(): the local fallback needs no host config.
     let config = load_config(&env.config_search);
-    let resolved = config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
+    let resolved = config
+        .as_ref()
+        .ok()
+        .and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
     let Some(resolved) = resolved else {
         let api = crate::api::ApiClient::connect(&env.local_socket).await?;
@@ -293,8 +307,10 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
     // Hard-failing here would kill that key for anyone who hasn't written
     // hosts.toml yet, with an error about SSH hosts they never asked for.
     let config = load_config(&env.config_search);
-    let resolved =
-        config.as_ref().ok().and_then(|c| resolve_context(env, &c.hosts, &ctx));
+    let resolved = config
+        .as_ref()
+        .ok()
+        .and_then(|c| resolve_context(env, &c.hosts, &ctx));
 
     // One key for both worlds: inside a mirror these take the remote path
     // below; anywhere else they degrade to the plain local action instead of
@@ -340,7 +356,9 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
 
     // Follow the invoking remote pane unless a known remote policy overrides
     // it. Omitting cwd under `follow` would follow another client's focus.
-    let policy = if kind == "split" { None } else {
+    let policy = if kind == "split" {
+        None
+    } else {
         crate::cwd_policy::remote_policy(&remote, &host).await
     };
     let mut cwd: Option<String> = None;
@@ -355,22 +373,36 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
 
     match kind {
         "workspace" => {
-            let res: Value = api.request("workspace.create", json!({ "cwd": cwd, "focus": false })).await?;
+            let res: Value = api
+                .request("workspace.create", json!({ "cwd": cwd, "focus": false }))
+                .await?;
             println!(
                 "created workspace {} ({}) on {}; mirror follows shortly",
-                res.pointer("/workspace/label").and_then(|v| v.as_str()).unwrap_or("?"),
-                res.pointer("/workspace/workspace_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                res.pointer("/workspace/label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
+                res.pointer("/workspace/workspace_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
                 host.name
             );
         }
         "tab" => {
-            let ws = resolved.as_ref().and_then(|r| r.remote_ws_id.clone()).unwrap();
+            let ws = resolved
+                .as_ref()
+                .and_then(|r| r.remote_ws_id.clone())
+                .unwrap();
             let res: Value = api
-                .request("tab.create", json!({ "workspace_id": ws, "cwd": cwd, "focus": false }))
+                .request(
+                    "tab.create",
+                    json!({ "workspace_id": ws, "cwd": cwd, "focus": false }),
+                )
                 .await?;
             println!(
                 "created tab {} in {}: {ws}; mirror follows shortly",
-                res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                res.pointer("/tab/tab_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
                 host.name
             );
         }
@@ -388,7 +420,9 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
             println!(
                 "split {pane_id} {dir} on {} → {}; mirror follows shortly",
                 host.name,
-                res.pointer("/pane/pane_id").and_then(|v| v.as_str()).unwrap_or("ok")
+                res.pointer("/pane/pane_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("ok")
             );
         }
         _ => return Err(err(format!("unknown remote action: {kind}"))),
@@ -403,13 +437,22 @@ async fn run(env: &Env, kind: &str, direction: Option<&str>) -> Result<()> {
 async fn resolve_host(env: &Env, host_arg: Option<&str>) -> Result<HostConfig> {
     let config = load_config(&env.config_search)?;
     if let Some(name) = host_arg {
-        return config.hosts.iter().find(|h| h.name == name).cloned().ok_or_else(|| {
-            let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
-            err(format!(
-                "unknown host {name:?} (configured: {})",
-                if known.is_empty() { "none".into() } else { known.join(", ") }
-            ))
-        });
+        return config
+            .hosts
+            .iter()
+            .find(|h| h.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                let known: Vec<&str> = config.hosts.iter().map(|h| h.name.as_str()).collect();
+                err(format!(
+                    "unknown host {name:?} (configured: {})",
+                    if known.is_empty() {
+                        "none".into()
+                    } else {
+                        known.join(", ")
+                    }
+                ))
+            });
     }
     let ctx = invocation_context();
     resolve_context(env, &config.hosts, &ctx).map(|r| r.host).ok_or_else(|| {
@@ -438,7 +481,7 @@ async fn hide(env: &Env, host_arg: Option<&str>) -> Result<()> {
     // "already hidden" with the mirrors still on screen is a dead end.
     match crate::daemon::running_pid(env) {
         Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            let _ = crate::platform::request_poke(&env.state_dir, pid);
             println!(
                 "hid {} — remote keeps running; `herdr-mirror show {}` brings it back",
                 host.name, host.name
@@ -514,7 +557,7 @@ async fn show_all(env: &Env) -> Result<()> {
 fn nudge_daemon(env: &Env, prefix: &str) {
     match crate::daemon::running_pid(env) {
         Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            let _ = crate::platform::request_poke(&env.state_dir, pid);
             println!("{prefix} — daemon syncing now");
         }
         None => println!("{prefix} — mirrors reappear when the daemon starts"),
@@ -529,32 +572,88 @@ mod cwd_live_tests {
     #[ignore = "requires PR89_LIVE_ROOT with isolated remote session config and fixture.json"]
     async fn remote_creation_directory_policies() {
         let root = std::path::PathBuf::from(std::env::var("PR89_LIVE_ROOT").unwrap());
-        let fixture: Value = serde_json::from_str(&std::fs::read_to_string(root.join("fixture.json")).unwrap()).unwrap();
-        let env = Env {config_search: vec![root.clone()],state_dir:root.clone(),local_socket:root.join("unused.sock")};
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("fixture.json")).unwrap())
+                .unwrap();
+        let env = Env {
+            config_search: vec![root.clone()],
+            state_dir: root.clone(),
+            local_socket: root.join("unused.sock"),
+        };
         let config = load_config(&env.config_search).unwrap();
         let host = &config.hosts[0];
         let mut remote = RemoteHost::new(host, &root);
         let (api, _) = remote.connect_api().await.unwrap();
-        let source = api.request("workspace.create", json!({"cwd":fixture["anchor"], "focus":true})).await.unwrap();
+        let source = api
+            .request(
+                "workspace.create",
+                json!({"cwd":fixture["anchor"], "focus":true}),
+            )
+            .await
+            .unwrap();
         let ws = source["workspace"]["workspace_id"].as_str().unwrap();
         let pane = source["root_pane"]["pane_id"].as_str().unwrap();
         let anchor_cwd = source["root_pane"]["cwd"].clone();
-        api.request("tab.create", json!({"workspace_id":ws,"cwd":fixture["other"],"focus":true})).await.unwrap();
+        api.request(
+            "tab.create",
+            json!({"workspace_id":ws,"cwd":fixture["other"],"focus":true}),
+        )
+        .await
+        .unwrap();
         let mut state = crate::state::HostState::default();
-        state.workspaces.insert(ws.into(), crate::state::WsEntry {local_id:"local-ws".into(), tombstone:None,root_tab_local_id:None,last_remote_label:None});
-        state.panes.insert(pane.into(), crate::state::PaneEntry {local_id:"local-pane".into(),tombstone:None,seq:0,reported:None});
-        crate::state::save_state(&root,&host.name,&state).unwrap();
-        std::env::set_var("HERDR_PLUGIN_CONTEXT_JSON", r#"{"workspace_id":"local-ws","focused_pane_id":"local-pane"}"#);
+        state.workspaces.insert(
+            ws.into(),
+            crate::state::WsEntry {
+                local_id: "local-ws".into(),
+                tombstone: None,
+                root_tab_local_id: None,
+                last_remote_label: None,
+            },
+        );
+        state.panes.insert(
+            pane.into(),
+            crate::state::PaneEntry {
+                local_id: "local-pane".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+            },
+        );
+        crate::state::save_state(&root, &host.name, &state).unwrap();
+        std::env::set_var(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"workspace_id":"local-ws","focused_pane_id":"local-pane"}"#,
+        );
         for kind in ["tab", "workspace", "split"] {
-            let before = api.request("pane.list",json!({})).await.unwrap();
-            let ids: std::collections::HashSet<String> = before["panes"].as_array().unwrap().iter().map(|p|p["pane_id"].as_str().unwrap().into()).collect();
-            run(&env,kind,if kind=="split" {Some("right")} else {None}).await.unwrap();
-            let after = api.request("pane.list",json!({})).await.unwrap();
-            let created: Vec<_> = after["panes"].as_array().unwrap().iter().filter(|p|!ids.contains(p["pane_id"].as_str().unwrap())).collect();
-            assert_eq!(created.len(),1,"{kind}");
-            let expected = if kind=="split" || fixture["policy"]=="follow" {&anchor_cwd} else {&fixture["expected"]};
-            println!("{kind}: cwd={} expected={expected}",created[0]["cwd"]);
-            assert_eq!(&created[0]["cwd"],expected,"{kind}");
+            let before = api.request("pane.list", json!({})).await.unwrap();
+            let ids: std::collections::HashSet<String> = before["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["pane_id"].as_str().unwrap().into())
+                .collect();
+            run(
+                &env,
+                kind,
+                if kind == "split" { Some("right") } else { None },
+            )
+            .await
+            .unwrap();
+            let after = api.request("pane.list", json!({})).await.unwrap();
+            let created: Vec<_> = after["panes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| !ids.contains(p["pane_id"].as_str().unwrap()))
+                .collect();
+            assert_eq!(created.len(), 1, "{kind}");
+            let expected = if kind == "split" || fixture["policy"] == "follow" {
+                &anchor_cwd
+            } else {
+                &fixture["expected"]
+            };
+            println!("{kind}: cwd={} expected={expected}", created[0]["cwd"]);
+            assert_eq!(&created[0]["cwd"], expected, "{kind}");
         }
         std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON");
     }

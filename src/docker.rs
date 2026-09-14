@@ -16,18 +16,19 @@
 // The held `events.subscribe` stream is a single long-lived exec, so the
 // high-frequency path costs nothing extra.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::config::HostKind;
+use crate::platform::{self, LocalStream};
 use crate::util::{err, Logger, Result};
 
 /// Handle to a running container. Cheap to clone; holds no processes.
@@ -43,9 +44,7 @@ fn docker_filter(kind: &HostKind) -> Result<String> {
         // `name=` is a substring match in docker, so pin it with anchors to
         // avoid the same class of collision that broke streamer counting
         HostKind::DockerContainer(name) => Ok(format!("name=^{name}$")),
-        HostKind::DockerFolder(folder) => {
-            Ok(format!("label=devcontainer.local_folder={folder}"))
-        }
+        HostKind::DockerFolder(folder) => Ok(format!("label=devcontainer.local_folder={folder}")),
     }
 }
 
@@ -97,6 +96,7 @@ pub async fn resolve(docker_bin: &str, kind: &HostKind) -> Result<Vec<String>> {
 /// The deadline is not optional. The pane runs a single-threaded runtime, so an
 /// unbounded wait here blocks input, rendering and signal handling — a wedged
 /// Docker daemon would otherwise make the pane unkillable.
+#[cfg(unix)]
 pub fn resolve_blocking(docker_bin: &str, kind: &HostKind, wait: Duration) -> Result<String> {
     let filter = docker_filter(kind)?;
     let mut child = std::process::Command::new(docker_bin)
@@ -110,7 +110,9 @@ pub fn resolve_blocking(docker_bin: &str, kind: &HostKind, wait: Duration) -> Re
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = child.wait_with_output().map_err(|e| err(format!("docker ps: {e}")))?;
+                let out = child
+                    .wait_with_output()
+                    .map_err(|e| err(format!("docker ps: {e}")))?;
                 let ids = parse_ps(status.success(), &out.stdout, &out.stderr)?;
                 return ids
                     .into_iter()
@@ -148,8 +150,10 @@ pub async fn probe_socat(docker_bin: &str, cid: &str) -> Result<()> {
     if out.status.success() && !out.stdout.is_empty() {
         return Ok(());
     }
-    Err(err("container has no socat, which is needed to reach herdr's socket — \
-             install it in the image, or bind-mount the socket to the host"))
+    Err(err(
+        "container has no socat, which is needed to reach herdr's socket — \
+             install it in the image, or bind-mount the socket to the host",
+    ))
 }
 
 /// socat's address grammar is not a plain path: `,` starts an option list and
@@ -168,7 +172,9 @@ pub(crate) fn validate_socket_path(sock: &str) -> Result<()> {
         return Err(err(format!("remote socket path is not absolute: {sock}")));
     }
     if sock.contains(',') || sock.contains("!!") {
-        return Err(err(format!("remote socket path has socat metacharacters: {sock}")));
+        return Err(err(format!(
+            "remote socket path has socat metacharacters: {sock}"
+        )));
     }
     Ok(())
 }
@@ -205,7 +211,14 @@ impl Container {
     /// One `docker exec` bridging a single connection to the container socket.
     fn relay_child(&self, remote_sock: &str) -> Result<tokio::process::Child> {
         let mut cmd = Command::new(&self.docker_bin);
-        cmd.args(["exec", "-i", &self.id, "socat", "-", &format!("UNIX-CONNECT:{remote_sock}")]);
+        cmd.args([
+            "exec",
+            "-i",
+            &self.id,
+            "socat",
+            "-",
+            &format!("UNIX-CONNECT:{remote_sock}"),
+        ]);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // kept, not nulled: a container that died, or a socat that cannot
@@ -215,7 +228,8 @@ impl Container {
             // if we drop the connection the child must die rather than linger
             // holding the container socket open
             .kill_on_drop(true);
-        cmd.spawn().map_err(|e| err(format!("docker exec (relay) failed: {e}")))
+        cmd.spawn()
+            .map_err(|e| err(format!("docker exec (relay) failed: {e}")))
     }
 }
 
@@ -232,17 +246,20 @@ pub fn serve_relay(
     // a previous daemon (or a crash) leaves the socket file behind; bind fails
     // on an existing path even when nothing is listening. Callers must only
     // reach here after establishing that nothing live owns it.
-    let _ = std::fs::remove_file(&local_sock);
+    let _ = platform::remove_endpoint(&local_sock);
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let listener = UnixListener::bind(&local_sock)
+    let mut listener = platform::LocalListener::bind(&local_sock)
         .map_err(|e| err(format!("cannot bind {}: {e}", local_sock.display())))?;
     // anyone who can connect here drives the remote herdr API unauthenticated,
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
-    if let Err(e) = std::fs::set_permissions(&local_sock, std::fs::Permissions::from_mode(0o600)) {
-        log.log(&format!("relay: cannot restrict {}: {e}", local_sock.display()));
+    if let Err(e) = platform::set_private_endpoint(&local_sock) {
+        log.log(&format!(
+            "relay: cannot restrict {}: {e}",
+            local_sock.display()
+        ));
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -255,7 +272,7 @@ pub fn serve_relay(
         loop {
             let stream = tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((s, _)) => s,
+                    Ok(s) => s,
                     Err(e) => {
                         consecutive_errors += 1;
                         log.log(&format!("relay accept failed ({consecutive_errors}): {e}"));
@@ -282,7 +299,11 @@ pub fn serve_relay(
             });
         }
     });
-    Ok(RelayHandle { path, task, shutdown: shutdown_tx })
+    Ok(RelayHandle {
+        path,
+        task,
+        shutdown: shutdown_tx,
+    })
 }
 
 async fn wait_shutdown(mut rx: watch::Receiver<bool>) {
@@ -310,7 +331,7 @@ impl Drop for RelayHandle {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        let _ = platform::remove_endpoint(&self.path);
     }
 }
 
@@ -318,14 +339,23 @@ impl Drop for RelayHandle {
 async fn pump(
     container: &Container,
     remote_sock: &str,
-    stream: UnixStream,
+    stream: LocalStream,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut child = container.relay_child(remote_sock)?;
-    let mut cin = child.stdin.take().ok_or_else(|| err("relay: no child stdin"))?;
-    let mut cout = child.stdout.take().ok_or_else(|| err("relay: no child stdout"))?;
-    let mut cerr = child.stderr.take().ok_or_else(|| err("relay: no child stderr"))?;
-    let (mut lr, mut lw) = stream.into_split();
+    let mut cin = child
+        .stdin
+        .take()
+        .ok_or_else(|| err("relay: no child stdin"))?;
+    let mut cout = child
+        .stdout
+        .take()
+        .ok_or_else(|| err("relay: no child stdout"))?;
+    let mut cerr = child
+        .stderr
+        .take()
+        .ok_or_else(|| err("relay: no child stderr"))?;
+    let (mut lr, mut lw) = platform::split(stream);
 
     // Client → container. Finishing means the client half-closed after sending
     // its request, which is NOT the end of the exchange: forward the EOF and
@@ -370,7 +400,11 @@ async fn pump(
     // surface why socat gave up, instead of presenting every distinct fault as
     // an indistinguishable "connection closed"
     let mut errtext = String::new();
-    let _ = timeout(Duration::from_millis(200), cerr.read_to_string(&mut errtext)).await;
+    let _ = timeout(
+        Duration::from_millis(200),
+        cerr.read_to_string(&mut errtext),
+    )
+    .await;
     let errtext = errtext.trim();
     if !errtext.is_empty() {
         return Err(err(format!("relay: {errtext}")));
@@ -381,6 +415,8 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn filters_are_anchored_or_labelled() {
@@ -416,11 +452,18 @@ mod tests {
     #[test]
     fn rejects_socat_metacharacters_in_socket_path() {
         assert!(validate_socket_path("/root/.config/herdr/herdr.sock").is_ok());
-        assert!(validate_socket_path("/tmp/x!!EXEC:/bin/sh").is_err(), "dual-address");
+        assert!(
+            validate_socket_path("/tmp/x!!EXEC:/bin/sh").is_err(),
+            "dual-address"
+        );
         assert!(validate_socket_path("/tmp/x,fork").is_err(), "option list");
-        assert!(validate_socket_path("relative/path.sock").is_err(), "not absolute");
+        assert!(
+            validate_socket_path("relative/path.sock").is_err(),
+            "not absolute"
+        );
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_blocking_times_out_rather_than_hanging() {
         // A stub that ignores its args and hangs, standing in for a wedged
@@ -442,7 +485,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e}");
-        assert!(start.elapsed() < Duration::from_secs(5), "must not wait for the stub to finish");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait for the stub to finish"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -458,6 +504,7 @@ mod tests {
     /// meaningful against a live socket, and the held `events.subscribe`
     /// stream is the part most likely to behave differently from a one-shot
     /// request.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore]
     async fn relay_reaches_real_container() {
@@ -467,7 +514,8 @@ mod tests {
         };
         let sock = std::env::var("HERDR_MIRROR_IT_SOCK")
             .unwrap_or_else(|_| "/root/.config/herdr/herdr.sock".into());
-        let docker_bin = std::env::var("HERDR_MIRROR_IT_DOCKER").unwrap_or_else(|_| "docker".into());
+        let docker_bin =
+            std::env::var("HERDR_MIRROR_IT_DOCKER").unwrap_or_else(|_| "docker".into());
 
         let kind = HostKind::DockerContainer(name.clone());
         let ids = resolve(&docker_bin, &kind).await.expect("resolve failed");
@@ -479,17 +527,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("herdr-mirror-it-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let local_sock = dir.join("it-api.sock");
-        let container = Container { id: cid, docker_bin };
-        let handle =
-            serve_relay(container, sock, local_sock.clone(), Logger::new(&dir, false)).unwrap();
+        let container = Container {
+            id: cid,
+            docker_bin,
+        };
+        let handle = serve_relay(
+            container,
+            sock,
+            local_sock.clone(),
+            Logger::new(&dir, false),
+        )
+        .unwrap();
 
         // the socket must not be readable by other users: it proxies an API
         // that can start agents with arbitrary argv
-        let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&handle.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
 
         // 1. one-shot request/response (ApiClient::connect pings)
-        let api = crate::api::ApiClient::connect(&handle.path).await.expect("ping through relay");
+        let api = crate::api::ApiClient::connect(&handle.path)
+            .await
+            .expect("ping through relay");
         eprintln!("ping ok");
 
         // 2. a real payload, exercising a larger response than a pong
@@ -497,13 +559,18 @@ mod tests {
             .request("session.snapshot", serde_json::json!({}))
             .await
             .expect("session.snapshot through relay");
-        assert!(snap.pointer("/snapshot/workspaces").is_some(), "snapshot shape: {snap}");
+        assert!(
+            snap.pointer("/snapshot/workspaces").is_some(),
+            "snapshot shape: {snap}"
+        );
         eprintln!("snapshot ok ({} bytes)", snap.to_string().len());
 
         // 3. several sequential requests: each is a fresh connection, so this
         //    is what would expose a per-request child or fd leak
         for _ in 0..5 {
-            api.request("session.snapshot", serde_json::json!({})).await.expect("repeat request");
+            api.request("session.snapshot", serde_json::json!({}))
+                .await
+                .expect("repeat request");
         }
         eprintln!("5 sequential requests ok");
 
@@ -513,7 +580,10 @@ mod tests {
             .await
             .expect("events.subscribe through relay");
         let idle = timeout(Duration::from_millis(1500), stream.next()).await;
-        assert!(idle.is_err() || idle.unwrap().is_some(), "subscription closed early");
+        assert!(
+            idle.is_err() || idle.unwrap().is_some(),
+            "subscription closed early"
+        );
         eprintln!("subscribe held ok");
 
         drop(handle);

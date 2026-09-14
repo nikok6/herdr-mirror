@@ -15,6 +15,7 @@ mod api;
 mod binding;
 mod closes;
 mod config;
+#[cfg_attr(windows, allow(dead_code))]
 mod cwd_policy;
 mod daemon;
 mod docker;
@@ -24,7 +25,12 @@ mod layout_sync;
 mod mirror;
 mod pane;
 mod paste;
+#[cfg(unix)]
 mod pick;
+#[cfg(windows)]
+#[path = "pick_windows.rs"]
+mod pick;
+mod platform;
 mod predict;
 mod remote;
 mod remote_action;
@@ -53,7 +59,9 @@ fn main() {
 }
 
 fn run(cmd: &str, rest: &[String]) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let result = run_on(&rt, cmd, rest);
     // pane mode's blocking stdin read would hang a plain Runtime::drop forever
     rt.shutdown_background();

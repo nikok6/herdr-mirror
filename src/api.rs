@@ -14,9 +14,9 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 
+use crate::platform::{self, LocalReadHalf, LocalWriteHalf};
 use crate::util::{err, Result};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -38,7 +38,9 @@ pub struct ApiClient {
 impl ApiClient {
     /// Connect-check the socket (one ping round-trip), then hand back a client.
     pub async fn connect(socket_path: &Path) -> Result<ApiClient> {
-        let client = ApiClient { socket_path: socket_path.to_path_buf() };
+        let client = ApiClient {
+            socket_path: socket_path.to_path_buf(),
+        };
         client.request("ping", json!({})).await?;
         Ok(client)
     }
@@ -56,16 +58,24 @@ impl ApiClient {
     }
 
     async fn request_inner(&self, method: &str, params: Value) -> Result<Value> {
-        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path))
+        let stream = timeout(CONNECT_TIMEOUT, platform::connect(&self.socket_path))
             .await
-            .map_err(|_| err(format!("api connect timeout: {}", self.socket_path.display())))??;
-        let (read, mut write) = stream.into_split();
+            .map_err(|_| {
+                err(format!(
+                    "api connect timeout: {}",
+                    self.socket_path.display()
+                ))
+            })??;
+        let (read, mut write) = platform::split(stream);
         let id = format!("mirror_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
-        let line = serde_json::to_string(&json!({ "id": id, "method": method, "params": params }))? + "\n";
+        let line =
+            serde_json::to_string(&json!({ "id": id, "method": method, "params": params }))? + "\n";
         write.write_all(line.as_bytes()).await?;
         let mut lines = BufReader::new(read).lines();
         while let Some(line) = lines.next_line().await? {
-            let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if msg.get("id").and_then(|v| v.as_str()) != Some(id.as_str()) {
                 continue;
             }
@@ -85,10 +95,15 @@ impl ApiClient {
     /// Held connection pushing events. Pull with `EventStream::next()`; a
     /// `None` means the stream dropped (resubscribe from the caller).
     pub async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<EventStream> {
-        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path))
+        let stream = timeout(CONNECT_TIMEOUT, platform::connect(&self.socket_path))
             .await
-            .map_err(|_| err(format!("api connect timeout: {}", self.socket_path.display())))??;
-        let (read, mut write) = stream.into_split();
+            .map_err(|_| {
+                err(format!(
+                    "api connect timeout: {}",
+                    self.socket_path.display()
+                ))
+            })??;
+        let (read, mut write) = platform::split(stream);
         let id = format!("mirror_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let line = serde_json::to_string(
             &json!({ "id": id, "method": "events.subscribe", "params": { "subscriptions": subscriptions } }),
@@ -102,16 +117,22 @@ impl ApiClient {
             .ok_or_else(|| err("subscribe: stream closed before ack"))?;
         let msg: Value = serde_json::from_str(&ack)?;
         if let Some(e) = msg.get("error") {
-            let text = e.get("message").and_then(|v| v.as_str()).unwrap_or("subscribe failed");
+            let text = e
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subscribe failed");
             return Err(err(text.to_string()));
         }
-        Ok(EventStream { lines, _write: write })
+        Ok(EventStream {
+            lines,
+            _write: write,
+        })
     }
 }
 
 pub struct EventStream {
-    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    _write: tokio::net::unix::OwnedWriteHalf, // keeps the connection open
+    lines: tokio::io::Lines<BufReader<LocalReadHalf>>,
+    _write: LocalWriteHalf, // keeps the connection open
 }
 
 impl EventStream {
@@ -120,7 +141,9 @@ impl EventStream {
         loop {
             match self.lines.next_line().await {
                 Ok(Some(line)) => {
-                    let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                    let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
                     if let Some(event) = msg.get("event").and_then(|v| v.as_str()) {
                         return Some(EventEnvelope {
                             event: event.to_string(),
