@@ -320,11 +320,65 @@ async fn pump(target: &ExecTarget, stream: UnixStream, shutdown: watch::Receiver
     // fault as an indistinguishable "connection closed"
     let mut errtext = String::new();
     let _ = timeout(Duration::from_millis(200), cerr.read_to_string(&mut errtext)).await;
-    let errtext = errtext.trim();
+    let errtext = relay_fault(&errtext);
     if !errtext.is_empty() {
         return Err(err(format!("relay: {errtext}")));
     }
     Ok(())
+}
+
+/// Reduce a relay child's stderr to the part that actually indicates a fault.
+///
+/// Anything on stderr used to mean failure, but `ssh` also writes purely
+/// informational notices there — OpenSSH 10 warns on every connection to a
+/// server without post-quantum key exchange. Treating those as faults turns a
+/// healthy relay into a permanent reconnect loop, so they are dropped and an
+/// otherwise-quiet stderr reports success.
+fn relay_fault(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !is_ssh_notice(l))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn is_ssh_notice(line: &str) -> bool {
+    // OpenSSH prefixes these advisories with `**`; the banner text itself is
+    // version-specific, so match the marker rather than the wording.
+    line.starts_with("**")
+        || line.starts_with("Warning: Permanently added")
+        || line.starts_with("Pseudo-terminal will not be allocated")
+}
+
+#[cfg(test)]
+mod relay_fault_tests {
+    use super::relay_fault;
+
+    #[test]
+    fn openssh_advisories_are_not_faults() {
+        let banner = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                      ** This session may be vulnerable to \"store now, decrypt later\" attacks.\n\
+                      ** The server may need to be upgraded. See https://openssh.com/pq.html\n";
+        assert_eq!(relay_fault(banner), "");
+        assert_eq!(relay_fault("   \n\n"), "");
+        assert_eq!(
+            relay_fault("Warning: Permanently added 'host' to the list of known hosts."),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_real_fault_survives_alongside_an_advisory() {
+        let mixed = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                     socat: connection refused\n";
+        assert_eq!(relay_fault(mixed), "socat: connection refused");
+        assert_eq!(
+            relay_fault("Permission denied (publickey).\nsomething else\n"),
+            "Permission denied (publickey).; something else"
+        );
+    }
 }
 
 #[cfg(test)]
