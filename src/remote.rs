@@ -346,30 +346,45 @@ impl RemoteHost {
         Ok(())
     }
 
+    /// Whether this host's ssh calls go through a shared ControlMaster.
+    ///
+    /// Two separate reasons not to, and both have to hold for it to be used:
+    ///
+    /// - OpenSSH *for* Windows has no ControlMaster (`-S`/`-M`/`-O`) at all, so
+    ///   when herdr-mirror runs on Windows every invocation is standalone.
+    /// - A Windows *host* multiplexes unreliably in the other direction: two
+    ///   exec channels opened concurrently on one master against Windows sshd
+    ///   can come back with a truncated or empty stream. The daemon opens the
+    ///   API relay and ordinary commands at the same time, so it hits this
+    ///   routinely; sequential use looks fine, which is why it is easy to miss.
+    fn uses_control_master(&self) -> bool {
+        !cfg!(windows) && !matches!(self.cfg.kind, crate::config::HostKind::Windows)
+    }
+
     fn base_args(&self) -> Vec<String> {
-        // OpenSSH for Windows has no ControlMaster (`-S`/`-M`/`-O`): every ssh
-        // invocation there is a standalone connection. BatchMode is safe and
-        // still keeps the connection non-interactive.
-        #[cfg(windows)]
-        {
-            vec!["-o".into(), "BatchMode=yes".into()]
-        }
-        #[cfg(not(windows))]
-        {
-            vec![
+        if self.uses_control_master() {
+            return vec![
                 "-S".into(),
                 self.ctl_path.display().to_string(),
                 "-o".into(),
                 "BatchMode=yes".into(),
-            ]
+            ];
         }
+        // ControlPath=none is explicit rather than merely omitting `-S`: the
+        // user's ssh_config may set ControlMaster/ControlPath for this host,
+        // which would silently put the multiplexing back.
+        vec![
+            "-o".into(),
+            "ControlPath=none".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+        ]
     }
 
     pub async fn ensure_master(&mut self) -> Result<()> {
-        #[cfg(windows)]
-        {
+        if !self.uses_control_master() {
             // No mux socket to establish; `exec` opens a fresh channel each call.
-            Ok(())
+            return Ok(());
         }
         #[cfg(not(windows))]
         {
@@ -413,6 +428,10 @@ impl RemoteHost {
                 )));
             }
             Ok(())
+        }
+        #[cfg(windows)]
+        {
+            unreachable!("uses_control_master() is always false on Windows")
         }
     }
 
@@ -626,7 +645,7 @@ impl RemoteHost {
             relay_cmd.tool()
         ));
         let handle = crate::ssh_relay::serve_relay(
-            self.ctl_path.clone(),
+            self.uses_control_master().then(|| self.ctl_path.clone()),
             self.cfg.target.clone(),
             relay_cmd,
             self.exec_sock.clone(),

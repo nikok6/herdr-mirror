@@ -175,13 +175,14 @@ while True:
     format!("python3 -c '{BRIDGE}' '{sock_b64}'")
 }
 
-/// Where and how to reach the remote: reuses the daemon's own ControlMaster
-/// (`-S ctl_path`) so a relay exec costs no new ssh handshake, exactly like
-/// every other multiplexed exec this daemon already runs.
+/// Where and how to reach the remote. `ctl_path` is `Some` when the daemon's
+/// own ControlMaster can be reused (`-S ctl_path`), so a relay exec costs no
+/// new ssh handshake, exactly like every other multiplexed exec this daemon
+/// runs. It is `None` when multiplexing is unavailable or unsafe — see
+/// `RemoteHost::uses_control_master` — and each relay then pays a handshake.
 #[derive(Debug, Clone)]
 struct ExecTarget {
-    #[cfg_attr(windows, allow(dead_code))]
-    ctl_path: PathBuf,
+    ctl_path: Option<PathBuf>,
     ssh_target: String,
     relay_cmd: RelayCommand,
 }
@@ -189,22 +190,29 @@ struct ExecTarget {
 impl ExecTarget {
     fn relay_child(&self) -> Result<tokio::process::Child> {
         let mut cmd = Command::new("ssh");
-        // Windows OpenSSH has no ControlMaster, so there is no `-S` mux socket
-        // to point at; a fresh connection per relay is the only option.
-        #[cfg(windows)]
-        {
-            cmd.args(["-o", "BatchMode=yes", &self.ssh_target, &self.relay_cmd.cmd]);
-        }
-        #[cfg(not(windows))]
-        {
-            cmd.args([
-                "-S",
-                &self.ctl_path.display().to_string(),
-                "-o",
-                "BatchMode=yes",
-                &self.ssh_target,
-                &self.relay_cmd.cmd,
-            ]);
+        match &self.ctl_path {
+            Some(ctl) => {
+                cmd.args([
+                    "-S",
+                    &ctl.display().to_string(),
+                    "-o",
+                    "BatchMode=yes",
+                    &self.ssh_target,
+                    &self.relay_cmd.cmd,
+                ]);
+            }
+            // Explicit, not merely omitted: the user's ssh_config may enable
+            // ControlMaster for this host, which would put multiplexing back.
+            None => {
+                cmd.args([
+                    "-o",
+                    "ControlPath=none",
+                    "-o",
+                    "BatchMode=yes",
+                    &self.ssh_target,
+                    &self.relay_cmd.cmd,
+                ]);
+            }
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -228,7 +236,7 @@ impl ExecTarget {
 /// comments for the accept-loop and shutdown reasoning, which apply unchanged
 /// here.
 pub fn serve_relay(
-    ctl_path: PathBuf,
+    ctl_path: Option<PathBuf>,
     ssh_target: String,
     relay_cmd: RelayCommand,
     local_sock: PathBuf,
@@ -536,7 +544,7 @@ mod tests {
             tool: "python3",
         };
         let handle = serve_relay(
-            ctl_path.clone(),
+            Some(ctl_path.clone()),
             ssh_target.clone(),
             relay_cmd,
             local_sock.clone(),
@@ -581,36 +589,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Removes the test's temp dir even when an assertion unwinds. No ssh
+    /// master to tear down: this test deliberately runs unmultiplexed.
     #[cfg(unix)]
     struct WindowsRelayItCleanup {
         dir: PathBuf,
-        ctl_path: PathBuf,
-        target: String,
-        master_started: bool,
     }
 
     #[cfg(unix)]
     impl Drop for WindowsRelayItCleanup {
         fn drop(&mut self) {
-            if self.master_started {
-                let _ = std::process::Command::new("ssh")
-                    .args([
-                        "-S",
-                        self.ctl_path.to_str().unwrap(),
-                        "-O",
-                        "exit",
-                        &self.target,
-                    ])
-                    .status();
-            }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
     /// End-to-end check of the *real* Unix→Windows API relay. Uses the Windows
     /// `herdr-mirror.exe relay` path instead of a manual socat/python bridge,
-    /// exercising the prebuilt relay command and repeated SSH exec channels
-    /// through the same ControlMaster.
+    /// exercising the prebuilt relay command.
+    ///
+    /// Deliberately runs with NO ControlMaster and checks CONCURRENT
+    /// connections, because that is what the daemon does and what a sequential
+    /// multiplexed check misses: two exec channels opened at once on one master
+    /// against Windows sshd can return a truncated or empty stream.
     ///
     /// Requires:
     ///   HERDR_MIRROR_IT_WINDOWS_TARGET=<ssh target of the Windows host>
@@ -637,34 +637,8 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let ctl_path = dir.join("it.ctl");
         let local_sock = dir.join("it-api.sock");
-        let mut cleanup = WindowsRelayItCleanup {
-            dir: dir.clone(),
-            ctl_path: ctl_path.clone(),
-            target: target.clone(),
-            master_started: false,
-        };
-
-        // Establish a ControlMaster so relay execs are multiplexed.
-        let start = Command::new("ssh")
-            .args([
-                "-M",
-                "-S",
-                ctl_path.to_str().unwrap(),
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ControlPersist=yes",
-                "-f",
-                "-N",
-                &target,
-            ])
-            .status()
-            .await
-            .expect("ssh master spawn");
-        cleanup.master_started = true;
-        assert!(start.success(), "ssh ControlMaster failed to start");
+        let _cleanup = WindowsRelayItCleanup { dir: dir.clone() };
 
         // Build the fixed Windows relay command (herdr-mirror.exe relay).
         let relay_bin = std::env::var("HERDR_MIRROR_IT_WINDOWS_RELAY_BIN")
@@ -678,8 +652,10 @@ mod tests {
             .unwrap(),
         );
 
+        // None: no ControlMaster, matching what the daemon uses for a Windows
+        // host.
         let handle = serve_relay(
-            ctl_path.clone(),
+            None,
             target.clone(),
             relay_cmd,
             local_sock.clone(),
@@ -711,27 +687,29 @@ mod tests {
         );
         eprintln!("snapshot ok ({} bytes)", snap.to_string().len());
 
-        // Three fresh sequential API connections through the same listener,
-        // each creating a new SSH exec channel on the ControlMaster.
-        for i in 0..3 {
-            let fresh = crate::api::ApiClient::connect(&handle.path)
-                .await
-                .unwrap_or_else(|e| panic!("connection {i} through relay: {e}"));
-            fresh
-                .request("ping", serde_json::json!({}))
-                .await
-                .unwrap_or_else(|e| panic!("ping on connection {i}: {e}"));
-            eprintln!("connection {i} ok");
+        // Four CONCURRENT API connections through the same listener. The daemon
+        // overlaps the events subscription with ordinary requests, so this — not
+        // a sequential loop — is the shape that has to hold.
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let path = handle.path.clone();
+            tasks.push(tokio::spawn(async move {
+                let fresh = crate::api::ApiClient::connect(&path)
+                    .await
+                    .unwrap_or_else(|e| panic!("concurrent connection {i}: {e}"));
+                fresh
+                    .request("ping", serde_json::json!({}))
+                    .await
+                    .unwrap_or_else(|e| panic!("ping on concurrent connection {i}: {e}"));
+            }));
         }
-        eprintln!("3 sequential connections ok");
+        for t in tasks {
+            t.await.expect("concurrent relay connection panicked");
+        }
+        eprintln!("4 concurrent connections ok");
 
         drop(handle);
-        let _ = Command::new("ssh")
-            .args(["-S", ctl_path.to_str().unwrap(), "-O", "exit", &target])
-            .status()
-            .await;
-        cleanup.master_started = false;
-        let _ = std::fs::remove_dir_all(&dir);
+        // _cleanup removes the temp dir on the way out.
     }
 
 }
