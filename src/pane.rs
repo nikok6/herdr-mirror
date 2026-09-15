@@ -344,6 +344,17 @@ fn spawn_session(
             .map(|container| container.kind.clone())
             .unwrap_or(crate::config::HostKind::Ssh)
     };
+    // A Windows host has no remote resolver to fall back on. Without this the
+    // command would be built with an empty binary — `exec  terminal session …`
+    // — which the remote rejects and the pane renders as a blank reconnecting
+    // screen, hiding the actual cause (the daemon not passing --remote-bin).
+    if matches!(kind, crate::config::HostKind::Windows)
+        && args.remote_bin.as_deref().unwrap_or("").is_empty()
+    {
+        return Err(err(
+            "a Windows host needs --remote-bin (the absolute path to herdr.exe on the remote)",
+        ));
+    }
     let bin = crate::config::remote_herdr_expr_for_kind(
         &kind,
         args.remote_bin.as_deref(),

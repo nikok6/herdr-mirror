@@ -494,11 +494,11 @@ pub(crate) fn cmd_for_pane(
             pane_id.to_string(),
         ];
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
-        // defaults to the same resolution so the argv stays short
-        if !matches!(&kind, crate::config::HostKind::Windows) {
-            if let Some(bin) = &remote_bin {
-                argv.extend(["--remote-bin".into(), bin.clone()]);
-            }
+        // defaults to the same resolution so the argv stays short. A Windows
+        // host has no such default — the path is required config and the pane
+        // cannot rebuild it — so it always travels.
+        if let Some(bin) = &remote_bin {
+            argv.extend(["--remote-bin".into(), bin.clone()]);
         }
         if let Some(session) = &session {
             argv.extend(["--session".into(), session.clone()]);
@@ -522,9 +522,10 @@ pub(crate) fn cmd_for_pane(
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
             }
             crate::config::HostKind::Windows => {
+                // No --ctl-path: a Windows host is never multiplexed (see
+                // RemoteHost::uses_control_master), so the foreground poll opens
+                // its own connection like every other call to this host.
                 argv.push("--windows-host".into());
-                #[cfg(not(windows))]
-                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
             }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
@@ -2231,6 +2232,37 @@ mod tests {
                 "--ctl-path",
                 "/state/vps.ctl",
             ]
+        );
+    }
+
+    /// A Windows host has no remote resolver to fall back on: if remote_bin
+    /// does not reach the streamer, it builds `exec  terminal session ...`
+    /// with an empty binary and every mirror pane stays blank. It also must
+    /// not be handed a ControlMaster, which Windows sshd multiplexes unsafely.
+    #[cfg(unix)]
+    #[test]
+    fn windows_pane_argv_carries_remote_bin_and_no_ctl_path() {
+        let mut host = ssh_host();
+        host.kind = crate::config::HostKind::Windows;
+        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
+        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let argv = cmd("w1:p1");
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "vps",
+                "w1:p1",
+                "--remote-bin",
+                r"C:\tools\herdr.exe",
+                "--always-control",
+                "--windows-host",
+            ]
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--ctl-path"),
+            "a Windows host must not be multiplexed: {argv:?}"
         );
     }
 
