@@ -84,9 +84,17 @@ pub async fn poll(
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
+    windows_host: bool,
 ) -> Option<Fg> {
+    if windows_host {
+        return poll_windows(ssh_target, remote_bin, session, pane, ctl_path).await;
+    }
     // same expression as the observe session (configured path or PATH auto)
-    let bin = crate::config::remote_herdr_expr(remote_bin, session);
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &crate::config::HostKind::Ssh,
+        remote_bin,
+        session,
+    );
     // both answers in ONE hop: same ssh round trip cost as the old single query
     let cmd = format!(
         "{b} pane get {p}; echo '<<>>'; exec {b} pane process-info --pane {p}",
@@ -134,6 +142,53 @@ pub async fn poll(
     let text = String::from_utf8_lossy(&out.stdout);
     let (pane_json, proc_json) = text.split_once("<<>>")?;
     classify(pane_json, proc_json)
+}
+
+async fn poll_windows(
+    ssh_target: &str,
+    remote_bin: Option<&str>,
+    session: Option<&str>,
+    pane: &str,
+    ctl_path: Option<&str>,
+) -> Option<Fg> {
+    // A Windows host always carries an explicit, validated remote_bin; without
+    // one there is no name for a remote shell to resolve, so skip rather than
+    // emit an `exec  ...` command the ForceCommand wrapper would reject.
+    let remote_bin = remote_bin?;
+    crate::config::validate_windows_bin(remote_bin).ok()?;
+    if let Some(session) = session {
+        crate::config::validate_windows_session(session).ok()?;
+    }
+    let pane = crate::config::windows_force_command_token(pane).ok()?;
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &crate::config::HostKind::Windows,
+        Some(remote_bin),
+        session,
+    );
+    let pane_cmd = format!("exec {bin} pane get {pane}");
+    let proc_cmd = format!("exec {bin} pane process-info --pane {pane}");
+    let pane_json = ssh_output(ssh_target, &pane_cmd, ctl_path).await?;
+    let proc_json = ssh_output(ssh_target, &proc_cmd, ctl_path).await?;
+    classify(&pane_json, &proc_json)
+}
+
+async fn ssh_output(ssh_target: &str, command: &str, ctl_path: Option<&str>) -> Option<String> {
+    let mut sc = Command::new("ssh");
+    if let Some(path) = ctl_path {
+        sc.arg("-S").arg(path);
+    }
+    sc.args(SSH_COMMON_OPTS).arg(ssh_target).arg(command);
+    let out = sc
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]

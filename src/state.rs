@@ -132,16 +132,22 @@ pub fn set_hidden(state_dir: &Path, host: &str, hidden: bool) -> std::io::Result
 /// Keyed by pane id on purpose: an earlier version left the note unaddressed
 /// and the next streamer to start collected it, which was the replacement pane,
 /// reporting a move that had already finished.
+#[cfg(unix)]
 fn pane_hint_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
-    state_dir.join(format!(".hint-{}", crate::util::sane_component(local_pane_id)))
+    state_dir.join(format!(
+        ".hint-{}",
+        crate::util::sane_component(local_pane_id)
+    ))
 }
 
+#[cfg(unix)]
 pub fn set_pane_hint(state_dir: &Path, local_pane_id: &str, msg: &str) {
     let _ = std::fs::create_dir_all(state_dir);
     let _ = std::fs::write(pane_hint_path(state_dir, local_pane_id), msg);
 }
 
 /// Read and consume this pane's notice, if any.
+#[cfg(unix)]
 pub fn take_pane_hint(state_dir: &Path, local_pane_id: &str) -> Option<String> {
     let path = pane_hint_path(state_dir, local_pane_id);
     let msg = std::fs::read_to_string(&path).ok()?;
@@ -171,7 +177,10 @@ pub fn load_state(state_dir: &Path, host: &str) -> HostState {
 
 pub fn save_state(state_dir: &Path, host: &str, state: &HostState) -> Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    std::fs::write(state_path(state_dir, host), serde_json::to_string_pretty(state)?)?;
+    std::fs::write(
+        state_path(state_dir, host),
+        serde_json::to_string_pretty(state)?,
+    )?;
     Ok(())
 }
 
@@ -195,7 +204,10 @@ mod tests {
 }"#;
         let state: HostState = serde_json::from_str(ts).unwrap();
         assert_eq!(state.workspaces["w9"].local_id, "w1234");
-        assert_eq!(state.workspaces["w9"].root_tab_local_id.as_deref(), Some("t99"));
+        assert_eq!(
+            state.workspaces["w9"].root_tab_local_id.as_deref(),
+            Some("t99")
+        );
         assert!(state.workspaces["wB"].is_tombstoned());
         // a tab mapped before label history existed loads with none, which the
         // resolver reads as "remote wins once"
@@ -229,6 +241,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_pane_hint_goes_to_one_pane_and_only_once() {
         let dir = std::env::temp_dir().join(format!("hm-hint-{}", std::process::id()));
@@ -237,12 +250,16 @@ mod tests {
         // not the neighbour's: an unaddressed notice is what let the
         // REPLACEMENT pane announce a move that had already finished
         assert_eq!(take_pane_hint(&dir, "wBT:p3"), None);
-        assert_eq!(take_pane_hint(&dir, "wBT:p2").as_deref(), Some("closing the local tab"));
+        assert_eq!(
+            take_pane_hint(&dir, "wBT:p2").as_deref(),
+            Some("closing the local tab")
+        );
         // consumed, so a repaint doesn't resurrect it
         assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_stale_pane_hint_is_dropped_not_shown() {
         let dir = std::env::temp_dir().join(format!("hm-hint-old-{}", std::process::id()));
@@ -255,7 +272,10 @@ mod tests {
             .unwrap()
             .as_secs() as i64
             - 120;
-        let t = libc::timeval { tv_sec: secs, tv_usec: 0 };
+        let t = libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        };
         let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         assert_eq!(unsafe { libc::utimes(c.as_ptr(), [t, t].as_ptr()) }, 0);
         assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);

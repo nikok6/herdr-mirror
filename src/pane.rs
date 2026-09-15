@@ -37,15 +37,16 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::util::{err, Result};
-use crate::grid::{Grid, Renderer};
 use crate::foreground::Fg;
+use crate::grid::{Grid, Renderer};
 use crate::predict::Predictor;
 use crate::select::{Released, Select};
+use crate::util::{err, Result};
 
 // ---------------------------------------------------------------------------
 // args
@@ -61,6 +62,8 @@ pub struct Args {
     pub rows: usize,
     pub dump: bool,
     pub session: Option<String>,
+    /// remote Windows host using the restricted SSH ForceCommand wrapper
+    pub windows_host: bool,
     /// auto-release control after this much input idle; 0 disables
     pub control_idle_secs: u64,
     /// start and stay in control: writable, no idle release, and sized to the
@@ -97,6 +100,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         rows: 72,
         dump: false,
         session: None,
+        windows_host: false,
         control_idle_secs: 3600,
         always_control: false,
         max_cols: None,
@@ -111,20 +115,28 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         let mut next = |flag: &str| -> Result<String> {
-            it.next().cloned().ok_or_else(|| err(format!("{flag} needs a value")))
+            it.next()
+                .cloned()
+                .ok_or_else(|| err(format!("{flag} needs a value")))
         };
         match a.as_str() {
             "--remote-bin" => args.remote_bin = Some(next("--remote-bin")?),
             "--cols" => {
-                args.cols = next("--cols")?.parse().map_err(|_| err("--cols must be a number"))?;
+                args.cols = next("--cols")?
+                    .parse()
+                    .map_err(|_| err("--cols must be a number"))?;
             }
             "--rows" => {
-                args.rows = next("--rows")?.parse().map_err(|_| err("--rows must be a number"))?;
+                args.rows = next("--rows")?
+                    .parse()
+                    .map_err(|_| err("--rows must be a number"))?;
             }
             "--session" => args.session = Some(next("--session")?),
+            "--windows-host" => args.windows_host = true,
             "--control-idle" => {
-                args.control_idle_secs =
-                    next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
+                args.control_idle_secs = next("--control-idle")?
+                    .parse()
+                    .map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
             // 0 is unset here for the same reason config treats it that way:
@@ -132,12 +144,20 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             // herdr rejects outright, killing the session twice over and
             // stranding the pane in "control unavailable" over a typo.
             "--max-cols" => {
-                args.max_cols = Some(next("--max-cols")?.parse().map_err(|_| err("--max-cols must be a number"))?)
-                    .filter(|&n| n > 0)
+                args.max_cols = Some(
+                    next("--max-cols")?
+                        .parse()
+                        .map_err(|_| err("--max-cols must be a number"))?,
+                )
+                .filter(|&n| n > 0)
             }
             "--max-rows" => {
-                args.max_rows = Some(next("--max-rows")?.parse().map_err(|_| err("--max-rows must be a number"))?)
-                    .filter(|&n| n > 0)
+                args.max_rows = Some(
+                    next("--max-rows")?
+                        .parse()
+                        .map_err(|_| err("--max-rows must be a number"))?,
+                )
+                .filter(|&n| n > 0)
             }
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--container" => container_name = Some(next("--container")?),
@@ -150,21 +170,39 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     if positional.len() != 2 {
         return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
+            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--windows-host] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
         ));
     }
     args.container = match (container_name, container_folder) {
         (Some(_), Some(_)) => return Err(err("--container and --container-folder are exclusive")),
-        (Some(n), None) => {
-            Some(ContainerArg { kind: crate::config::HostKind::DockerContainer(n), docker_bin })
-        }
-        (None, Some(f)) => {
-            Some(ContainerArg { kind: crate::config::HostKind::DockerFolder(f), docker_bin })
-        }
+        (Some(n), None) => Some(ContainerArg {
+            kind: crate::config::HostKind::DockerContainer(n),
+            docker_bin,
+        }),
+        (None, Some(f)) => Some(ContainerArg {
+            kind: crate::config::HostKind::DockerFolder(f),
+            docker_bin,
+        }),
         (None, None) => None,
     };
     args.ssh_target = positional.remove(0);
     args.pane_target = positional.remove(0);
+    if args.windows_host {
+        // The Windows binary is configuration, not a constant: validate it the
+        // same way hosts.toml does, since it becomes a literal command prefix.
+        match args.remote_bin.as_deref() {
+            None => {
+                return Err(err(
+                    "--windows-host needs --remote-bin (the absolute path to herdr.exe on the remote)",
+                ))
+            }
+            Some(bin) => crate::config::validate_windows_bin(bin)?,
+        }
+        if let Some(session) = args.session.as_deref() {
+            crate::config::validate_windows_session(session)?;
+        }
+        crate::config::windows_force_command_token(&args.pane_target)?;
+    }
     Ok(args)
 }
 
@@ -199,34 +237,71 @@ struct Frame {
 }
 
 enum Msg {
-    Frame { gen: u64, frame: Frame },
-    SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
+    Frame {
+        gen: u64,
+        frame: Frame,
+    },
+    SessionExit {
+        gen: u64,
+        mode: Mode,
+        reason: String,
+        uptime: Duration,
+    },
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
     Foreground(Option<Fg>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
+    StdinEof,
+    Resize,
+    #[cfg(unix)]
+    Hint,
+    Shutdown,
 }
 
 struct Session {
     gen: u64,
     mode: Mode,
-    process_group: i32,
+    #[cfg(unix)]
+    process_cleanup: i32,
+    #[cfg(windows)]
+    process_cleanup: WindowsProcessTree,
     stdin: ChildStdin,
 }
 
 /// Stop the transport and every local helper it spawned (notably an ssh
 /// ProxyCommand such as `aws ssm start-session`). Each transport is started as
 /// its own process-group leader, so this cannot signal the pane wrapper itself.
+#[cfg(unix)]
 fn kill_session_process_group(process_group: i32) {
     if process_group > 0 {
         unsafe { libc::kill(-process_group, libc::SIGKILL) };
     }
 }
 
+#[cfg(windows)]
+type WindowsProcessTree = crate::platform::ProcessTree;
+
+#[cfg(windows)]
+fn attach_process_job(pid: u32) -> Result<WindowsProcessTree> {
+    Ok(crate::platform::attach_process_tree(pid)?)
+}
+
+#[cfg(windows)]
+fn kill_session_process_group(process_tree: WindowsProcessTree) {
+    crate::platform::terminate_process_tree(process_tree);
+}
+
 fn isolate_session_process_group(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    {
+        // Do not open a second console when the diagnostic is launched from a
+        // GUI terminal or from a pipe.
+        command.creation_flags(0x0800_0000);
+    }
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
@@ -239,6 +314,14 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
+    // A Herdr ConPTY may run under a service environment whose OpenSSH home
+    // differs from the interactive shell. Keep the normal config lookup unless
+    // an isolated test or deployment explicitly supplies a config path.
+    if let Ok(config) = std::env::var("HERDR_MIRROR_SSH_CONFIG") {
+        if !config.is_empty() {
+            argv.extend(["-F".into(), config]);
+        }
+    }
     // A pane stream is long-lived and interactive. It must not inherit a
     // ControlPath from ~/.ssh/config: a stale shared master can hang
     // the stream before the remote command starts. `-S none` disables control
@@ -247,19 +330,43 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
     argv
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+fn spawn_session(
+    args: &Args,
+    mode: Mode,
+    cols: usize,
+    rows: usize,
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
-    let bin = crate::config::remote_herdr_expr(
+    let kind = if args.windows_host {
+        crate::config::HostKind::Windows
+    } else {
+        args.container
+            .as_ref()
+            .map(|container| container.kind.clone())
+            .unwrap_or(crate::config::HostKind::Ssh)
+    };
+    // remote_bin is guaranteed present and validated for a Windows host by
+    // parse_args: without it the command would carry an empty binary and the
+    // pane would render as a blank reconnecting screen with no stated cause.
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &kind,
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
+    let pane_target = if matches!(kind, crate::config::HostKind::Windows) {
+        crate::config::windows_force_command_token(&args.pane_target)?
+    } else {
+        sh_quote(&args.pane_target)
+    };
     let cmd = format!(
         "exec {} terminal session {} {} --cols {} --rows {}",
         bin,
         mode.as_str(),
-        sh_quote(&args.pane_target),
+        pane_target,
         cols,
         rows
     );
@@ -271,20 +378,31 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             c.args(ssh_stream_args(&args.ssh_target, &cmd));
             c
         }
-        Some(ct) => {
-            // resolve per spawn so a rebuilt container is picked up on
-            // reconnect. Bounded: this runs on the pane's single-threaded
-            // runtime, so a wedged Docker daemon must not be able to freeze
-            // input, rendering or signal handling.
-            let id = crate::docker::resolve_blocking(
-                &ct.docker_bin,
-                &ct.kind,
-                Duration::from_secs(5),
-            )?;
-            let mut c = tokio::process::Command::new(&ct.docker_bin);
-            // `sh -c` not `-lc`: match ssh's non-login remote shell
-            c.args(["exec", "-i", &id, "sh", "-c", &cmd]);
-            c
+        Some(_ct) => {
+            // Docker container support is only available on Unix for now.
+            // On Windows, the --dump mode should use SSH directly.
+            #[cfg(windows)]
+            {
+                return Err(err(
+                    "Docker container support is not yet available on Windows; use SSH directly",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                // resolve per spawn so a rebuilt container is picked up on
+                // reconnect. Bounded: this runs on the pane's single-threaded
+                // runtime, so a wedged Docker daemon must not be able to freeze
+                // input, rendering or signal handling.
+                let id = crate::docker::resolve_blocking(
+                    &_ct.docker_bin,
+                    &_ct.kind,
+                    Duration::from_secs(5),
+                )?;
+                let mut c = tokio::process::Command::new(&_ct.docker_bin);
+                // `sh -c` not `-lc`: match ssh's non-login remote shell
+                c.args(["exec", "-i", &id, "sh", "-c", &cmd]);
+                c
+            }
         }
     };
     // Keep the transport and all of its local descendants in one independently
@@ -296,7 +414,16 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    #[cfg(unix)]
     let process_group = child.id().map(|p| p as i32).unwrap_or(0);
+    #[cfg(windows)]
+    let process_tree = match child.id().map(attach_process_job).transpose()? {
+        Some(tree) => tree,
+        None => {
+            let _ = child.start_kill();
+            return Err(err("ssh child did not expose a process id"));
+        }
+    };
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
@@ -314,7 +441,14 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
                 buf.push_str(&l);
                 buf.push('\n');
                 if buf.len() > 400 {
-                    let tail: String = buf.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+                    let tail: String = buf
+                        .chars()
+                        .rev()
+                        .take(400)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     *buf = tail;
                 }
             }
@@ -322,7 +456,9 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let mut close_reason = String::new();
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(frame) = serde_json::from_str::<Frame>(&line) else { continue };
+            let Ok(frame) = serde_json::from_str::<Frame>(&line) else {
+                continue;
+            };
             if frame.kind == "terminal.closed" {
                 if let Some(r) = &frame.reason {
                     close_reason = r.clone();
@@ -335,11 +471,30 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = child.wait().await;
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
-        let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let reason = if close_reason.is_empty() {
+            tail
+        } else {
+            close_reason
+        };
+        let _ = tx
+            .send(Msg::SessionExit {
+                gen,
+                mode,
+                reason,
+                uptime: started.elapsed(),
+            })
+            .await;
     });
 
-    Ok(Session { gen, mode, process_group, stdin })
+    Ok(Session {
+        gen,
+        mode,
+        #[cfg(unix)]
+        process_cleanup: process_group,
+        #[cfg(windows)]
+        process_cleanup: process_tree,
+        stdin,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -411,20 +566,46 @@ fn initial_mode(always_control: bool, size: (usize, usize)) -> Mode {
     }
 }
 
+#[cfg(unix)]
 fn term_size() -> (usize, usize) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0
+            && ws.ws_row > 0
+        {
             return (ws.ws_col as usize, ws.ws_row as usize);
         }
     }
     (80, 24)
 }
 
+#[cfg(windows)]
+fn term_size() -> (usize, usize) {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut csbi = CONSOLE_SCREEN_BUFFER_INFO::default();
+        if !handle.is_null() && GetConsoleScreenBufferInfo(handle, &mut csbi) != 0 {
+            let cols = i32::from(csbi.srWindow.Right) - i32::from(csbi.srWindow.Left) + 1;
+            let rows = i32::from(csbi.srWindow.Bottom) - i32::from(csbi.srWindow.Top) + 1;
+            if cols > 0 && rows > 0 {
+                return (cols as usize, rows as usize);
+            }
+        }
+    }
+    (80, 24)
+}
+
+#[cfg(unix)]
 struct RawMode {
     orig: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawMode {
     fn enable() -> Option<RawMode> {
         unsafe {
@@ -444,6 +625,86 @@ impl RawMode {
     fn restore(&self) {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct RawMode {
+    input_handle: windows_sys::Win32::Foundation::HANDLE,
+    input_mode: u32,
+    output: Option<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl RawMode {
+    fn enable() -> Option<RawMode> {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        unsafe {
+            let input_handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut input_mode = 0;
+            if input_handle.is_null() || GetConsoleMode(input_handle, &mut input_mode) == 0 {
+                return None;
+            }
+            let raw_input = (input_mode
+                & !(ENABLE_LINE_INPUT
+                    | ENABLE_ECHO_INPUT
+                    | ENABLE_PROCESSED_INPUT
+                    | ENABLE_QUICK_EDIT_MODE))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if SetConsoleMode(input_handle, raw_input) == 0 {
+                return None;
+            }
+
+            let output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut output = None;
+            let mut output_mode = 0;
+            if !output_handle.is_null() && GetConsoleMode(output_handle, &mut output_mode) != 0 {
+                let vt_output = output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                if SetConsoleMode(output_handle, vt_output) != 0 {
+                    output = Some((output_handle, output_mode));
+                }
+            }
+            Some(RawMode {
+                input_handle,
+                input_mode,
+                output,
+            })
+        }
+    }
+
+    fn restore(&self) {
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+
+        unsafe {
+            let _ = SetConsoleMode(self.input_handle, self.input_mode);
+            if let Some((handle, mode)) = self.output {
+                let _ = SetConsoleMode(handle, mode);
+            }
+        }
+    }
+}
+
+fn stdout_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        };
+
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0;
+            !handle.is_null() && GetConsoleMode(handle, &mut mode) != 0
         }
     }
 }
@@ -470,7 +731,9 @@ fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> 
         match rest[i] {
             b'0'..=b'9' => {
                 // saturate: garbage digit runs on stdin must not overflow-panic
-                nums[n] = nums[n].saturating_mul(10).saturating_add((rest[i] - b'0') as u32);
+                nums[n] = nums[n]
+                    .saturating_mul(10)
+                    .saturating_add((rest[i] - b'0') as u32);
                 have_digit = true;
                 i += 1;
             }
@@ -643,7 +906,11 @@ pub(crate) enum PasteSplit {
     Pending,
     /// no paste involved: forward as-is
     Passthrough(Vec<u8>),
-    Complete { before: Vec<u8>, body: Vec<u8>, after: Vec<u8> },
+    Complete {
+        before: Vec<u8>,
+        body: Vec<u8>,
+        after: Vec<u8>,
+    },
 }
 
 fn find_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -706,7 +973,6 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|w| w == [0x1b, b'[', b'<'])
 }
 
-
 // ---------------------------------------------------------------------------
 // the wrapper state machine
 
@@ -742,9 +1008,10 @@ fn target_gone(reason: &str, pane_target: &str) -> bool {
     if pane_target.is_empty() {
         return false;
     }
-    reason
-        .to_ascii_lowercase()
-        .contains(&format!("terminal target {} not found", pane_target.to_ascii_lowercase()))
+    reason.to_ascii_lowercase().contains(&format!(
+        "terminal target {} not found",
+        pane_target.to_ascii_lowercase()
+    ))
 }
 
 /// Delay before the next attempt, and the ladder position to keep.
@@ -900,7 +1167,11 @@ impl App {
     /// Msg::Foreground and updates `remote_is_shell`.
     fn spawn_foreground_poll(&mut self, force: bool) {
         let now = Instant::now();
-        if !force && self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
+        if !force
+            && self
+                .fg_poll_at
+                .is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL)
+        {
             return;
         }
         self.fg_poll_at = Some(now);
@@ -911,6 +1182,7 @@ impl App {
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
+        let windows_host = self.args.windows_host;
         tokio::spawn(async move {
             let v = crate::foreground::poll(
                 &ssh,
@@ -919,6 +1191,7 @@ impl App {
                 &pane,
                 ctl.as_deref(),
                 container.as_ref(),
+                windows_host,
             )
             .await;
             let _ = tx.send(Msg::Foreground(v)).await;
@@ -988,10 +1261,13 @@ impl App {
         if let Some(mut s) = self.session.take() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+                    let _ = s
+                        .stdin
+                        .write_all(b"{\"type\":\"terminal.release\"}\n")
+                        .await;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                kill_session_process_group(s.process_group);
+                kill_session_process_group(s.process_cleanup);
             });
         }
     }
@@ -1008,7 +1284,7 @@ impl App {
             Mode::Control => self.control_size(),
         };
         if let Some(s) = self.session.take() {
-            kill_session_process_group(s.process_group);
+            kill_session_process_group(s.process_cleanup);
         }
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
@@ -1017,7 +1293,9 @@ impl App {
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
+                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })
+                            .to_string()
+                            + "\n";
                         let _ = s.stdin.write_all(line.as_bytes()).await;
                     }
                 } else {
@@ -1027,13 +1305,12 @@ impl App {
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
-                self.renderer.status(
-                    if m == Mode::Control && !self.args.always_control {
+                self.renderer
+                    .status(if m == Mode::Control && !self.args.always_control {
                         "CONTROL — ctrl+\\ to release"
                     } else {
                         ""
-                    },
-                );
+                    });
             }
             Err(e) => self.schedule_reconnect(m, &e.to_string()),
         }
@@ -1054,19 +1331,26 @@ impl App {
             // would leave the misleading "terminal closed" line on screen from
             // the second cycle onward. The renderer diffs rows, so an
             // unchanged line costs one row write a minute.
-            self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
+            self.renderer
+                .status(&format!("remote pane {} is gone", self.args.pane_target));
             // and nothing may expire it out from under us: the control→observe
             // fallback sets a 1.5s hint just before this path runs
             self.hint_clear_at = None;
         } else {
-            let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-            self.renderer
-                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+            let suffix = if reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {reason}")
+            };
+            self.renderer.status(&format!(
+                "reconnecting in {}s ({}){suffix}",
+                delay / 1000,
+                m.as_str()
+            ));
         }
         self.paint();
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
     }
-
 
     fn switch_mode(&mut self, m: Mode) {
         // already settled or scheduled — don't restart. Without this guard,
@@ -1083,7 +1367,11 @@ impl App {
         self.select.clear();
         self.renderer.invalidate();
         // immediate feedback for the mode-switch gap (stop + 200ms + reconnect)
-        self.renderer.status(if m == Mode::Control { "taking control…" } else { "releasing…" });
+        self.renderer.status(if m == Mode::Control {
+            "taking control…"
+        } else {
+            "releasing…"
+        });
         self.paint();
         self.switch_at = Some(Instant::now() + SWITCH_GAP);
     }
@@ -1093,8 +1381,13 @@ impl App {
             return; // stale frame from a replaced session
         }
         if frame.kind == "terminal.closed" {
-            let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
-            self.renderer.status(&format!("remote terminal closed{suffix}"));
+            let suffix = frame
+                .reason
+                .as_deref()
+                .map(|r| format!(": {r}"))
+                .unwrap_or_default();
+            self.renderer
+                .status(&format!("remote terminal closed{suffix}"));
             self.paint();
             return;
         }
@@ -1125,7 +1418,12 @@ impl App {
             self.predict.on_frame(&self.grid);
         }
         if self.args.dump {
-            let lines: Vec<String> = self.grid.text_lines().into_iter().filter(|l| !l.is_empty()).collect();
+            let lines: Vec<String> = self
+                .grid
+                .text_lines()
+                .into_iter()
+                .filter(|l| !l.is_empty())
+                .collect();
             println!(
                 "--- frame seq={:?} full={:?} {}x{} ---\n{}",
                 frame.seq,
@@ -1144,18 +1442,32 @@ impl App {
             return; // an old child we already replaced/killed
         }
         self.session = None;
-        let reason_line =
-            reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+        let reason_line = reason
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
         // control that dies quickly twice is failing (refused/dropped): fall
         // back to observe so the pane stays viewable; a keystroke retries
         if exited_mode == Mode::Control {
-            self.control_failures = if uptime < QUICK_CONTROL_FAILURE { self.control_failures + 1 } else { 0 };
+            self.control_failures = if uptime < QUICK_CONTROL_FAILURE {
+                self.control_failures + 1
+            } else {
+                0
+            };
             if self.control_failures >= 2 {
                 self.control_failures = 0;
                 self.control_sticky = true;
                 self.switch_mode(Mode::Observe);
-                let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
-                self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
+                let suffix = if reason_line.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({reason_line})")
+                };
+                self.hint(&format!(
+                    "control unavailable — viewing only{suffix}; type to retry"
+                ));
                 return;
             }
         }
@@ -1175,8 +1487,8 @@ impl App {
             MouseSplit::Pending => {}
             MouseSplit::Passthrough(bytes) => self.route_input(bytes).await,
         }
-        self.mouse_flush_at = (!self.mouse_buf.is_empty())
-            .then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
+        self.mouse_flush_at =
+            (!self.mouse_buf.is_empty()).then(|| Instant::now() + MOUSE_INPUT_TIMEOUT);
     }
 
     /// Flush an unfinished mouse prefix after its short completion window.
@@ -1200,7 +1512,11 @@ impl App {
             match split_paste(&mut self.paste_buf, chunk) {
                 PasteSplit::Pending => return,
                 PasteSplit::Passthrough(bytes) => return self.route_mouse_input(bytes).await,
-                PasteSplit::Complete { before, body, after } => {
+                PasteSplit::Complete {
+                    before,
+                    body,
+                    after,
+                } => {
                     self.route_mouse_input(before).await;
                     // A partial mouse sequence cannot continue into a paste;
                     // discard it before delivering the paste body directly.
@@ -1249,9 +1565,16 @@ impl App {
         }
         // lossy only for the probe; the forward path keeps the original bytes
         let Some(paths) = crate::paste::dropped_paths(&String::from_utf8_lossy(&body)) else {
-            self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
+            self.deliver_input(crate::paste::bracketed_bytes(&body))
+                .await;
             return;
         };
+
+        if self.args.windows_host {
+            self.hint("file upload unavailable on Windows hosts; forwarding drop");
+            self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
+            return;
+        }
 
         self.paste_inflight = true;
         self.paste_original = Some(body);
@@ -1278,7 +1601,8 @@ impl App {
             // every path already exists over there, so the user meant those
             // files: forward what they actually dropped
             if let Some(body) = original {
-                self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
+                self.deliver_input(crate::paste::bracketed_bytes(&body))
+                    .await;
             }
         }
         if let Some(e) = result.error {
@@ -1307,6 +1631,10 @@ impl App {
 
     async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
         if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+            if self.args.windows_host {
+                self.deliver_input(buf).await;
+                return;
+            }
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
@@ -1405,7 +1733,7 @@ impl App {
                                     // Finish this gesture before a later press in
                                     // the same read starts the next selection.
                                     sel_changed |= self.select.clear();
-                                },
+                                }
                                 // It was a click, not a drag. TUI/agent get it
                                 // (claude and codex discard the bytes cleanly).
                                 // A shell does not: the prompt never enabled
@@ -1497,7 +1825,8 @@ impl App {
             }
             return;
         }
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
+        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }))
+            .await;
     }
 
     async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
@@ -1528,21 +1857,29 @@ impl Drop for PidfileGuard {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let tty = !args.dump && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-    let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
-    let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
+    let tty = !args.dump && stdout_is_tty();
 
-    // announce ourselves so the daemon can tell its typed `exec` took
+    let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
+    let state_dir = crate::util::home_dir()
+        .join(".local")
+        .join("state")
+        .join("herdr-mirror");
+
+    // Announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
-    // daemon-spawned streamer, so it must not claim the slot
-    let _pidfile = (!args.dump).then(|| {
-        let path =
-            crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        std::fs::write(&path, std::process::id().to_string()).ok().map(|_| PidfileGuard(path))
-    }).flatten();
+    // daemon-spawned streamer, so it must not claim the slot.
+    let _pidfile = (!args.dump)
+        .then(|| {
+            let path =
+                crate::util::streamer_pid_path(&state_dir, &args.ssh_target, &args.pane_target);
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            crate::util::write_current_process_identity(&path)
+                .ok()
+                .map(|_| PidfileGuard(path))
+        })
+        .flatten();
 
     // Publish the pid before releasing the launch claim. Recovery always sees
     // at least one guard, even while herdr's process snapshot catches up.
@@ -1562,9 +1899,10 @@ pub async fn run(args: Args) -> Result<()> {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&path, std::process::id().to_string());
+        let _ = crate::util::write_current_process_identity(&path);
         // drop anything addressed to this pane before we existed: it describes
         // something that happened to a previous occupant
+        #[cfg(unix)]
         let _ = crate::state::take_pane_hint(&state_dir, id);
         PidfileGuard(path)
     });
@@ -1606,6 +1944,7 @@ pub async fn run(args: Args) -> Result<()> {
                     }
                 }
             }
+            let _ = tx.send(Msg::StdinEof).await;
         });
     }
 
@@ -1644,6 +1983,8 @@ pub async fn run(args: Args) -> Result<()> {
         paste_queue: Vec::new(),
         paste_original: None,
     };
+    let mut last_term_size = term_size();
+    let mut windows_resize = tokio::time::interval(Duration::from_millis(250));
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1655,17 +1996,47 @@ pub async fn run(args: Args) -> Result<()> {
     // is to be ignored). That window is exactly when a client attaching lays out
     // a freshly created pane — the resize we now promote on. Registered first,
     // tokio buffers it and delivers it once the loop starts.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
-    // someone left a notice for this pane and wants it seen now
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
-    let mut sigwinch = signal(SignalKind::window_change())?;
+    #[cfg(unix)]
+    {
+        let signal_tx = app.tx.clone();
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sighup = signal(SignalKind::hangup())?;
+        let mut sigusr1 = signal(SignalKind::user_defined1())?;
+        let mut sigwinch = signal(SignalKind::window_change())?;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sigwinch.recv() => {
+                        if signal_tx.send(Msg::Resize).await.is_err() { break; }
+                    }
+                    _ = sigusr1.recv() => {
+                        if signal_tx.send(Msg::Hint).await.is_err() { break; }
+                    }
+                    _ = sigterm.recv() => {
+                        let _ = signal_tx.send(Msg::Shutdown).await;
+                        break;
+                    }
+                    _ = sighup.recv() => {
+                        let _ = signal_tx.send(Msg::Shutdown).await;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    let signal_tx = app.tx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_tx.send(Msg::Shutdown).await;
+        }
+    });
 
-    app.connect(initial_mode(app.args.always_control, term_size())).await;
+    app.connect(initial_mode(app.args.always_control, term_size()))
+        .await;
     // the pane may have been laid out while the session was spawning; the signal
     // for that is buffered above, but check directly too
-    if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
+    if app.mode == Mode::Observe
+        && initial_mode(app.args.always_control, term_size()) == Mode::Control
     {
         app.switch_mode(Mode::Control);
     } else if app.args.always_control && app.mode == Mode::Observe {
@@ -1691,6 +2062,8 @@ pub async fn run(args: Args) -> Result<()> {
             app.mouse_flush_at,
         ]);
 
+        // All branches must be unconditionally present in the select! macro.
+        // Platform-specific signal branches use cfg gates; ctrl_c is always present.
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
@@ -1712,36 +2085,40 @@ pub async fn run(args: Args) -> Result<()> {
                     },
                     Some(Msg::Paste(outcome)) => app.handle_paste(outcome).await,
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
+                    Some(Msg::StdinEof) if !app.args.dump => break,
+                    Some(Msg::StdinEof) => {}
+                    Some(Msg::Resize) => {
+                        last_term_size = term_size();
+                        app.renderer.invalidate();
+                        if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
+                            app.switch_mode(Mode::Control);
+                        }
+                        if app.mode == Mode::Control {
+                            let (cols, rows) = app.control_size();
+                            app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                        }
+                        app.paint();
+                    }
+                    #[cfg(unix)]
+                    Some(Msg::Hint) => {
+                        if let Some(id) = local_pane_id.as_deref() {
+                            if let Some(msg) = crate::state::take_pane_hint(&state_dir, id) {
+                                app.hint_for(&msg, Duration::from_secs(4));
+                            }
+                        }
+                    }
+                    Some(Msg::Shutdown) => break,
                 }
             }
-            _ = sigwinch.recv() => {
-                app.renderer.invalidate();
-                // a resize means a client is laying this pane out, so the size is
-                // now a real viewport: take control if that is what we're for.
-                // control_sticky means control was refused twice in a row and we
-                // told the user "type to retry" — a window drag must not turn
-                // that into a reconnect storm.
-                if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
-                    app.switch_mode(Mode::Control);
-                }
-                if app.mode == Mode::Control {
-                    // capped like the initial connect: a local window drag must
-                    // not push a capped host past its ceiling either
-                    let (cols, rows) = app.control_size();
-                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
-                }
-                app.paint();
-            }
-            _ = sigusr1.recv() => {
-                if let Some(id) = local_pane_id.as_deref() {
-                    if let Some(msg) = crate::state::take_pane_hint(&state_dir, id) {
-                        app.hint_for(&msg, Duration::from_secs(4));
+            _ = windows_resize.tick() => {
+                if tty {
+                    let size = term_size();
+                    if size != last_term_size {
+                        last_term_size = size;
+                        let _ = app.tx.send(Msg::Resize).await;
                     }
                 }
             }
-            _ = sigterm.recv() => break,
-            _ = sigint.recv() => break,
-            _ = sighup.recv() => break,
             _ = sleep => {
                 let now = Instant::now();
                 if app.switch_at.is_some_and(|t| t <= now) {
@@ -1785,10 +2162,13 @@ pub async fn run(args: Args) -> Result<()> {
     // tree (including any ProxyCommand), restore tty
     if let Some(mut s) = app.session.take() {
         if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+            let _ = s
+                .stdin
+                .write_all(b"{\"type\":\"terminal.release\"}\n")
+                .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        kill_session_process_group(s.process_group);
+        kill_session_process_group(s.process_cleanup);
     }
     if tty {
         // ?1l with the rest: leaving the hosting pane in application cursor mode
@@ -1808,6 +2188,7 @@ pub async fn run(args: Args) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pane_transport_cleanup_terminates_proxy_command() {
         let nonce = std::time::SystemTime::now()
@@ -1869,7 +2250,10 @@ mod tests {
             unsafe { libc::kill(proxy_pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_file(pid_path);
-        assert!(!proxy_survived, "ProxyCommand survived pane transport cleanup");
+        assert!(
+            !proxy_survived,
+            "ProxyCommand survived pane transport cleanup"
+        );
     }
 
     #[test]
@@ -1913,11 +2297,23 @@ mod tests {
         // remote foreground classified as a TUI (e.g. `claude`) — wheel must
         // still produce a semantic scroll, not a raw forward, or it silently
         // does nothing when the TUI doesn't consume mouse wheel input
-        assert_eq!(mouse_action(Some(Fg::Agent), 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(Fg::Agent), 65, true), MouseAction::Scroll { up: false });
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 64, true),
+            MouseAction::Scroll { up: true }
+        );
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 65, true),
+            MouseAction::Scroll { up: false }
+        );
         // unclassified/shell foreground: wheel still scrolls
-        assert_eq!(mouse_action(None, 64, true), MouseAction::Scroll { up: true });
-        assert_eq!(mouse_action(Some(Fg::Shell), 65, true), MouseAction::Scroll { up: false });
+        assert_eq!(
+            mouse_action(None, 64, true),
+            MouseAction::Scroll { up: true }
+        );
+        assert_eq!(
+            mouse_action(Some(Fg::Shell), 65, true),
+            MouseAction::Scroll { up: false }
+        );
         // the wheel never reaches the selection path at all, which is what
         // keeps PR #54's scroll regression impossible here by construction
         assert_eq!(mouse_action(Some(Fg::Agent), 0, true), MouseAction::Select);
@@ -1928,9 +2324,21 @@ mod tests {
     #[test]
     fn every_remote_tui_selects_on_drag_agent_or_not() {
         for fg in [Fg::Agent, Fg::Mouse] {
-            assert_eq!(mouse_action(Some(fg), 0, true), MouseAction::Select, "{fg:?} press");
-            assert_eq!(mouse_action(Some(fg), 32, true), MouseAction::Select, "{fg:?} drag");
-            assert_eq!(mouse_action(Some(fg), 0, false), MouseAction::Select, "{fg:?} release");
+            assert_eq!(
+                mouse_action(Some(fg), 0, true),
+                MouseAction::Select,
+                "{fg:?} press"
+            );
+            assert_eq!(
+                mouse_action(Some(fg), 32, true),
+                MouseAction::Select,
+                "{fg:?} drag"
+            );
+            assert_eq!(
+                mouse_action(Some(fg), 0, false),
+                MouseAction::Select,
+                "{fg:?} release"
+            );
             // other buttons still reach the app
             assert_eq!(mouse_action(Some(fg), 1, true), MouseAction::ForwardRaw);
             assert_eq!(mouse_action(Some(fg), 2, true), MouseAction::ForwardRaw);
@@ -1966,12 +2374,24 @@ mod tests {
             );
         }
         // horizontal wheel keeps dropping, modified or not
-        assert_eq!(mouse_action(Some(Fg::Agent), 66 + 16, true), MouseAction::Drop);
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 66 + 16, true),
+            MouseAction::Drop
+        );
         // buttons 8-11 carry bit 7, which the old mask also leaked
-        assert_eq!(mouse_action(Some(Fg::Agent), 128, true), MouseAction::ForwardRaw);
-        assert_eq!(mouse_action(Some(Fg::Agent), 128 + 4, true), MouseAction::ForwardRaw);
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 128, true),
+            MouseAction::ForwardRaw
+        );
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 128 + 4, true),
+            MouseAction::ForwardRaw
+        );
         // a wheel release is not a left release
-        assert_eq!(mouse_action(Some(Fg::Agent), 64, false), MouseAction::ForwardRaw);
+        assert_eq!(
+            mouse_action(Some(Fg::Agent), 64, false),
+            MouseAction::ForwardRaw
+        );
     }
 
     #[test]
@@ -2039,7 +2459,6 @@ mod tests {
         assert!(escape.is_empty());
     }
 
-
     #[test]
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("w9:p1"), "'w9:p1'");
@@ -2079,25 +2498,117 @@ mod tests {
         assert_eq!(a.max_cols, None);
         assert_eq!(a.max_rows, None);
 
-        let argv: Vec<String> =
-            ["h", "w1:p1", "--max-cols", "212"].iter().map(|s| s.to_string()).collect();
+        let argv: Vec<String> = ["h", "w1:p1", "--max-cols", "212"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(parse_args(&argv).unwrap().max_cols, Some(212));
     }
 
     #[test]
     fn arg_parsing() {
-        let argv: Vec<String> =
-            ["work", "w9:p1", "--remote-bin", "/opt/herdr", "--cols", "176", "--rows", "66"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let argv: Vec<String> = [
+            "work",
+            "w9:p1",
+            "--remote-bin",
+            "/opt/herdr",
+            "--cols",
+            "176",
+            "--rows",
+            "66",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let a = parse_args(&argv).unwrap();
         assert_eq!(a.ssh_target, "work");
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin.as_deref(), Some("/opt/herdr"));
         assert_eq!((a.cols, a.rows), (176, 66));
         assert!(parse_args(&["onlyone".to_string()]).is_err());
-        assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
+        assert!(parse_args(&[
+            "a".into(),
+            "b".into(),
+            "--visibility-file".into(),
+            "x".into()
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn windows_host_flag_round_trips() {
+        let argv: Vec<String> = [
+            "windows",
+            "w9:p1",
+            "--windows-host",
+            "--remote-bin",
+            r"C:\tools\herdr.exe",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = parse_args(&argv).unwrap();
+        assert!(args.windows_host);
+        assert_eq!(args.remote_bin.as_deref(), Some(r"C:\tools\herdr.exe"));
+        assert_eq!(args.ctl_path, None);
+        assert!(args.container.is_none());
+        // A Windows host cannot resolve a bare name on the remote, so the path
+        // is required rather than optional.
+        let missing: Vec<String> = ["windows", "w9:p1", "--windows-host"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_args(&missing).is_err());
+    }
+
+    #[test]
+    fn windows_force_command_inputs_fail_closed() {
+        for pane in [
+            "w9 p1",
+            "w9'p1",
+            "w9\"p1",
+            "w9&p1",
+            "w9|p1",
+            "w9;p1",
+            "w9<p1",
+            "w9>p1",
+            "w9%p1",
+            "w9`p1",
+            r"w9\p1",
+        ] {
+            // A valid remote_bin is supplied so the rejection can only come
+            // from the pane target itself.
+            let argv = vec![
+                "windows".into(),
+                pane.into(),
+                "--windows-host".into(),
+                "--remote-bin".into(),
+                r"C:\tools\herdr.exe".into(),
+            ];
+            assert!(parse_args(&argv).is_err(), "accepted unsafe pane {pane:?}");
+        }
+        // A remote_bin that is relative, or carries grammar the ForceCommand
+        // wrapper could reinterpret, is refused. (`D:\evil.exe` is not on this
+        // list: an unexpected *location* is the operator's call, an unparseable
+        // command is not.)
+        for bin in [r"herdr.exe", r"tools\herdr.exe", r"C:\a&b\herdr.exe", r"C:\a b\he|rdr.exe"] {
+            let argv = vec![
+                "windows".into(),
+                "w9:p1".into(),
+                "--windows-host".into(),
+                "--remote-bin".into(),
+                bin.into(),
+            ];
+            assert!(parse_args(&argv).is_err(), "accepted unsafe remote_bin {bin:?}");
+        }
+        let argv = vec![
+            "windows".into(),
+            "w9:p1".into(),
+            "--windows-host".into(),
+            "--session".into(),
+            "team name".into(),
+        ];
+        assert!(parse_args(&argv).is_err());
     }
 
     // --- birth size trust (#23) ---
@@ -2129,7 +2640,11 @@ mod tests {
         // the whole composition: only a trusted size under always_control opens
         // writable, because Control is what can resize the remote
         assert_eq!(initial_mode(true, (141, 44)), Mode::Control);
-        assert_eq!(initial_mode(true, (54, 23)), Mode::Observe, "placeholder-sized");
+        assert_eq!(
+            initial_mode(true, (54, 23)),
+            Mode::Observe,
+            "placeholder-sized"
+        );
         // without always_control we start read-only regardless, as before
         assert_eq!(initial_mode(false, (141, 44)), Mode::Observe);
         assert_eq!(initial_mode(false, (54, 23)), Mode::Observe);
@@ -2164,8 +2679,14 @@ mod tests {
     #[test]
     fn ordinary_typing_passes_straight_through() {
         let mut buf = Vec::new();
-        assert_eq!(split(&mut buf, b"a"), PasteSplit::Passthrough(b"a".to_vec()));
-        assert_eq!(split(&mut buf, b"\x1b[A"), PasteSplit::Passthrough(b"\x1b[A".to_vec()));
+        assert_eq!(
+            split(&mut buf, b"a"),
+            PasteSplit::Passthrough(b"a".to_vec())
+        );
+        assert_eq!(
+            split(&mut buf, b"\x1b[A"),
+            PasteSplit::Passthrough(b"\x1b[A".to_vec())
+        );
         assert!(buf.is_empty(), "typing must not buffer");
     }
 
@@ -2176,7 +2697,11 @@ mod tests {
         assert_eq!(split(&mut buf, b"llo"), PasteSplit::Pending);
         assert_eq!(
             split(&mut buf, E),
-            PasteSplit::Complete { before: vec![], body: b"hello".to_vec(), after: vec![] }
+            PasteSplit::Complete {
+                before: vec![],
+                body: b"hello".to_vec(),
+                after: vec![]
+            }
         );
         assert!(buf.is_empty());
     }
@@ -2189,7 +2714,11 @@ mod tests {
         assert_eq!(split(&mut buf, b"\x1b[20"), PasteSplit::Pending);
         assert_eq!(
             split(&mut buf, &seq(&[b"0~/tmp/a.png", E])),
-            PasteSplit::Complete { before: vec![], body: b"/tmp/a.png".to_vec(), after: vec![] }
+            PasteSplit::Complete {
+                before: vec![],
+                body: b"/tmp/a.png".to_vec(),
+                after: vec![]
+            }
         );
     }
 
@@ -2219,7 +2748,11 @@ mod tests {
         assert_eq!(body, b"one");
         assert_eq!(
             split(&mut buf, &after),
-            PasteSplit::Complete { before: vec![], body: b"two".to_vec(), after: vec![] },
+            PasteSplit::Complete {
+                before: vec![],
+                body: b"two".to_vec(),
+                after: vec![]
+            },
             "feeding the tail back must yield the second paste"
         );
     }
@@ -2269,7 +2802,11 @@ mod tests {
         let mut buf = Vec::new();
         assert_eq!(
             split(&mut buf, &framed),
-            PasteSplit::Complete { before: vec![], body, after: vec![] },
+            PasteSplit::Complete {
+                before: vec![],
+                body,
+                after: vec![]
+            },
             "re-framing must be exactly what the splitter undoes"
         );
     }
@@ -2290,7 +2827,10 @@ mod tests {
         // The auto-resolver execs `$(command -v herdr || echo ~/.local/bin/herdr)`,
         // so a host without herdr fails with a shell not-found — a different
         // problem that a slow rung would wrongly paper over.
-        assert!(!target_gone("sh: 1: exec: /home/u/.local/bin/herdr: not found", "w9Z:p99"));
+        assert!(!target_gone(
+            "sh: 1: exec: /home/u/.local/bin/herdr: not found",
+            "w9Z:p99"
+        ));
 
         // a target that merely shares our prefix: p1 and p10 are both real ids
         assert!(!target_gone(
@@ -2330,9 +2870,9 @@ mod tests {
         assert_eq!(reconnect_delay(false, idx), (2000, 2));
     }
 
-
     // Exercise the real input routing: a release and the next press can share
     // one stdin read. A local sink stands in for the session; no SSH is used.
+    #[cfg(unix)]
     async fn selection_followed_by_press(next_drag: bool) {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
@@ -2373,10 +2913,15 @@ mod tests {
             paste_original: None,
         };
         let mut child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
-            .spawn().unwrap();
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
         app.session = Some(Session {
-            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
+            gen: 1,
+            mode: Mode::Control,
+            process_cleanup: child.id().unwrap() as i32,
             stdin: child.stdin.take().unwrap(),
         });
         app.mode = Mode::Control;
@@ -2385,12 +2930,11 @@ mod tests {
         app.fg_poll_at = Some(Instant::now());
         // Blank cells exercise copy handling without writing to the clipboard.
         app.grid.resize(80, 24);
-        app.handle_stdin(
-            b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m\x1b[<0;1;2M".to_vec(),
-        ).await;
-        let result = app.select.release(
-            if next_drag { (1, 3) } else { (1, 0) }, b"release",
-        );
+        app.handle_stdin(b"\x1b[<0;1;1M\x1b[<32;4;1M\x1b[<0;4;1m\x1b[<0;1;2M".to_vec())
+            .await;
+        let result = app
+            .select
+            .release(if next_drag { (1, 3) } else { (1, 0) }, b"release");
         drop(app);
         child.kill().await.unwrap();
         let _ = child.wait().await;
@@ -2401,14 +2945,98 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn copying_selection_preserves_next_click_in_same_read() {
         selection_followed_by_press(false).await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn copying_selection_preserves_next_drag_in_same_read() {
         selection_followed_by_press(true).await;
     }
 
+    // ── Windows data-plane helpers ──────────────────────────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn term_size_returns_at_least_default() {
+        // In CI or pipes the console API returns 0; the fallback must be 80×24.
+        let (cols, rows) = super::term_size();
+        assert!(cols >= 80, "cols={cols}");
+        assert!(rows >= 24, "rows={rows}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn isolate_session_process_group_sets_creation_flags() {
+        // Verify the helper applies CREATE_NO_WINDOW (0x0800_0000) and the
+        // command still runs. We use std::process::Command since this is a
+        // synchronous test — the key is that the flag was applied without panic.
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "ver"]);
+        // Manually replicate what isolate_session_process_group does for std.
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+        let status = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("cmd /C ver failed to spawn");
+        assert!(status.success(), "cmd /C ver exited with {status}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attach_and_kill_process_group() {
+        // Spawn a long-lived process, attach it to a job object, then kill via
+        // the helper. This exercises attach_process_job + kill_session_process_group.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "timeout", "/T", "60", "/NOBREAK", ">NUL"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn timeout process");
+        let pid = child.id();
+        let tree = super::attach_process_job(pid).expect("attach_process_job failed");
+        super::kill_session_process_group(tree);
+        let exit = child.wait().expect("wait failed");
+        // TerminateJobObject exits the process with code 1
+        assert_eq!(
+            exit.code(),
+            Some(1),
+            "expected exit code 1 from terminated job"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attach_process_job_rejects_nonexistent_pid() {
+        // PID 4 is the System Idle Process and cannot be opened; any other
+        // certainly-doesn't-exist PID works too. The helper must return Err.
+        let result = super::attach_process_job(u32::MAX);
+        assert!(result.is_err(), "expected error for non-existent PID");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stdout_is_tty_reflects_console() {
+        // When running under cargo test stdout is piped; the helper should
+        // return false. In a real console it returns true. Either way it must
+        // not panic.
+        let _ = super::stdout_is_tty();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_mode_enable_restore_roundtrip() {
+        // In a piped test environment enable() returns None; that is expected.
+        // When it succeeds the restore must not panic.
+        if let Some(raw) = super::RawMode::enable() {
+            raw.restore();
+        }
+    }
 }

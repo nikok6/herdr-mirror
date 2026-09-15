@@ -10,11 +10,13 @@
 //   herdr-mirror remote-invoke <plugin>.<action>
 //   herdr-mirror remote-actions [host]              # discovery
 //   herdr-mirror bind|unbind ...                    # keybinding setup
+//   herdr-mirror relay [--session-b64=TOKEN]        # Windows local API relay
 
 mod api;
 mod binding;
 mod closes;
 mod config;
+#[cfg_attr(windows, allow(dead_code))]
 mod cwd_policy;
 mod daemon;
 mod docker;
@@ -24,8 +26,14 @@ mod layout_sync;
 mod mirror;
 mod pane;
 mod paste;
+#[cfg(unix)]
 mod pick;
+#[cfg(windows)]
+#[path = "pick_windows.rs"]
+mod pick;
+mod platform;
 mod predict;
+mod relay;
 mod remote;
 mod remote_action;
 mod select;
@@ -53,7 +61,9 @@ fn main() {
 }
 
 fn run(cmd: &str, rest: &[String]) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let result = run_on(&rt, cmd, rest);
     // pane mode's blocking stdin read would hang a plain Runtime::drop forever
     rt.shutdown_background();
@@ -96,6 +106,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }
+        "relay" => rt.block_on(relay::cmd(&rest[1..])),
         "pick-workspace" => {
             if rest.iter().any(|a| a == "--menu") {
                 pick::menu(rt, Env::resolve()?)
@@ -136,7 +147,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rt.block_on(binding::unbind(Env::resolve()?, what))
         }
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
+            "unknown command: {other} (daemon|pane|relay|start|pause|ensure|status|once|restore|teardown|hide|show|pick-workspace|remote-workspace|remote-tab|remote-split|remote-invoke|remote-actions|bind|unbind)"
         ))),
     }
 }

@@ -175,7 +175,15 @@ pub enum LayoutNode {
 /// `layout_sync::plan_placements` can't place faithfully; the shape-preserving
 /// path lives there.
 pub fn locate_in_layout(node: &LayoutNode, pane_id: &str) -> Option<(String, Vec<String>)> {
-    let LayoutNode::Split { direction, first, second, .. } = node else { return None };
+    let LayoutNode::Split {
+        direction,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return None;
+    };
     let is_the_pane =
         |n: &LayoutNode| matches!(n, LayoutNode::Pane { pane_id: Some(p), .. } if p == pane_id);
     if is_the_pane(first) {
@@ -211,7 +219,12 @@ fn map_node(node: &LayoutNode, cwd: &str) -> Value {
             "label": label,
             "cwd": cwd,
         }),
-        LayoutNode::Split { direction, ratio, first, second } => json!({
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => json!({
             "type": "split",
             "direction": direction,
             "ratio": ratio,
@@ -233,17 +246,20 @@ fn prune_closed(node: &LayoutNode, panes: &BTreeMap<String, PaneEntry>) -> Optio
                 .is_some_and(|e| e.is_tombstoned());
             (!closed).then(|| node.clone())
         }
-        LayoutNode::Split { direction, ratio, first, second } => {
-            match (prune_closed(first, panes), prune_closed(second, panes)) {
-                (Some(f), Some(s)) => Some(LayoutNode::Split {
-                    direction: direction.clone(),
-                    ratio: *ratio,
-                    first: Box::new(f),
-                    second: Box::new(s),
-                }),
-                (one, two) => one.or(two),
-            }
-        }
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => match (prune_closed(first, panes), prune_closed(second, panes)) {
+            (Some(f), Some(s)) => Some(LayoutNode::Split {
+                direction: direction.clone(),
+                ratio: *ratio,
+                first: Box::new(f),
+                second: Box::new(s),
+            }),
+            (one, two) => one.or(two),
+        },
     }
 }
 
@@ -312,11 +328,17 @@ pub async fn apply_hidden(
     // that now belong to someone else: a local server restart can reassign one,
     // and this cannot tell. Converge's own close paths share that weakness.
     let live: std::collections::HashSet<String> = match fetch_snapshot(local).await {
-        Ok(snap) => snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect(),
+        Ok(snap) => snap
+            .workspaces
+            .iter()
+            .map(|w| w.workspace_id.clone())
+            .collect(),
         Err(e) => {
             // the one path where hide legitimately does nothing; say so, or the
             // mirrors stay up with no explanation anywhere
-            log.log(&format!("hidden: local snapshot failed for {host_name}: {e}"));
+            log.log(&format!(
+                "hidden: local snapshot failed for {host_name}: {e}"
+            ));
             return;
         }
     };
@@ -325,7 +347,9 @@ pub async fn apply_hidden(
         return;
     }
     if let Err(e) = save_state(state_dir, host_name, &state) {
-        log.log(&format!("hidden: could not save state for {host_name}: {e}"));
+        log.log(&format!(
+            "hidden: could not save state for {host_name}: {e}"
+        ));
         return;
     }
     for local_id in &doomed {
@@ -333,7 +357,9 @@ pub async fn apply_hidden(
         if let Ok(mut t) = closes.lock() {
             t.mark_self_close(local_id);
         }
-        if let Err(e) = local.request("workspace.close", json!({ "workspace_id": local_id })).await
+        if let Err(e) = local
+            .request("workspace.close", json!({ "workspace_id": local_id }))
+            .await
         {
             log.log(&format!("hidden: close failed for {local_id}: {e}"));
         }
@@ -411,7 +437,10 @@ fn resolve_label(
     // remote unchanged, local differs → this is a user rename. Accept it with
     // or without the "<prefix>: " convention; empty/degenerate names restamp.
     let stripped = match prefix {
-        Some(p) => local_label.strip_prefix(&format!("{p}: ")).unwrap_or(local_label).trim(),
+        Some(p) => local_label
+            .strip_prefix(&format!("{p}: "))
+            .unwrap_or(local_label)
+            .trim(),
         None => local_label.trim(),
     };
     if stripped.is_empty() || stripped == remote_label {
@@ -465,7 +494,9 @@ pub(crate) fn cmd_for_pane(
             pane_id.to_string(),
         ];
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
-        // defaults to the same resolution so the argv stays short
+        // defaults to the same resolution so the argv stays short. A Windows
+        // host has no such default — the path is required config and the pane
+        // cannot rebuild it — so it always travels.
         if let Some(bin) = &remote_bin {
             argv.extend(["--remote-bin".into(), bin.clone()]);
         }
@@ -490,6 +521,12 @@ pub(crate) fn cmd_for_pane(
             crate::config::HostKind::Ssh => {
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
             }
+            crate::config::HostKind::Windows => {
+                // No --ctl-path: a Windows host is never multiplexed (see
+                // RemoteHost::uses_control_master), so the foreground poll opens
+                // its own connection like every other call to this host.
+                argv.push("--windows-host".into());
+            }
             crate::config::HostKind::DockerContainer(name) => {
                 argv.extend(["--container".into(), name.clone()]);
                 argv.extend(["--docker-bin".into(), docker_bin.clone()]);
@@ -512,8 +549,18 @@ pub(crate) fn cmd_for_pane(
 }
 
 /// single-quote for a POSIX shell command line
+#[cfg(not(windows))]
+#[cfg_attr(windows, allow(dead_code))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// PowerShell uses single quotes too, but escapes an embedded quote by
+/// doubling it. Git Bash and other POSIX shells accept this form as well.
+#[cfg(windows)]
+#[cfg_attr(windows, allow(dead_code))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Reconcile one mirrored tab's geometry: exchange panes into the arrangement
@@ -539,11 +586,17 @@ async fn reconcile_tab_geometry(
     struct ExportedLayout {
         root: LayoutNode,
     }
-    let remote_layout =
-        deps.remote.request_t::<Exported>("layout.export", json!({ "tab_id": remote_tab })).await;
-    let local_layout =
-        deps.local.request_t::<Exported>("layout.export", json!({ "tab_id": local_tab })).await;
-    let (Ok(remote), Ok(local)) = (remote_layout, local_layout) else { return };
+    let remote_layout = deps
+        .remote
+        .request_t::<Exported>("layout.export", json!({ "tab_id": remote_tab }))
+        .await;
+    let local_layout = deps
+        .local
+        .request_t::<Exported>("layout.export", json!({ "tab_id": local_tab }))
+        .await;
+    let (Ok(remote), Ok(local)) = (remote_layout, local_layout) else {
+        return;
+    };
 
     let map: BTreeMap<String, String> = remote_panes
         .iter()
@@ -586,10 +639,15 @@ async fn reconcile_tab_geometry(
     for (source, target) in &plan.swaps {
         if let Err(e) = deps
             .local
-            .request("pane.swap", json!({ "source_pane_id": source, "target_pane_id": target }))
+            .request(
+                "pane.swap",
+                json!({ "source_pane_id": source, "target_pane_id": target }),
+            )
             .await
         {
-            deps.log.log(&format!("{remote_tab}: pane swap failed ({e}) — retrying next pass"));
+            deps.log.log(&format!(
+                "{remote_tab}: pane swap failed ({e}) — retrying next pass"
+            ));
             return;
         }
     }
@@ -602,7 +660,8 @@ async fn reconcile_tab_geometry(
         };
         let params = json!({ "tab_id": tab, "path": fix.path, "ratio": fix.ratio });
         if let Err(e) = api.request("layout.set_split_ratio", params).await {
-            deps.log.log(&format!("{remote_tab}: split ratio sync failed: {e}"));
+            deps.log
+                .log(&format!("{remote_tab}: split ratio sync failed: {e}"));
             failed.insert(crate::layout_sync::path_key(&fix.path));
         }
     }
@@ -666,84 +725,106 @@ pub(crate) async fn spawn_streamer_pane(
     argv: &[String],
     log: &Logger,
 ) {
-    let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
-    else {
-        log.log(&format!("refusing malformed streamer command for {local_pane_id}"));
-        return;
-    };
-    match crate::util::claim_streamer_spawn(
-        state_dir,
-        &ssh_target,
-        &pane_target,
-        local_pane_id,
-    ) {
-        Ok(crate::util::StreamerSpawnClaim::Claimed) => {}
-        Ok(crate::util::StreamerSpawnClaim::Active) => {
-            log.log(&format!("streamer for {pane_target} already active in {local_pane_id}; not retyping"));
-            return;
-        }
-        Ok(crate::util::StreamerSpawnClaim::Pending) => {
-            log.log(&format!("streamer launch for {pane_target} already pending in {local_pane_id}; not retyping"));
-            return;
-        }
-        Err(e) => {
-            log.log(&format!("cannot claim streamer launch for {local_pane_id}: {e}; not retyping"));
-            return;
-        }
-    }
-
-    let line = format!(
-        "exec {}\n",
-        argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
-    );
-    if let Err(e) = local
-        .request("pane.send_text", json!({ "pane_id": local_pane_id, "text": line }))
-        .await
+    // Automatic Windows streamer launch stays disabled until the daemon path has
+    // a live lifecycle test; direct `pane` use is the supported attended path.
+    #[cfg(windows)]
     {
-        crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
-        log.log(&format!("spawn streamer {local_pane_id}: {e}"));
-        return;
+        let _ = (local, state_dir, local_pane_id, argv);
+        log.log("Windows streamer launch is disabled; use an attended pane");
     }
 
-    // Typed input can be eaten by interactive shell startup (oh-my-zsh's
-    // update prompt swallows the first key — in EVERY new shell until it's
-    // answered). Verify the streamer registered its pidfile and retype the
-    // exec if not, off-loop so a slow shell never stalls reconcile. The
-    // alive-check right before each resend keeps a late-starting streamer
-    // from getting the line typed into its stdin (which would forward it to
-    // the remote pane as text).
-    let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
-    let pane_id = local_pane_id.to_string();
-    tokio::spawn(async move {
-        for wait_ms in [3000u64, 4000] {
-            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-            if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-                || crate::util::pane_streamer_alive(&state_dir, &pane_id)
-            {
+    #[cfg(not(windows))]
+    {
+        let (Some(ssh_target), Some(pane_target)) = (argv.get(2).cloned(), argv.get(3).cloned())
+        else {
+            log.log(&format!(
+                "refusing malformed streamer command for {local_pane_id}"
+            ));
+            return;
+        };
+        match crate::util::claim_streamer_spawn(state_dir, &ssh_target, &pane_target, local_pane_id)
+        {
+            Ok(crate::util::StreamerSpawnClaim::Claimed) => {}
+            Ok(crate::util::StreamerSpawnClaim::Active) => {
+                log.log(&format!(
+                    "streamer for {pane_target} already active in {local_pane_id}; not retyping"
+                ));
                 return;
             }
-            log.log(&format!(
-                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
-            ));
-            if local
-                .request("pane.send_text", json!({ "pane_id": pane_id, "text": line }))
-                .await
-                .is_err()
-            {
-                crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
-                return; // pane gone (closed meanwhile) — nothing to heal
+            Ok(crate::util::StreamerSpawnClaim::Pending) => {
+                log.log(&format!("streamer launch for {pane_target} already pending in {local_pane_id}; not retyping"));
+                return;
+            }
+            Err(e) => {
+                log.log(&format!(
+                    "cannot claim streamer launch for {local_pane_id}: {e}; not retyping"
+                ));
+                return;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
-        if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
-            && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
+
+        let line = format!(
+            "exec {}\n",
+            argv.iter()
+                .map(|a| sh_quote(a))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if let Err(e) = local
+            .request(
+                "pane.send_text",
+                json!({ "pane_id": local_pane_id, "text": line }),
+            )
+            .await
         {
-            crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
-            log.log(&format!(
+            crate::util::clear_streamer_spawn_pending(state_dir, local_pane_id);
+            log.log(&format!("spawn streamer {local_pane_id}: {e}"));
+            return;
+        }
+
+        // Typed input can be eaten by interactive shell startup (oh-my-zsh's
+        // update prompt swallows the first key — in EVERY new shell until it's
+        // answered). Verify the streamer registered its pidfile and retype the
+        // exec if not, off-loop so a slow shell never stalls reconcile. The
+        // alive-check right before each resend keeps a late-starting streamer
+        // from getting the line typed into its stdin (which would forward it to
+        // the remote pane as text).
+        let (local, log, state_dir) = (local.clone(), log.clone(), state_dir.to_path_buf());
+        let pane_id = local_pane_id.to_string();
+        tokio::spawn(async move {
+            for wait_ms in [3000u64, 4000] {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                if crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                    || crate::util::pane_streamer_alive(&state_dir, &pane_id)
+                {
+                    return;
+                }
+                log.log(&format!(
+                "streamer for {pane_target} not up in {pane_id} — shell startup likely ate the exec; retyping"
+            ));
+                if local
+                    .request(
+                        "pane.send_text",
+                        json!({ "pane_id": pane_id, "text": line }),
+                    )
+                    .await
+                    .is_err()
+                {
+                    crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
+                    return; // pane gone (closed meanwhile) — nothing to heal
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4000)).await;
+            if !crate::util::streamer_alive(&state_dir, &ssh_target, &pane_target)
+                && !crate::util::pane_streamer_alive(&state_dir, &pane_id)
+            {
+                crate::util::clear_streamer_spawn_pending(&state_dir, &pane_id);
+                log.log(&format!(
                 "streamer for {pane_target} still not up in {pane_id} after retries — pane left as a shell"
             ));
-        }
-    });
+            }
+        });
+    }
 }
 
 /// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
@@ -787,7 +868,9 @@ fn note_mapped(deps: &ConvergeDeps, state: &HostState, fresh_local_ids: &[String
         // Not cosmetic: this write is what tells the intercept hook these
         // objects are ours. An unwritable state dir would otherwise leave every
         // daemon-created pane looking like native junk, silently.
-        deps.log.log(&format!("could not persist map after mapping fresh ids: {e}"));
+        deps.log.log(&format!(
+            "could not persist map after mapping fresh ids: {e}"
+        ));
     }
 }
 
@@ -821,14 +904,29 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     let (remote_snap, local_snap) =
         tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
 
-
-    let mut local_ws_ids: HashSet<String> =
-        local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
+    let mut local_ws_ids: HashSet<String> = local_snap
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.clone())
+        .collect();
     let local_tab_ids: HashSet<&str> = local_snap.tabs.iter().map(|t| t.tab_id.as_str()).collect();
-    let local_pane_ids: HashSet<&str> = local_snap.panes.iter().map(|p| p.pane_id.as_str()).collect();
-    let remote_ws_ids: HashSet<&str> = remote_snap.workspaces.iter().map(|w| w.workspace_id.as_str()).collect();
-    let remote_tab_ids: HashSet<&str> = remote_snap.tabs.iter().map(|t| t.tab_id.as_str()).collect();
-    let remote_pane_ids: HashSet<&str> = remote_snap.panes.iter().map(|p| p.pane_id.as_str()).collect();
+    let local_pane_ids: HashSet<&str> = local_snap
+        .panes
+        .iter()
+        .map(|p| p.pane_id.as_str())
+        .collect();
+    let remote_ws_ids: HashSet<&str> = remote_snap
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.as_str())
+        .collect();
+    let remote_tab_ids: HashSet<&str> =
+        remote_snap.tabs.iter().map(|t| t.tab_id.as_str()).collect();
+    let remote_pane_ids: HashSet<&str> = remote_snap
+        .panes
+        .iter()
+        .map(|p| p.pane_id.as_str())
+        .collect();
     let mut sizes: HashMap<String, LayoutRect> = HashMap::new();
     for layout in &remote_snap.layouts {
         for p in &layout.panes {
@@ -860,30 +958,52 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     };
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
-        if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
+        if !entry.is_tombstoned()
+            && !local_ws_ids.contains(&entry.local_id)
+            && remote_ws_ids.contains(rid.as_str())
+        {
             entry.tombstone = Some(true);
             if close_remote && user_closed.contains(&entry.local_id) {
                 ws_close_remote.push(rid.clone());
             } else {
-                log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
+                log.log(&format!(
+                    "workspace mirror for {rid} was closed locally — tombstoning"
+                ));
             }
         }
     }
     for rid in &ws_close_remote {
-        log.log(&format!("workspace mirror for {rid} closed locally — closing remote workspace"));
-        if let Err(e) = deps.remote.request("workspace.close", json!({ "workspace_id": rid })).await {
+        log.log(&format!(
+            "workspace mirror for {rid} closed locally — closing remote workspace"
+        ));
+        if let Err(e) = deps
+            .remote
+            .request("workspace.close", json!({ "workspace_id": rid }))
+            .await
+        {
             log.log(&format!("remote workspace close failed for {rid}: {e}"));
         }
     }
-    let pane_ws: HashMap<&str, &str> =
-        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
-    let pane_tab: HashMap<&str, &str> =
-        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.tab_id.as_str())).collect();
+    let pane_ws: HashMap<&str, &str> = remote_snap
+        .panes
+        .iter()
+        .map(|p| (p.pane_id.as_str(), p.workspace_id.as_str()))
+        .collect();
+    let pane_tab: HashMap<&str, &str> = remote_snap
+        .panes
+        .iter()
+        .map(|p| (p.pane_id.as_str(), p.tab_id.as_str()))
+        .collect();
     let mut drop_panes: Vec<String> = Vec::new();
     let mut pane_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.panes.iter_mut() {
-        if !entry.is_tombstoned() && !local_pane_ids.contains(entry.local_id.as_str()) && remote_pane_ids.contains(rid.as_str()) {
-            let ws_entry = pane_ws.get(rid.as_str()).and_then(|ws| state.workspaces.get(*ws));
+        if !entry.is_tombstoned()
+            && !local_pane_ids.contains(entry.local_id.as_str())
+            && remote_pane_ids.contains(rid.as_str())
+        {
+            let ws_entry = pane_ws
+                .get(rid.as_str())
+                .and_then(|ws| state.workspaces.get(*ws));
             // if the pane's whole mirror workspace is gone, the stale pane
             // entry is collateral — drop it (its tombstoned workspace already
             // blocks recreation)
@@ -900,7 +1020,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     if close_remote && (user_closed.contains(&entry.local_id) || tab_closed) {
                         pane_close_remote.push(rid.clone());
                     } else {
-                        log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
+                        log.log(&format!(
+                            "pane mirror for {rid} was closed locally — tombstoning"
+                        ));
                     }
                 }
                 _ => drop_panes.push(rid.clone()),
@@ -908,8 +1030,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     for rid in &pane_close_remote {
-        log.log(&format!("pane mirror for {rid} closed locally — closing remote pane"));
-        if let Err(e) = deps.remote.request("pane.close", json!({ "pane_id": rid })).await {
+        log.log(&format!(
+            "pane mirror for {rid} closed locally — closing remote pane"
+        ));
+        if let Err(e) = deps
+            .remote
+            .request("pane.close", json!({ "pane_id": rid }))
+            .await
+        {
             log.log(&format!("remote pane close failed for {rid}: {e}"));
         }
     }
@@ -924,36 +1052,60 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     //    reconnected mid-restore (transiently empty/partial snapshot) can't
     //    mass-close mirrors.
     let prev_ids = std::mem::take(&mut state.prev_remote_ids);
-    let absent_twice = |rid: &str, present: &HashSet<&str>| {
-        !present.contains(rid) && !prev_ids.contains(rid)
-    };
-    let gone_ws: Vec<String> =
-        state.workspaces.keys().filter(|rid| absent_twice(rid, &remote_ws_ids)).cloned().collect();
+    let absent_twice =
+        |rid: &str, present: &HashSet<&str>| !present.contains(rid) && !prev_ids.contains(rid);
+    let gone_ws: Vec<String> = state
+        .workspaces
+        .keys()
+        .filter(|rid| absent_twice(rid, &remote_ws_ids))
+        .cloned()
+        .collect();
     for rid in gone_ws {
         let entry = state.workspaces.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
-            log.log(&format!("remote workspace {rid} gone — closing mirror {}", entry.local_id));
+            log.log(&format!(
+                "remote workspace {rid} gone — closing mirror {}",
+                entry.local_id
+            ));
             mark_self_close(deps, &entry.local_id);
-            if let Err(e) = deps.local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await {
+            if let Err(e) = deps
+                .local
+                .request("workspace.close", json!({ "workspace_id": entry.local_id }))
+                .await
+            {
                 log.log(&format!("close failed: {e}"));
             }
         }
     }
-    let gone_tabs: Vec<String> =
-        state.tabs.keys().filter(|rid| absent_twice(rid, &remote_tab_ids)).cloned().collect();
+    let gone_tabs: Vec<String> = state
+        .tabs
+        .keys()
+        .filter(|rid| absent_twice(rid, &remote_tab_ids))
+        .cloned()
+        .collect();
     for rid in gone_tabs {
         let entry = state.tabs.remove(&rid).unwrap();
         if local_tab_ids.contains(entry.local_id.as_str()) {
-            let _ = deps.local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
+            let _ = deps
+                .local
+                .request("tab.close", json!({ "tab_id": entry.local_id }))
+                .await;
         }
     }
-    let gone_panes: Vec<String> =
-        state.panes.keys().filter(|rid| absent_twice(rid, &remote_pane_ids)).cloned().collect();
+    let gone_panes: Vec<String> = state
+        .panes
+        .keys()
+        .filter(|rid| absent_twice(rid, &remote_pane_ids))
+        .cloned()
+        .collect();
     for rid in gone_panes {
         let entry = state.panes.remove(&rid).unwrap();
         if !entry.is_tombstoned() && local_pane_ids.contains(entry.local_id.as_str()) {
             mark_self_close(deps, &entry.local_id);
-            let _ = deps.local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
+            let _ = deps
+                .local
+                .request("pane.close", json!({ "pane_id": entry.local_id }))
+                .await;
         }
     }
     // record this pass's remote ids for the next comparison
@@ -968,11 +1120,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     // panes (a machine mirroring us back), so mutual mirroring can't nest.
     let mut panes_by_ws: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
     for p in &remote_snap.panes {
-        panes_by_ws.entry(p.workspace_id.as_str()).or_default().push(p);
+        panes_by_ws
+            .entry(p.workspace_id.as_str())
+            .or_default()
+            .push(p);
     }
     let mut mirror_ws_ids: HashSet<String> = HashSet::new();
     for rws in &remote_snap.workspaces {
-        let Some(panes) = panes_by_ws.get(rws.workspace_id.as_str()).filter(|p| !p.is_empty()) else {
+        let Some(panes) = panes_by_ws
+            .get(rws.workspace_id.as_str())
+            .filter(|p| !p.is_empty())
+        else {
             continue;
         };
         if panes.iter().all(|p| pane_is_mirror(p)) {
@@ -986,7 +1144,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             continue;
         }
         let label = format!("{}: {}", host.prefix, rws.label);
-        if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
+        if state
+            .workspaces
+            .get(&rws.workspace_id)
+            .is_some_and(|e| e.is_tombstoned())
+        {
             continue;
         }
         let existing = state
@@ -995,9 +1157,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             .filter(|e| local_ws_ids.contains(&e.local_id))
             .cloned();
         if let Some(entry) = existing {
-            let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
+            let local_ws = local_snap
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
-                match resolve_label(Some(&host.prefix), &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
+                match resolve_label(
+                    Some(&host.prefix),
+                    &rws.label,
+                    &lws.label,
+                    entry.last_remote_label.as_deref(),
+                ) {
                     LabelAction::PushRemote(new_remote) => {
                         // the user renamed the mirror → the rename is intent for
                         // the REMOTE workspace; push it there and restamp local
@@ -1015,7 +1185,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         let stamped = format!("{}: {}", host.prefix, new_remote);
                         if lws.label != stamped {
                             deps.local
-                                .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
+                                .request(
+                                    "workspace.rename",
+                                    json!({ "workspace_id": entry.local_id, "label": stamped }),
+                                )
                                 .await?;
                         }
                         if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
@@ -1024,7 +1197,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     }
                     LabelAction::RestampLocal => {
                         deps.local
-                            .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": label }))
+                            .request(
+                                "workspace.rename",
+                                json!({ "workspace_id": entry.local_id, "label": label }),
+                            )
                             .await?;
                         if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
                             e.last_remote_label = Some(rws.label.clone());
@@ -1041,17 +1217,26 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             }
         } else {
             // adopt a label-matching unmapped local workspace (orphan from a crash)
-            let mapped: HashSet<&str> = state.workspaces.values().map(|e| e.local_id.as_str()).collect();
+            let mapped: HashSet<&str> = state
+                .workspaces
+                .values()
+                .map(|e| e.local_id.as_str())
+                .collect();
             let orphan = local_snap
                 .workspaces
                 .iter()
                 .find(|w| w.label == label && !mapped.contains(w.workspace_id.as_str()));
             let entry = if let Some(orphan) = orphan {
-                log.log(&format!("adopting existing workspace {label} ({})", orphan.workspace_id));
+                log.log(&format!(
+                    "adopting existing workspace {label} ({})",
+                    orphan.workspace_id
+                ));
                 WsEntry {
                     local_id: orphan.workspace_id.clone(),
                     tombstone: None,
-                    root_tab_local_id: if orphan.tab_count == Some(1) && orphan.pane_count == Some(1) {
+                    root_tab_local_id: if orphan.tab_count == Some(1)
+                        && orphan.pane_count == Some(1)
+                    {
                         orphan.active_tab_id.clone()
                     } else {
                         None
@@ -1079,7 +1264,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 let created: Created = deps
                     .local
-                    .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false }))
+                    .request_t(
+                        "workspace.create",
+                        json!({ "label": label, "cwd": cwd, "focus": false }),
+                    )
                     .await?;
                 WsEntry {
                     local_id: created.workspace.workspace_id,
@@ -1105,7 +1293,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if rws.tokens.is_empty() {
             continue; // nothing to forward (also the pre-0.7.4 remote case)
         }
-        let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
+        let Some(entry) = state.workspaces.get(&rws.workspace_id) else {
+            continue;
+        };
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
@@ -1120,14 +1310,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 4. remote tabs → replicate layout with wrapper commands
     for rtab in &remote_snap.tabs {
-        let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else { continue };
+        let Some(ws_entry) = state.workspaces.get(&rtab.workspace_id).cloned() else {
+            continue;
+        };
         if ws_entry.is_tombstoned() {
             continue;
         }
         let tab_entry = state.tabs.get(&rtab.tab_id).cloned();
-        let tab_exists = tab_entry.as_ref().is_some_and(|t| local_tab_ids.contains(t.local_id.as_str()));
-        let remote_panes_in_tab: Vec<&PaneInfo> =
-            remote_snap.panes.iter().filter(|p| p.tab_id == rtab.tab_id).collect();
+        let tab_exists = tab_entry
+            .as_ref()
+            .is_some_and(|t| local_tab_ids.contains(t.local_id.as_str()));
+        let remote_panes_in_tab: Vec<&PaneInfo> = remote_snap
+            .panes
+            .iter()
+            .filter(|p| p.tab_id == rtab.tab_id)
+            .collect();
         // A tab whose mirror the user closed leaves only tombstoned pane
         // entries behind (a TabEntry has no tombstone of its own — its stale
         // local id just stops resolving). Rebuilding it would recreate panes
@@ -1135,14 +1332,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         // round-trip. `restore` deletes the tombstones, which lifts this.
         if !tab_exists
             && !remote_panes_in_tab.is_empty()
-            && remote_panes_in_tab
-                .iter()
-                .all(|p| state.panes.get(&p.pane_id).is_some_and(|e| e.is_tombstoned()))
+            && remote_panes_in_tab.iter().all(|p| {
+                state
+                    .panes
+                    .get(&p.pane_id)
+                    .is_some_and(|e| e.is_tombstoned())
+            })
         {
             continue;
         }
 
-        if !tab_exists || remote_panes_in_tab.iter().any(|p| !state.panes.contains_key(&p.pane_id)) {
+        if !tab_exists
+            || remote_panes_in_tab
+                .iter()
+                .any(|p| !state.panes.contains_key(&p.pane_id))
+        {
             #[derive(Deserialize)]
             struct Exported {
                 layout: ExportedLayout,
@@ -1151,8 +1355,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             struct ExportedLayout {
                 root: LayoutNode,
             }
-            let exported: Exported =
-                deps.remote.request_t("layout.export", json!({ "tab_id": rtab.tab_id })).await?;
+            let exported: Exported = deps
+                .remote
+                .request_t("layout.export", json!({ "tab_id": rtab.tab_id }))
+                .await?;
 
             if !tab_exists {
                 // apply only the non-tombstoned part of the tree: layout.apply
@@ -1213,7 +1419,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq,
+                            reported: None,
+                        },
                     );
                     fresh.push(local_id.clone());
                     to_spawn.push((local_id, rid.clone()));
@@ -1221,7 +1432,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 note_mapped(deps, state, &fresh);
                 for (local_id, rid) in &to_spawn {
                     // plain pane created above; exec the streamer into it
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, local_id, &cmd_for(rid), &deps.log).await;
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        local_id,
+                        &cmd_for(rid),
+                        &deps.log,
+                    )
+                    .await;
                 }
             } else {
                 // tab exists — add mirrors for individual new remote panes as
@@ -1246,7 +1464,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     .collect();
                 let (placements, unplaceable) =
                     crate::layout_sync::plan_placements(&exported.layout.root, &mirrored);
-                let in_this_tab = |rid: &String| remote_panes_in_tab.iter().any(|p| &p.pane_id == rid);
+                let in_this_tab =
+                    |rid: &String| remote_panes_in_tab.iter().any(|p| &p.pane_id == rid);
                 for place in placements.iter().filter(|p| in_this_tab(&p.pane)) {
                     if state.panes.contains_key(&place.pane) {
                         continue;
@@ -1281,18 +1500,32 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     // unmapped placeholder panes 250ms after pane.created
                     state.panes.insert(
                         place.pane.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&place.pane), &deps.log)
-                        .await;
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        &local_id,
+                        &cmd_for(&place.pane),
+                        &deps.log,
+                    )
+                    .await;
                 }
                 // A pane whose remote sibling is a multi-pane subtree can't be
                 // reproduced: pane.split splits a leaf, and nothing wraps a
                 // subtree in a new split. Place it by the old heuristic so the
                 // mirror is never missing a pane, and say so — the tab's ratio
                 // sync will report a structural mismatch from here on.
-                for rp in remote_panes_in_tab.iter().filter(|p| unplaceable.contains(&p.pane_id)) {
+                for rp in remote_panes_in_tab
+                    .iter()
+                    .filter(|p| unplaceable.contains(&p.pane_id))
+                {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
                     }
@@ -1305,10 +1538,14 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         .or_else(|| {
                             remote_panes_in_tab
                                 .iter()
-                                .find_map(|p| state.panes.get(&p.pane_id).map(|e| e.local_id.clone()))
+                                .find_map(|p| {
+                                    state.panes.get(&p.pane_id).map(|e| e.local_id.clone())
+                                })
                                 .map(|t| (t, "right".to_string()))
                         });
-                    let Some((target, direction)) = fallback else { continue };
+                    let Some((target, direction)) = fallback else {
+                        continue;
+                    };
                     log.log(&format!(
                         "{}: remote pane {} sits beside a subtree — mirroring it beside {target} instead; split sizes for this tab won't track",
                         rtab.tab_id, rp.pane_id
@@ -1317,11 +1554,22 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         split_mirror_pane(&deps.local, &target, &direction, None, &cwd).await?;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq: 0, reported: None },
+                        PaneEntry {
+                            local_id: local_id.clone(),
+                            tombstone: None,
+                            seq: 0,
+                            reported: None,
+                        },
                     );
                     note_mapped(deps, state, std::slice::from_ref(&local_id));
-                    spawn_streamer_pane(&deps.local, &deps.state_dir, &local_id, &cmd_for(&rp.pane_id), &deps.log)
-                        .await;
+                    spawn_streamer_pane(
+                        &deps.local,
+                        &deps.state_dir,
+                        &local_id,
+                        &cmd_for(&rp.pane_id),
+                        &deps.log,
+                    )
+                    .await;
                 }
             }
         }
@@ -1334,7 +1582,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // rename is intent for the REMOTE tab, and only a remote that moved
             // since we last stamped may overwrite the local label.
             if let Some(ltab) = local_tab {
-                match resolve_label(None, &rtab.label, &ltab.label, entry.last_remote_label.as_deref()) {
+                match resolve_label(
+                    None,
+                    &rtab.label,
+                    &ltab.label,
+                    entry.last_remote_label.as_deref(),
+                ) {
                     LabelAction::PushRemote(new_remote) => {
                         log.log(&format!(
                             "local rename of tab {tab_local} → pushing \"{new_remote}\" to remote {}",
@@ -1345,7 +1598,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         // being mistaken for a remote rename and stomped
                         if deps
                             .remote
-                            .request("tab.rename", json!({ "tab_id": rtab.tab_id, "label": new_remote }))
+                            .request(
+                                "tab.rename",
+                                json!({ "tab_id": rtab.tab_id, "label": new_remote }),
+                            )
                             .await
                             .is_ok()
                         {
@@ -1361,7 +1617,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         // user rename and push it over the remote's
                         if deps
                             .local
-                            .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
+                            .request(
+                                "tab.rename",
+                                json!({ "tab_id": tab_local, "label": rtab.label }),
+                            )
                             .await
                             .is_ok()
                         {
@@ -1398,7 +1657,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     // remembered ratio agreements for tabs that are gone would otherwise
     // accumulate in the state file forever
     let live_tabs: HashSet<String> = state.tabs.keys().cloned().collect();
-    state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
+    state
+        .ratios
+        .retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
     // 5. push authoritative agent status onto mirror panes
     push_statuses(deps, &remote_snap, state).await;
@@ -1471,11 +1732,16 @@ pub async fn push_pane_status(
             entry.reported = Some(label);
         }
         None => {
-            let Some(reported) = entry.reported.clone() else { return };
+            let Some(reported) = entry.reported.clone() else {
+                return;
+            };
             // remote agent exited — retract our claim so the mirror pane doesn't
             // show a phantom agent row forever
             entry.seq += 1;
-            log.log(&format!("remote agent gone on {remote_id} — releasing {reported} from {}", entry.local_id));
+            log.log(&format!(
+                "remote agent gone on {remote_id} — releasing {reported} from {}",
+                entry.local_id
+            ));
             if let Err(e) = local
                 .request(
                     "pane.release_agent",
@@ -1526,16 +1792,25 @@ pub async fn apply_remote_closes(
         if let Some(entry) = state.workspaces.remove(rid) {
             changed = true;
             if !entry.is_tombstoned() {
-                log.log(&format!("remote workspace {rid} closed — closing mirror {}", entry.local_id));
-                let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
+                log.log(&format!(
+                    "remote workspace {rid} closed — closing mirror {}",
+                    entry.local_id
+                ));
+                let _ = local
+                    .request("workspace.close", json!({ "workspace_id": entry.local_id }))
+                    .await;
             }
         } else if let Some(entry) = state.tabs.remove(rid) {
             changed = true;
-            let _ = local.request("tab.close", json!({ "tab_id": entry.local_id })).await;
+            let _ = local
+                .request("tab.close", json!({ "tab_id": entry.local_id }))
+                .await;
         } else if let Some(entry) = state.panes.remove(rid) {
             changed = true;
             if !entry.is_tombstoned() {
-                let _ = local.request("pane.close", json!({ "pane_id": entry.local_id })).await;
+                let _ = local
+                    .request("pane.close", json!({ "pane_id": entry.local_id }))
+                    .await;
             }
         }
     }
@@ -1547,23 +1822,41 @@ pub async fn apply_remote_closes(
 }
 
 pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
-    let agent_by_pane: HashMap<&str, &AgentInfo> =
-        remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    let agent_by_pane: HashMap<&str, &AgentInfo> = remote_snap
+        .agents
+        .iter()
+        .map(|a| (a.pane_id.as_str(), a))
+        .collect();
     for (remote_id, entry) in state.panes.iter_mut() {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
-        push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
+        push_pane_status(
+            &deps.local,
+            &deps.host.name,
+            remote_id,
+            entry,
+            agent,
+            &deps.log,
+        )
+        .await;
     }
 }
 
 /// Mark mirrored agents unknown (ssh drop) — statuses recover on reconnect.
 /// Only panes we actually reported an agent onto; inventing agent rows for
 /// plain mirrored terminals pollutes the agents panel.
-pub async fn mark_unknown(local: &ApiClient, state_dir: &std::path::Path, host_name: &str, reason: &str) {
+pub async fn mark_unknown(
+    local: &ApiClient,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    reason: &str,
+) {
     let mut state = load_state(state_dir, host_name);
     let source = mirror_source(host_name);
     let custom = clamp_status(reason);
     for entry in state.panes.values_mut() {
-        let Some(reported) = entry.reported.clone() else { continue };
+        let Some(reported) = entry.reported.clone() else {
+            continue;
+        };
         if entry.is_tombstoned() {
             continue;
         }
@@ -1616,14 +1909,19 @@ pub async fn teardown(
                 t.mark_self_close(&entry.local_id);
             }
         }
-        let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
+        let _ = local
+            .request("workspace.close", json!({ "workspace_id": entry.local_id }))
+            .await;
     }
     Ok(())
 }
 
 async fn move_ws(local: &ApiClient, ws: &str, insert_index: usize) -> bool {
     local
-        .request("workspace.move", json!({ "workspace_id": ws, "insert_index": insert_index }))
+        .request(
+            "workspace.move",
+            json!({ "workspace_id": ws, "insert_index": insert_index }),
+        )
         .await
         .is_ok()
 }
@@ -1693,9 +1991,14 @@ fn plan_regroup(current: &[(String, usize)]) -> Vec<(String, usize)> {
 /// workspaces are never reordered (they group as a side effect of mirror rows
 /// being pushed below them). Idempotent: issues no moves when already grouped.
 pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logger) {
-    let Ok(snap) = fetch_snapshot(local).await else { return };
-    let current: Vec<(String, usize)> =
-        snap.workspaces.iter().map(|w| (w.workspace_id.clone(), ws_rank(&w.label, prefixes))).collect();
+    let Ok(snap) = fetch_snapshot(local).await else {
+        return;
+    };
+    let current: Vec<(String, usize)> = snap
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.clone(), ws_rank(&w.label, prefixes)))
+        .collect();
     for (ws, insert_index) in plan_regroup(&current) {
         if !move_ws(local, &ws, insert_index).await {
             log.log(&format!("regroup: move {ws} failed"));
@@ -1739,7 +2042,11 @@ mod tests {
         state.workspaces.insert("R2".into(), ws_entry("w8", true)); // user closed it
         state.workspaces.insert("R3".into(), ws_entry("w9", false)); // already gone
         let doomed = hidden_close_plan(true, &mut state, &live(&["w7", "w8"]));
-        assert_eq!(doomed, vec!["w7".to_string()], "only the live, non-tombstoned one");
+        assert_eq!(
+            doomed,
+            vec!["w7".to_string()],
+            "only the live, non-tombstoned one"
+        );
         // the tombstone survives, or `show` resurrects a mirror the user closed
         assert!(state.workspaces.contains_key("R2"));
         assert!(!state.workspaces.contains_key("R1"));
@@ -1755,6 +2062,7 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: "vps".into(),
             remote_bin: None,
+            relay_bin: None,
             session: None,
             always_control: true,
             max_cols: None,
@@ -1764,11 +2072,19 @@ mod tests {
     }
 
     fn leaf(pane_id: &str) -> LayoutNode {
-        LayoutNode::Pane { pane_id: Some(pane_id.into()), label: None }
+        LayoutNode::Pane {
+            pane_id: Some(pane_id.into()),
+            label: None,
+        }
     }
 
     fn split(direction: &str, ratio: f64, first: LayoutNode, second: LayoutNode) -> LayoutNode {
-        LayoutNode::Split { direction: direction.into(), ratio, first: Box::new(first), second: Box::new(second) }
+        LayoutNode::Split {
+            direction: direction.into(),
+            ratio,
+            first: Box::new(first),
+            second: Box::new(second),
+        }
     }
 
     /// The fallback path, used only for a pane `layout_sync::plan_placements`
@@ -1784,7 +2100,12 @@ mod tests {
 
         // nested: p3 is under a "down" split inside the "right" split's second
         // branch, so the nearest sibling is p2, not p1
-        let tree = split("right", 0.3, leaf("p1"), split("down", 0.4, leaf("p2"), leaf("p3")));
+        let tree = split(
+            "right",
+            0.3,
+            leaf("p1"),
+            split("down", 0.4, leaf("p2"), leaf("p3")),
+        );
         let (dir, sibs) = locate_in_layout(&tree, "p3").unwrap();
         assert_eq!(dir, "down");
         assert_eq!(sibs, vec!["p2".to_string()]);
@@ -1793,7 +2114,12 @@ mod tests {
     }
 
     fn tombstoned(local_id: &str) -> PaneEntry {
-        PaneEntry { local_id: local_id.into(), tombstone: Some(true), seq: 0, reported: None }
+        PaneEntry {
+            local_id: local_id.into(),
+            tombstone: Some(true),
+            seq: 0,
+            reported: None,
+        }
     }
 
     /// A locally-closed (tombstoned) pane must not survive into the tree a tab
@@ -1801,17 +2127,30 @@ mod tests {
     /// tombstoned one would be left as a dead shell no streamer ever claims.
     #[test]
     fn prune_closed_drops_tombstoned_panes_and_collapses_splits() {
-        let tree = split("right", 0.3, leaf("p1"), split("down", 0.4, leaf("p2"), leaf("p3")));
+        let tree = split(
+            "right",
+            0.3,
+            leaf("p1"),
+            split("down", 0.4, leaf("p2"), leaf("p3")),
+        );
 
         // untracked and live panes survive untouched
         let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
         panes.insert(
             "p1".into(),
-            PaneEntry { local_id: "l1".into(), tombstone: None, seq: 0, reported: None },
+            PaneEntry {
+                local_id: "l1".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+            },
         );
         let mut ids = Vec::new();
         walk_pane_ids(&prune_closed(&tree, &panes).unwrap(), &mut ids);
-        assert_eq!(ids, vec!["p1".to_string(), "p2".to_string(), "p3".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["p1".to_string(), "p2".to_string(), "p3".to_string()]
+        );
 
         // a tombstoned leaf disappears and its split collapses to the sibling
         panes.insert("p2".into(), tombstoned("l2"));
@@ -1820,7 +2159,10 @@ mod tests {
         walk_pane_ids(&pruned, &mut ids);
         assert_eq!(ids, vec!["p1".to_string(), "p3".to_string()]);
         // the surviving outer split keeps its geometry
-        let LayoutNode::Split { direction, ratio, .. } = &pruned else {
+        let LayoutNode::Split {
+            direction, ratio, ..
+        } = &pruned
+        else {
             panic!("outer split should survive");
         };
         assert_eq!(direction, "right");
@@ -1843,6 +2185,7 @@ mod tests {
     ///
     /// If this test fails, that is the question to answer — not a prompt to
     /// update the expected value.
+    #[cfg(unix)]
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
@@ -1861,11 +2204,16 @@ mod tests {
             ]
         );
         // argv[0] is the resolved exe path, which varies by install
-        assert!(argv[0].ends_with("herdr-mirror") || argv[0].contains("herdr_mirror"), "{}", argv[0]);
+        assert!(
+            argv[0].ends_with("herdr-mirror") || argv[0].contains("herdr_mirror"),
+            "{}",
+            argv[0]
+        );
     }
 
     /// When remote_bin is set, it must appear on the argv (cross-process contract
     /// with the pane parser) rather than being re-resolved by the streamer.
+    #[cfg(unix)]
     #[test]
     fn ssh_pane_argv_carries_explicit_remote_bin() {
         let mut host = ssh_host();
@@ -1887,6 +2235,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn ssh_pane_argv_carries_remote_session() {
         let mut host = ssh_host();
@@ -1954,13 +2303,22 @@ mod tests {
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
         assert_eq!(parsed.ctl_path, None, "docker panes carry no ctl path");
-        let ct = parsed.container.expect("container must survive the argv round trip");
-        assert_eq!(ct.kind, crate::config::HostKind::DockerContainer("crazy_ride".into()));
-        assert_eq!(ct.docker_bin, "/usr/local/bin/docker", "--docker-bin must round-trip");
+        let ct = parsed
+            .container
+            .expect("container must survive the argv round trip");
+        assert_eq!(
+            ct.kind,
+            crate::config::HostKind::DockerContainer("crazy_ride".into())
+        );
+        assert_eq!(
+            ct.docker_bin, "/usr/local/bin/docker",
+            "--docker-bin must round-trip"
+        );
     }
 
     /// always_control is the only conditional flag; its absence must not
     /// disturb the position of --ctl-path.
+    #[cfg(unix)]
     #[test]
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
@@ -1973,14 +2331,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_pane_argv_uses_windows_transport_without_ctl_path() {
+        let mut host = ssh_host();
+        host.name = "windows".into();
+        host.kind = crate::config::HostKind::Windows;
+        host.target = "windows".into();
+        host.session = Some("team".into());
+        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
+        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        // Same argv on both platforms: a Windows host is never multiplexed,
+        // whichever OS the client runs on.
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "windows",
+                "w1:p1",
+                "--remote-bin",
+                r"C:\tools\herdr.exe",
+                "--session",
+                "team",
+                "--always-control",
+                "--windows-host",
+            ]
+        );
+        let parsed = crate::pane::parse_args(&argv[2..]).unwrap();
+        assert!(parsed.windows_host);
+        assert_eq!(parsed.remote_bin.as_deref(), Some(r"C:\tools\herdr.exe"));
+        assert_eq!(parsed.ctl_path, None);
+    }
+
     /// An uncapped host's argv must not grow, and a capped one must round-trip
     /// through the same parser the daemon's child uses.
     #[test]
     fn size_caps_reach_the_streamer_argv() {
         let mut host = ssh_host();
         host.always_control = false;
-        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
-        assert!(!uncapped.iter().any(|a| a == "--max-cols" || a == "--max-rows"));
+        let uncapped =
+            cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        assert!(!uncapped
+            .iter()
+            .any(|a| a == "--max-cols" || a == "--max-rows"));
 
         host.max_cols = Some(212);
         host.max_rows = Some(58);
@@ -1997,11 +2390,20 @@ mod tests {
     #[test]
     fn ws_label_two_way_rename() {
         // in sync → nothing
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm: scratch", Some("scratch")), LabelAction::InSync);
+        assert_eq!(
+            resolve_label(Some("pm"), "scratch", "pm: scratch", Some("scratch")),
+            LabelAction::InSync
+        );
         // remote renamed (history differs) → remote wins
-        assert_eq!(resolve_label(Some("pm"), "runs", "pm: scratch", Some("scratch")), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(Some("pm"), "runs", "pm: scratch", Some("scratch")),
+            LabelAction::RestampLocal
+        );
         // no history (pre-upgrade state file) → remote wins once
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm: LLMs", None), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(Some("pm"), "scratch", "pm: LLMs", None),
+            LabelAction::RestampLocal
+        );
         // user renamed locally, kept the prefix → push stripped name to remote
         assert_eq!(
             resolve_label(Some("pm"), "scratch", "pm: LLMs", Some("scratch")),
@@ -2013,7 +2415,10 @@ mod tests {
             LabelAction::PushRemote("LLM runs".into())
         );
         // degenerate: renamed to just the prefix-colon or whitespace → restamp
-        assert_eq!(resolve_label(Some("pm"), "scratch", "pm:  ", Some("scratch")), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(Some("pm"), "scratch", "pm:  ", Some("scratch")),
+            LabelAction::RestampLocal
+        );
     }
 
     /// Tabs carry the remote label verbatim, so the same resolution runs with no
@@ -2022,18 +2427,30 @@ mod tests {
     #[test]
     fn tab_label_two_way_rename() {
         // in sync → nothing
-        assert_eq!(resolve_label(None, "logs", "logs", Some("logs")), LabelAction::InSync);
+        assert_eq!(
+            resolve_label(None, "logs", "logs", Some("logs")),
+            LabelAction::InSync
+        );
         // remote renamed since we last stamped → remote wins
-        assert_eq!(resolve_label(None, "build", "logs", Some("logs")), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(None, "build", "logs", Some("logs")),
+            LabelAction::RestampLocal
+        );
         // user renamed the mirror tab, remote unchanged → push it to the remote
         assert_eq!(
             resolve_label(None, "logs", "deploys", Some("logs")),
             LabelAction::PushRemote("deploys".into())
         );
         // no history (tab mapped by an older mirror) → remote wins once
-        assert_eq!(resolve_label(None, "logs", "deploys", None), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(None, "logs", "deploys", None),
+            LabelAction::RestampLocal
+        );
         // renamed to whitespace → restamp rather than push an empty label
-        assert_eq!(resolve_label(None, "logs", "   ", Some("logs")), LabelAction::RestampLocal);
+        assert_eq!(
+            resolve_label(None, "logs", "   ", Some("logs")),
+            LabelAction::RestampLocal
+        );
         // a never-named remote tab reports its position as its label, so a local
         // rename of one still has to push rather than restamp
         assert_eq!(
@@ -2116,14 +2533,21 @@ mod tests {
         };
         assert_eq!(stripped_missing.effective_title(), Some("✳ working"));
 
-        let bare = AgentInfo { name: None, ..Default::default() };
+        let bare = AgentInfo {
+            name: None,
+            ..Default::default()
+        };
         assert_eq!(bare.effective_title(), None);
     }
 
     // simulate herdr's move_workspace(source, insert_index) on an id list
     fn apply_move(order: &mut Vec<String>, ws: &str, insert_index: usize) {
         let src = order.iter().position(|w| w == ws).unwrap();
-        let target_idx = if src < insert_index { insert_index - 1 } else { insert_index };
+        let target_idx = if src < insert_index {
+            insert_index - 1
+        } else {
+            insert_index
+        };
         let item = order.remove(src);
         order.insert(target_idx, item);
     }

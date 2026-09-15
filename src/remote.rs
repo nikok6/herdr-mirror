@@ -2,9 +2,11 @@
 // forward) over one ControlMaster per host. Pane streams deliberately use
 // their own direct connections instead (see pane.rs).
 
+#[cfg(not(windows))]
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ use tokio::time::timeout;
 
 use crate::api::ApiClient;
 use crate::config::{ApiTransport, HostConfig};
+use crate::platform;
 use crate::util::{err, Logger, Result};
 
 /// Marker in the error text for "the container isn't running". A stopped
@@ -54,8 +57,11 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -66,7 +72,22 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
             }
         }
     };
+    #[cfg(unix)]
     let process_group = child.id().map(|id| id as i32);
+    #[cfg(windows)]
+    let process_tree = match child.id().map(platform::attach_process_tree).transpose() {
+        Ok(Some(tree)) => Some(tree),
+        Ok(None) => None,
+        Err(e) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return SshOutput {
+                code: 1,
+                out: String::new(),
+                err: format!("cannot own ssh process tree: {e}"),
+            };
+        }
+    };
     let mut stdout = child.stdout.take().expect("piped ssh stdout");
     let mut stderr = child.stderr.take().expect("piped ssh stderr");
     let mut out = Vec::new();
@@ -94,10 +115,17 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
             err: e.to_string(),
         },
         Err(_) => {
+            #[cfg(unix)]
             if let Some(process_group) = process_group {
                 // ProxyCommand and any other ssh descendants share this group.
                 // Killing only the direct child leaves those descendants behind.
                 unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            }
+            #[cfg(windows)]
+            if let Some(tree) = process_tree {
+                platform::terminate_process_tree(tree);
+            } else {
+                let _ = child.kill().await;
             }
             // Reap the direct child before a reconnect starts another ssh tree.
             let _ = child.wait().await;
@@ -110,6 +138,7 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
     }
 }
 
+#[cfg(not(windows))]
 fn remove_stale_control_socket(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -121,7 +150,11 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
             )))
         }
     };
-    if !metadata.file_type().is_socket() {
+    let is_socket = {
+        use std::os::unix::fs::FileTypeExt;
+        metadata.file_type().is_socket()
+    };
+    if !is_socket {
         return Err(err(format!(
             "refusing to replace ssh control path {} because it is not a socket",
             path.display()
@@ -205,8 +238,6 @@ fn short_hash(s: &str) -> String {
 /// installs on byte-identical paths across this upgrade (no orphaned masters,
 /// no migration). Only names that were already too long to work at all move.
 fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
-    use std::os::unix::ffi::OsStrExt;
-
     // macOS reserves one byte of sockaddr_un's 104-byte path for NUL; Linux
     // allows 108, and we deliberately apply the tighter bound on both so a
     // hosts.toml is portable. Overhead is the worst case across the three
@@ -215,7 +246,13 @@ fn socket_stem(state_dir: &std::path::Path, host_name: &str) -> String {
     const MAX_SOCKET_PATH_BYTES: usize = 103;
     const CONTROL_SOCKET_OVERHEAD: usize = 21;
 
-    let directory_bytes = state_dir.as_os_str().as_bytes().len() + 1;
+    #[cfg(unix)]
+    let directory_bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        state_dir.as_os_str().as_bytes().len() + 1
+    };
+    #[cfg(windows)]
+    let directory_bytes = state_dir.to_string_lossy().len() + 1;
     let budget = MAX_SOCKET_PATH_BYTES.saturating_sub(directory_bytes + CONTROL_SOCKET_OVERHEAD);
     if host_name.len() <= budget {
         return host_name.into();
@@ -286,7 +323,10 @@ impl RemoteHost {
         let Some(id) = ids.first().cloned() else {
             // a stopped devcontainer is the resting state, not a fault; the
             // daemon matches this marker to back off gently
-            return Err(err(format!("{DORMANT}: no running container for {}", self.cfg.target)));
+            return Err(err(format!(
+                "{DORMANT}: no running container for {}",
+                self.cfg.target
+            )));
         };
         if ids.len() > 1 {
             // reachable without an attacker: a compose devcontainer can put the
@@ -299,60 +339,100 @@ impl RemoteHost {
         }
         // re-probe on every (re)connect: a rebuilt container may differ
         crate::docker::probe_socat(&bin, &id).await?;
-        self.container = Some(crate::docker::Container { id, docker_bin: bin });
+        self.container = Some(crate::docker::Container {
+            id,
+            docker_bin: bin,
+        });
         Ok(())
     }
 
+    /// Whether this host's ssh calls go through a shared ControlMaster.
+    ///
+    /// Two separate reasons not to, and both have to hold for it to be used:
+    ///
+    /// - OpenSSH *for* Windows has no ControlMaster (`-S`/`-M`/`-O`) at all, so
+    ///   when herdr-mirror runs on Windows every invocation is standalone.
+    /// - A Windows *host* multiplexes unreliably in the other direction: two
+    ///   exec channels opened concurrently on one master against Windows sshd
+    ///   can come back with a truncated or empty stream. The daemon opens the
+    ///   API relay and ordinary commands at the same time, so it hits this
+    ///   routinely; sequential use looks fine, which is why it is easy to miss.
+    fn uses_control_master(&self) -> bool {
+        !cfg!(windows) && !matches!(self.cfg.kind, crate::config::HostKind::Windows)
+    }
+
     fn base_args(&self) -> Vec<String> {
+        if self.uses_control_master() {
+            return vec![
+                "-S".into(),
+                self.ctl_path.display().to_string(),
+                "-o".into(),
+                "BatchMode=yes".into(),
+            ];
+        }
+        // ControlPath=none is explicit rather than merely omitting `-S`: the
+        // user's ssh_config may set ControlMaster/ControlPath for this host,
+        // which would silently put the multiplexing back.
         vec![
-            "-S".into(),
-            self.ctl_path.display().to_string(),
+            "-o".into(),
+            "ControlPath=none".into(),
             "-o".into(),
             "BatchMode=yes".into(),
         ]
     }
 
     pub async fn ensure_master(&mut self) -> Result<()> {
-        let mut check = self.base_args();
-        check.extend(["-O".into(), "check".into(), self.cfg.target.clone()]);
-        if ssh(&check, 15000).await.code == 0 {
+        if !self.uses_control_master() {
+            // No mux socket to establish; `exec` opens a fresh channel each call.
             return Ok(());
         }
-        self.forwarded = false;
-        // OpenSSH falls back to a standalone connection when ControlPath exists
-        // but no master is listening. With -f -N that silently leaks one process
-        // per retry, while every later -O command keeps targeting the dead socket.
-        remove_stale_control_socket(&self.ctl_path)?;
-        let mut start: Vec<String> = vec![
-            "-M".into(),
-            "-S".into(),
-            self.ctl_path.display().to_string(),
-        ];
-        start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
-        start.extend([
-            "-o".into(),
-            "ControlPersist=yes".into(),
-            "-f".into(),
-            "-N".into(),
-            self.cfg.target.clone(),
-        ]);
-        let res = ssh(&start, 20000).await;
-        if res.code != 0 {
-            return Err(err(format!(
-                "ssh master to {} failed: {}",
-                self.cfg.target,
-                nonempty(&res.err, res.code)
-            )));
+        #[cfg(not(windows))]
+        {
+            let mut check = self.base_args();
+            check.extend(["-O".into(), "check".into(), self.cfg.target.clone()]);
+            if ssh(&check, 15000).await.code == 0 {
+                return Ok(());
+            }
+            self.forwarded = false;
+            // OpenSSH falls back to a standalone connection when ControlPath exists
+            // but no master is listening. With -f -N that silently leaks one process
+            // per retry, while every later -O command keeps targeting the dead socket.
+            remove_stale_control_socket(&self.ctl_path)?;
+            let mut start: Vec<String> = vec![
+                "-M".into(),
+                "-S".into(),
+                self.ctl_path.display().to_string(),
+            ];
+            start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
+            start.extend([
+                "-o".into(),
+                "ControlPersist=yes".into(),
+                "-f".into(),
+                "-N".into(),
+                self.cfg.target.clone(),
+            ]);
+            let res = ssh(&start, 20000).await;
+            if res.code != 0 {
+                return Err(err(format!(
+                    "ssh master to {} failed: {}",
+                    self.cfg.target,
+                    nonempty(&res.err, res.code)
+                )));
+            }
+            let verified = ssh(&check, 15000).await;
+            if verified.code != 0 {
+                return Err(err(format!(
+                    "ssh master to {} did not create a usable control socket: {}",
+                    self.cfg.target,
+                    nonempty(&verified.err, verified.code)
+                )));
+            }
+            Ok(())
         }
-        let verified = ssh(&check, 15000).await;
-        if verified.code != 0 {
-            return Err(err(format!(
-                "ssh master to {} did not create a usable control socket: {}",
-                self.cfg.target,
-                nonempty(&verified.err, verified.code)
-            )));
+        #[cfg(windows)]
+        {
+            unreachable!("uses_control_master() is always false on Windows")
         }
-        Ok(())
     }
 
     pub async fn exec(&self, command: &str, timeout_ms: u64) -> Result<String> {
@@ -372,11 +452,9 @@ impl RemoteHost {
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
-        let bin = crate::config::remote_herdr_expr(
-            self.cfg.remote_bin.as_deref(),
-            self.cfg.session.as_deref(),
-        );
-        let out = self.exec(&format!("exec {} status --json", bin), 15000).await?;
+        let out = self
+            .exec(&status_command(&self.cfg), 15000)
+            .await?;
         #[derive(Deserialize)]
         struct Client {
             version: Option<String>,
@@ -401,7 +479,11 @@ impl RemoteHost {
             .unwrap_or_else(|| "unknown".into());
         let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
         let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
-        let mut status = RemoteStatus { socket, supported: false, reason: None };
+        let mut status = RemoteStatus {
+            socket,
+            supported: false,
+            reason: None,
+        };
         if !running {
             // Name the session, or this reads as "that machine's herdr is
             // down" while the default session is running perfectly and only
@@ -426,29 +508,58 @@ impl RemoteHost {
     }
 
     pub async fn forward_api(&mut self, remote_socket: &str) -> Result<PathBuf> {
-        if self.forwarded && self.fwd_sock.exists() {
-            return Ok(self.fwd_sock.clone());
+        #[cfg(windows)]
+        {
+            // `-O forward` needs a ControlMaster, which Windows OpenSSH lacks;
+            // the exec relay is the only transport there.
+            let _ = remote_socket;
+            Err(err(
+                "ssh streamlocal forwarding is unavailable on Windows; use api_transport = \"exec\" or \"auto\"",
+            ))
         }
-        // NEVER cancel a healthy forward — other processes may be using it
-        if self.fwd_sock.exists() && ApiClient::connect(&self.fwd_sock).await.is_ok() {
+        #[cfg(not(windows))]
+        {
+            if self.forwarded && platform::endpoint_exists(&self.fwd_sock) {
+                return Ok(self.fwd_sock.clone());
+            }
+            // NEVER cancel a healthy forward — other processes may be using it
+            if platform::endpoint_exists(&self.fwd_sock)
+                && ApiClient::connect(&self.fwd_sock).await.is_ok()
+            {
+                self.forwarded = true;
+                return Ok(self.fwd_sock.clone());
+            }
+            let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+            // a dead process can leave the forward registered on the master with
+            // its socket file unlinked — cancel before re-adding
+            let mut cancel = self.base_args();
+            cancel.extend([
+                "-O".into(),
+                "cancel".into(),
+                "-L".into(),
+                spec.clone(),
+                self.cfg.target.clone(),
+            ]);
+            let _ = ssh(&cancel, 15000).await;
+            let _ = platform::remove_endpoint(&self.fwd_sock);
+            let mut fwd = self.base_args();
+            fwd.extend([
+                "-O".into(),
+                "forward".into(),
+                "-L".into(),
+                spec,
+                self.cfg.target.clone(),
+            ]);
+            let res = ssh(&fwd, 15000).await;
+            if res.code != 0 {
+                return Err(err(format!(
+                    "ssh socket forward failed: {}",
+                    nonempty(&res.err, res.code)
+                )));
+            }
             self.forwarded = true;
-            return Ok(self.fwd_sock.clone());
+            Ok(self.fwd_sock.clone())
         }
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        // a dead process can leave the forward registered on the master with
-        // its socket file unlinked — cancel before re-adding
-        let mut cancel = self.base_args();
-        cancel.extend(["-O".into(), "cancel".into(), "-L".into(), spec.clone(), self.cfg.target.clone()]);
-        let _ = ssh(&cancel, 15000).await;
-        let _ = std::fs::remove_file(&self.fwd_sock);
-        let mut fwd = self.base_args();
-        fwd.extend(["-O".into(), "forward".into(), "-L".into(), spec, self.cfg.target.clone()]);
-        let res = ssh(&fwd, 15000).await;
-        if res.code != 0 {
-            return Err(err(format!("ssh socket forward failed: {}", nonempty(&res.err, res.code))));
-        }
-        self.forwarded = true;
-        Ok(self.fwd_sock.clone())
     }
 
     /// Try the streamlocal `-L` forward, verified with a real ping — not just
@@ -475,12 +586,27 @@ impl RemoteHost {
     /// socket file unlinked. Unlike `forward_api`'s guard this cannot steal a
     /// healthy forward: it only runs after a real ping failed.
     async fn cancel_forward(&mut self, remote_socket: &str) {
-        let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
-        let mut args = self.base_args();
-        args.extend(["-O".into(), "cancel".into(), "-L".into(), spec, self.cfg.target.clone()]);
-        let _ = ssh(&args, 15000).await;
-        let _ = std::fs::remove_file(&self.fwd_sock);
-        self.forwarded = false;
+        #[cfg(windows)]
+        {
+            // Nothing was ever forwarded on Windows (see forward_api).
+            let _ = remote_socket;
+            self.forwarded = false;
+        }
+        #[cfg(not(windows))]
+        {
+            let spec = format!("{}:{}", self.fwd_sock.display(), remote_socket);
+            let mut args = self.base_args();
+            args.extend([
+                "-O".into(),
+                "cancel".into(),
+                "-L".into(),
+                spec,
+                self.cfg.target.clone(),
+            ]);
+            let _ = ssh(&args, 15000).await;
+            let _ = platform::remove_endpoint(&self.fwd_sock);
+            self.forwarded = false;
+        }
     }
 
     /// Bridge the remote socket over a plain ssh exec channel instead of a
@@ -497,14 +623,29 @@ impl RemoteHost {
             return Ok(self.exec_sock.clone());
         }
         self.exec_relay = None;
-        let relay_cmd = crate::ssh_relay::detect_relay_command(self, remote_socket).await?;
+        let relay_cmd = if matches!(&self.cfg.kind, crate::config::HostKind::Windows) {
+            // parse_config always resolves relay_bin for a Windows host, so a
+            // missing one is a construction bug, not a user misconfiguration.
+            let relay_bin = self
+                .cfg
+                .relay_bin
+                .as_deref()
+                .ok_or_else(|| crate::util::err("Windows host has no relay_bin"))?;
+            crate::ssh_relay::RelayCommand::prebuilt(crate::config::fixed_relay_command(
+                &self.cfg.kind,
+                relay_bin,
+                self.cfg.session.as_deref(),
+            )?)
+        } else {
+            crate::ssh_relay::detect_relay_command(self, remote_socket).await?
+        };
         self.log.log(&format!(
             "[{}] exec relay via {} → {remote_socket}",
             self.cfg.name,
             relay_cmd.tool()
         ));
         let handle = crate::ssh_relay::serve_relay(
-            self.ctl_path.clone(),
+            self.uses_control_master().then(|| self.ctl_path.clone()),
             self.cfg.target.clone(),
             relay_cmd,
             self.exec_sock.clone(),
@@ -527,9 +668,18 @@ impl RemoteHost {
     /// cost before this fallback existed.
     async fn connect_ssh_api(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let configured = self.cfg.api_transport;
-        let start_with_socket =
-            (if configured == ApiTransport::Auto { self.transport_hint } else { configured })
-                != ApiTransport::Exec;
+        let windows_host = matches!(&self.cfg.kind, crate::config::HostKind::Windows);
+        if windows_host && configured == ApiTransport::Socket {
+            return Err(err(
+                "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\"",
+            ));
+        }
+        if cfg!(windows) && configured == ApiTransport::Socket {
+            return Err(err(
+                "api_transport = \"socket\" is not supported on Windows; use \"exec\" or \"auto\"",
+            ));
+        }
+        let start_with_socket = should_try_socket(&self.cfg.kind, configured, self.transport_hint);
 
         if start_with_socket {
             match self.try_socket_transport(remote_socket).await {
@@ -559,6 +709,13 @@ impl RemoteHost {
     }
 
     pub async fn connect_api(&mut self) -> Result<(ApiClient, RemoteStatus)> {
+        if matches!(&self.cfg.kind, crate::config::HostKind::Windows)
+            && self.cfg.api_transport == ApiTransport::Socket
+        {
+            return Err(err(
+                "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\"",
+            ));
+        }
         self.ensure_ready().await?;
         let status = match self.status().await {
             Ok(s) => s,
@@ -569,7 +726,10 @@ impl RemoteHost {
             }
         };
         if !status.supported {
-            return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
+            return Err(err(status
+                .reason
+                .clone()
+                .unwrap_or_else(|| "remote unsupported".into())));
         }
         // ssh hosts hand back a connected client (its ping doubles as the
         // transport probe); the docker branch resolves a path and connects below
@@ -603,7 +763,21 @@ impl RemoteHost {
         let api = ApiClient::connect(&sock).await?;
         Ok((api, status))
     }
+}
 
+fn should_try_socket(kind: &crate::config::HostKind, configured: ApiTransport, hint: ApiTransport) -> bool {
+    !matches!(kind, crate::config::HostKind::Windows)
+        && cfg!(not(windows))
+        && (if configured == ApiTransport::Auto { hint } else { configured }) != ApiTransport::Exec
+}
+
+fn status_command(cfg: &HostConfig) -> String {
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &cfg.kind,
+        cfg.remote_bin.as_deref(),
+        cfg.session.as_deref(),
+    );
+    format!("exec {bin} status --json")
 }
 
 fn nonempty(e: &str, code: i32) -> String {
@@ -626,7 +800,11 @@ pub(crate) fn version_supported(version: &str) -> Option<bool> {
     // preview builds look like 0.7.1-preview.2026-06-30-<hash>
     let preview_ok = version
         .split_once("-preview.")
-        .map(|(_, rest)| rest.get(0..10).map(|d| d >= MIN_PREVIEW_BUILD).unwrap_or(false))
+        .map(|(_, rest)| {
+            rest.get(0..10)
+                .map(|d| d >= MIN_PREVIEW_BUILD)
+                .unwrap_or(false)
+        })
         .unwrap_or(false);
     Some(newer_than_base || preview_ok)
 }
@@ -635,6 +813,7 @@ pub(crate) fn version_supported(version: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn test_path(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -654,6 +833,7 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: name.into(),
             remote_bin: None,
+            relay_bin: None,
             session: None,
             max_cols: None,
             max_rows: None,
@@ -663,14 +843,75 @@ mod tests {
     }
 
     #[test]
+    fn windows_status_command_uses_the_configured_binary_without_posix_resolver() {
+        let mut host = ssh_host("windows");
+        host.kind = crate::config::HostKind::Windows;
+        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
+        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
+        assert_eq!(
+            status_command(&host),
+            r"exec C:\tools\herdr.exe status --json"
+        );
+        host.session = Some("team".into());
+        assert_eq!(
+            status_command(&host),
+            r"exec C:\tools\herdr.exe --session team status --json"
+        );
+    }
+
+    #[test]
+    fn windows_remote_hosts_never_try_streamlocal_transport() {
+        assert!(!should_try_socket(
+            &crate::config::HostKind::Windows,
+            ApiTransport::Auto,
+            ApiTransport::Socket
+        ));
+        assert!(!should_try_socket(
+            &crate::config::HostKind::Windows,
+            ApiTransport::Exec,
+            ApiTransport::Exec
+        ));
+        assert_eq!(
+            should_try_socket(
+                &crate::config::HostKind::Ssh,
+                ApiTransport::Auto,
+                ApiTransport::Socket
+            ),
+            cfg!(not(windows))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_for_windows_remote_reports_unavailable_streamlocal() {
+        let mut host = ssh_host("windows");
+        host.kind = crate::config::HostKind::Windows;
+        host.api_transport = ApiTransport::Socket;
+        let mut remote = RemoteHost::new(&host, std::path::Path::new("/state"));
+        let error = match remote.connect_ssh_api("C:\\herdr.sock").await {
+            Ok(_) => panic!("explicit socket unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\""
+        );
+    }
+
+    #[test]
     fn long_host_names_use_truncated_socket_paths() {
         let state_dir = PathBuf::from("/Users/example/.local/state/herdr-mirror");
         let name = "remote-development-environment-with-a-very-long-name";
         let remote = RemoteHost::new(&ssh_host(name), &state_dir);
         let stem = socket_stem(&state_dir, name);
 
-        assert!(stem.len() < name.len(), "long name should have been shortened");
-        assert!(name.starts_with(stem.split('-').next().unwrap()), "readable prefix kept");
+        assert!(
+            stem.len() < name.len(),
+            "long name should have been shortened"
+        );
+        assert!(
+            name.starts_with(stem.split('-').next().unwrap()),
+            "readable prefix kept"
+        );
         assert_eq!(
             remote.ctl_path.file_name().unwrap().to_string_lossy(),
             format!("{stem}.ctl")
@@ -693,7 +934,11 @@ mod tests {
 
         // these differ only *past* the cut, so plain truncation collided
         let budget = 103 - state_dir.as_os_str().len() - 1 - 21;
-        assert_eq!(a[..budget], b[..budget], "names must be identical up to the cut");
+        assert_eq!(
+            a[..budget],
+            b[..budget],
+            "names must be identical up to the cut"
+        );
 
         assert_ne!(
             socket_stem(&state_dir, a),
@@ -712,7 +957,10 @@ mod tests {
         // change here silently relocates every long-named host's ControlMaster.
         // If a hashing swap ever moves them, this must fail first.
         assert_eq!(short_hash("vps"), "4f02d738");
-        assert_eq!(short_hash("prod-us-east-1-application-server-cluster-node-alpha"), "cbd62d65");
+        assert_eq!(
+            short_hash("prod-us-east-1-application-server-cluster-node-alpha"),
+            "cbd62d65"
+        );
     }
 
     #[test]
@@ -740,10 +988,14 @@ mod tests {
         // a state dir long enough to eat the whole budget still yields distinct
         // stems rather than one shared path
         let deep = PathBuf::from("/Users/example/".to_string() + &"d".repeat(80));
-        assert_ne!(socket_stem(&deep, "alpha-host-name"), socket_stem(&deep, "beta-host-name"));
+        assert_ne!(
+            socket_stem(&deep, "alpha-host-name"),
+            socket_stem(&deep, "beta-host-name")
+        );
         assert!(!socket_stem(&deep, "alpha-host-name").is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_terminates_proxy_command() {
         let pid_path = test_path("timed-out-proxy-pid");
@@ -776,6 +1028,7 @@ mod tests {
         assert!(!proxy_survived, "ProxyCommand survived the ssh timeout");
     }
 
+    #[cfg(unix)]
     #[test]
     fn removes_stale_control_socket() {
         let path = test_path("stale-control");
@@ -787,6 +1040,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_to_replace_non_socket_control_path() {
         let path = test_path("non-socket-control");
@@ -805,9 +1059,18 @@ mod tests {
         assert_eq!(version_supported("0.7.2"), Some(true));
         assert_eq!(version_supported("0.8.0"), Some(true));
         assert_eq!(version_supported("1.0.0"), Some(true));
-        assert_eq!(version_supported("0.7.1-preview.2026-06-30-3459798b606d"), Some(true));
-        assert_eq!(version_supported("0.7.1-preview.2026-07-04-aaaa"), Some(true));
-        assert_eq!(version_supported("0.7.1-preview.2026-06-29-aaaa"), Some(false));
+        assert_eq!(
+            version_supported("0.7.1-preview.2026-06-30-3459798b606d"),
+            Some(true)
+        );
+        assert_eq!(
+            version_supported("0.7.1-preview.2026-07-04-aaaa"),
+            Some(true)
+        );
+        assert_eq!(
+            version_supported("0.7.1-preview.2026-06-29-aaaa"),
+            Some(false)
+        );
         assert_eq!(version_supported("garbage"), None);
     }
 }

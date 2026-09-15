@@ -17,15 +17,23 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             asset: herdr-mirror-linux-x86_64
+            bin: herdr-mirror
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
             asset: herdr-mirror-linux-aarch64
+            bin: herdr-mirror
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            asset: herdr-mirror-windows-x86_64.exe
+            bin: herdr-mirror.exe
           - target: x86_64-apple-darwin
             runner: macos-latest
             asset: herdr-mirror-darwin-x86_64
+            bin: herdr-mirror
           - target: aarch64-apple-darwin
             runner: macos-latest
             asset: herdr-mirror-darwin-aarch64
+            bin: herdr-mirror
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -34,7 +42,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/herdr-mirror ${{ matrix.asset }}
+      - run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}

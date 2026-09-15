@@ -15,6 +15,16 @@ libc = "0.2"
 unicode-width = "0.2"
 fnv = "1.0.7"
 glob = "0.3"
+fs2 = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+    "Win32_Security",
+] }
 
 [profile.release]
 lto = true

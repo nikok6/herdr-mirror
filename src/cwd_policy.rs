@@ -13,9 +13,13 @@ pub enum Policy {
 
 pub fn parse(text: &str) -> Option<Policy> {
     let config: toml::Value = text.parse().ok()?;
-    let Some(terminal) = config.get("terminal") else { return Some(Policy::Follow) };
+    let Some(terminal) = config.get("terminal") else {
+        return Some(Policy::Follow);
+    };
     let terminal = terminal.as_table()?;
-    let Some(value) = terminal.get("new_cwd") else { return Some(Policy::Follow) };
+    let Some(value) = terminal.get("new_cwd") else {
+        return Some(Policy::Follow);
+    };
     let raw = value.as_str()?;
     Some(match raw.trim() {
         "" | "follow" => Policy::Follow,
@@ -45,14 +49,18 @@ fn fixed_path(policy: &Policy, home: &Path) -> Option<PathBuf> {
 }
 
 pub fn same_path(a: &Path, b: &Path) -> bool {
-    a == b || match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
+    a == b
+        || match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
 }
 
 fn path_from_help(help: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(help.lines().find_map(|line| line.strip_prefix("Config: "))?);
+    let path = PathBuf::from(
+        help.lines()
+            .find_map(|line| line.strip_prefix("Config: "))?,
+    );
     path.is_absolute().then_some(path)
 }
 
@@ -61,10 +69,19 @@ pub async fn local_fixed_path() -> Option<PathBuf> {
         Some(p) => PathBuf::from(p),
         None => {
             let bin = std::env::var_os("HERDR_BIN_PATH").filter(|p| !p.is_empty())?;
-            let output = tokio::time::timeout(Duration::from_secs(3),
-                tokio::process::Command::new(bin).arg("--help").kill_on_drop(true).output(),
-            ).await.ok()?.ok()?;
-            if !output.status.success() { return None; }
+            let output = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::process::Command::new(bin)
+                    .arg("--help")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            if !output.status.success() {
+                return None;
+            }
             path_from_help(std::str::from_utf8(&output.stdout).ok()?)?
         }
     };
@@ -72,14 +89,27 @@ pub async fn local_fixed_path() -> Option<PathBuf> {
     fixed_path(&parse(&text)?, &crate::util::home_dir())
 }
 
-pub async fn remote_policy(remote: &crate::remote::RemoteHost, host: &crate::config::HostConfig) -> Option<Policy> {
-    let bin = crate::config::remote_herdr_expr(host.remote_bin.as_deref(), host.session.as_deref());
+pub async fn remote_policy(
+    remote: &crate::remote::RemoteHost,
+    host: &crate::config::HostConfig,
+) -> Option<Policy> {
+    if matches!(&host.kind, crate::config::HostKind::Windows) {
+        return Some(Policy::Follow);
+    }
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &host.kind,
+        host.remote_bin.as_deref(),
+        host.session.as_deref(),
+    );
     // Pass the reported path as data to POSIX sh, never interpolate it into
     // shell source. Missing config means Herdr's default; read errors don't.
     let reader = r#"IFS= read -r config || exit 1
 case "$config" in /*) ;; *) exit 1 ;; esac
 if [ -f "$config" ]; then cat "$config"; elif [ ! -e "$config" ]; then :; else exit 1; fi"#;
-    let cmd = format!("{bin} --help | sed -n 's/^Config: //p' | sh -c {}", crate::pane::sh_quote(reader));
+    let cmd = format!(
+        "{bin} --help | sed -n 's/^Config: //p' | sh -c {}",
+        crate::pane::sh_quote(reader)
+    );
     parse(&remote.exec(&cmd, 3000).await.ok()?)
 }
 
@@ -98,21 +128,29 @@ mod tests {
             ("[terminal]\nnew_cwd = '~'", Some(Policy::Path("~".into()))),
             ("[terminal]\nnew_cwd = 2", None),
             ("[broken", None),
-        ] { assert_eq!(parse(text), expected, "{text}"); }
+        ] {
+            assert_eq!(parse(text), expected, "{text}");
+        }
     }
 
+    #[cfg(unix)]
     #[test]
     fn expands_only_resolvable_fixed_paths() {
         let home = Path::new("/home/person");
         for (policy, expected) in [
             (Policy::Home, Some("/home/person")),
             (Policy::Path("~".into()), Some("/home/person")),
-            (Policy::Path("~/projects".into()), Some("/home/person/projects")),
+            (
+                Policy::Path("~/projects".into()),
+                Some("/home/person/projects"),
+            ),
             (Policy::Path("/projects".into()), Some("/projects")),
             (Policy::Path("relative".into()), None),
             (Policy::Follow, None),
             (Policy::Current, None),
-        ] { assert_eq!(fixed_path(&policy, home), expected.map(PathBuf::from)); }
+        ] {
+            assert_eq!(fixed_path(&policy, home), expected.map(PathBuf::from));
+        }
     }
 
     #[test]
@@ -120,15 +158,43 @@ mod tests {
         for kind in ["tab", "workspace", "split"] {
             assert!(inherit(kind, None));
             assert!(inherit(kind, Some(&Policy::Follow)));
-            for policy in [Policy::Home, Policy::Current, Policy::Path("/projects".into())] {
+            for policy in [
+                Policy::Home,
+                Policy::Current,
+                Policy::Path("/projects".into()),
+            ] {
                 assert_eq!(inherit(kind, Some(&policy)), kind == "split");
             }
         }
     }
 
+    #[tokio::test]
+    async fn windows_hosts_follow_without_remote_config_probe() {
+        let host = crate::config::HostConfig {
+            name: "windows".into(),
+            target: "windows-host".into(),
+            kind: crate::config::HostKind::Windows,
+            docker_bin: "docker".into(),
+            prefix: "windows".into(),
+            remote_bin: Some(r"C:\tools\herdr.exe".into()),
+            relay_bin: Some(r"C:\tools\herdr-mirror.exe".into()),
+            session: Some("team".into()),
+            api_transport: crate::config::ApiTransport::Auto,
+            always_control: true,
+            max_cols: None,
+            max_rows: None,
+        };
+        let remote = crate::remote::RemoteHost::new(&host, Path::new("/tmp/herdr-mirror-test"));
+        assert_eq!(remote_policy(&remote, &host).await, Some(Policy::Follow));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn reads_the_binarys_reported_config_path() {
-        assert_eq!(path_from_help("Usage: herdr\nConfig: /tmp/herdr-dev/config.toml\nLogs: elsewhere"), Some("/tmp/herdr-dev/config.toml".into()));
+        assert_eq!(
+            path_from_help("Usage: herdr\nConfig: /tmp/herdr-dev/config.toml\nLogs: elsewhere"),
+            Some("/tmp/herdr-dev/config.toml".into())
+        );
         assert_eq!(path_from_help("Config: relative/config.toml"), None);
         assert_eq!(path_from_help("no config path"), None);
     }

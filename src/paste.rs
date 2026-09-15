@@ -46,7 +46,11 @@ async fn read_clipboard_image() -> Option<Vec<u8>> {
         if let Some(bytes) = run_capture("wl-paste", &["-t", "image/png"]).await {
             return Some(bytes);
         }
-        run_capture("xclip", &["-selection", "clipboard", "-t", "image/png", "-o"]).await
+        run_capture(
+            "xclip",
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        )
+        .await
     }
 }
 
@@ -58,7 +62,10 @@ async fn run_capture(bin: &str, args: &[&str]) -> Option<Vec<u8>> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let out = timeout(CLIPBOARD_TIMEOUT, child.wait_with_output()).await.ok()?.ok()?;
+    let out = timeout(CLIPBOARD_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
     (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
 }
 
@@ -98,7 +105,12 @@ async fn upload_named(
     container: Option<&ContainerArg>,
 ) -> Result<String> {
     let ext = ext
-        .map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect::<String>())
+        .map(|e| {
+            e.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(16)
+                .collect::<String>()
+        })
         .filter(|e| !e.is_empty())
         .unwrap_or_else(|| "bin".into());
     // The counter, not just the clock: a multi-file drop can finish two
@@ -129,7 +141,11 @@ async fn upload_named(
         .map_err(|_| err("upload timed out"))??;
     if !out.status.success() {
         let tail = String::from_utf8_lossy(&out.stderr);
-        let tail = tail.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("upload failed");
+        let tail = tail
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("upload failed");
         return Err(err(tail.to_string()));
     }
     let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -149,7 +165,10 @@ async fn remote_command(
     Ok(match container {
         Some(ct) => {
             let ids = crate::docker::resolve(&ct.docker_bin, &ct.kind).await?;
-            let id = ids.into_iter().next().ok_or_else(|| err("container not found"))?;
+            let id = ids
+                .into_iter()
+                .next()
+                .ok_or_else(|| err("container not found"))?;
             let mut c = Command::new(&ct.docker_bin);
             c.args(["exec", "-i", &id, "sh", "-c", cmd]);
             c
@@ -227,10 +246,25 @@ pub fn dropped_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
             // the escape is the terminal's, not the shell's: the next char is
             // literal whatever it is. A trailing lone backslash is kept rather
             // than rejecting the payload, matching herdr's unescape.
-            '\\' => match chars.next() {
-                Some(next) => current.push(next),
-                None => current.push('\\'),
-            },
+            '\\' => {
+                #[cfg(not(windows))]
+                match chars.next() {
+                    Some(next) => current.push(next),
+                    None => current.push('\\'),
+                }
+                #[cfg(windows)]
+                match chars.next() {
+                    // Windows paths use backslashes as separators. Only treat
+                    // the terminal's escaped whitespace as an escape; all
+                    // other backslashes belong to the path.
+                    Some(next @ (' ' | '\\')) => current.push(next),
+                    Some(next) => {
+                        current.push('\\');
+                        current.push(next);
+                    }
+                    None => current.push('\\'),
+                }
+            }
             '\'' | '"' if quote.is_none() => quote = Some(ch),
             _ if Some(ch) == quote => quote = None,
             ' ' if quote.is_none() => {
@@ -245,8 +279,7 @@ pub fn dropped_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
         tokens.push(current);
     }
 
-    let paths: Vec<std::path::PathBuf> =
-        tokens.into_iter().map(std::path::PathBuf::from).collect();
+    let paths: Vec<std::path::PathBuf> = tokens.into_iter().map(std::path::PathBuf::from).collect();
     let all_files = paths
         .iter()
         .all(|p| p.is_absolute() && std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false));
@@ -279,7 +312,11 @@ async fn remote_has_all(
         .await
         .map_err(|_| err("remote existence check timed out"))??;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let lines: Vec<&str> = stdout.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     // a short or garbled answer means "don't know", which must not read as
     // "all present" — that would skip the upload and paste useless local paths
     Ok(lines.len() == paths.len() && lines.iter().all(|l| *l == "1"))
@@ -325,7 +362,11 @@ pub async fn files_to_remote(
 
     match remote_has_all(paths, ssh_target, ctl_path, container).await {
         Ok(true) => {
-            return DropResult { text: None, unchanged: true, error: None };
+            return DropResult {
+                text: None,
+                unchanged: true,
+                error: None,
+            };
         }
         Ok(false) => {}
         // a failed probe must not block the drop: uploading is the safe guess
@@ -369,7 +410,10 @@ async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let read = file.take(MAX_DROP_BYTES + 1).read_to_end(&mut buf).await?;
     if read as u64 > MAX_DROP_BYTES {
-        return Err(err(format!("larger than {} MB", MAX_DROP_BYTES / (1024 * 1024))));
+        return Err(err(format!(
+            "larger than {} MB",
+            MAX_DROP_BYTES / (1024 * 1024)
+        )));
     }
     Ok(buf)
 }
@@ -380,7 +424,10 @@ mod tests {
 
     #[test]
     fn osascript_data_literal_decodes() {
-        assert_eq!(parse_osascript_data("«data PNGf48656c6c6f»\n"), Some(b"Hello".to_vec()));
+        assert_eq!(
+            parse_osascript_data("«data PNGf48656c6c6f»\n"),
+            Some(b"Hello".to_vec())
+        );
         let png = parse_osascript_data("«data PNGf89504e470d0a1a0a»").unwrap();
         assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G']);
     }
@@ -399,7 +446,10 @@ mod tests {
         let b = bracketed("/home/u/.cache/herdr-mirror/pastes/p.png");
         assert!(b.starts_with(b"\x1b[200~"));
         assert!(b.ends_with(b"\x1b[201~"));
-        assert_eq!(&b[6..b.len() - 6], b"/home/u/.cache/herdr-mirror/pastes/p.png");
+        assert_eq!(
+            &b[6..b.len() - 6],
+            b"/home/u/.cache/herdr-mirror/pastes/p.png"
+        );
     }
 
     /// Real terminal output, captured by dragging onto a pane: absolute paths,
@@ -420,7 +470,10 @@ mod tests {
 
         // two files: the separating space is NOT escaped
         let two = format!("{one} {}", plain.display());
-        assert_eq!(dropped_paths(&two), Some(vec![spaced.clone(), plain.clone()]));
+        assert_eq!(
+            dropped_paths(&two),
+            Some(vec![spaced.clone(), plain.clone()])
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -435,7 +488,10 @@ mod tests {
         // relative paths are not drops (a drop is always absolute)
         assert_eq!(dropped_paths("src/paste.rs"), None);
         // a directory is not a file
-        assert_eq!(dropped_paths(&std::env::temp_dir().display().to_string()), None);
+        assert_eq!(
+            dropped_paths(&std::env::temp_dir().display().to_string()),
+            None
+        );
     }
 
     #[test]
@@ -455,9 +511,14 @@ mod tests {
         // extension comes from user data, so it must survive nothing but
         // alphanumerics
         let san = |e: Option<&str>| {
-            e.map(|e| e.chars().filter(|c| c.is_ascii_alphanumeric()).take(16).collect::<String>())
-                .filter(|e| !e.is_empty())
-                .unwrap_or_else(|| "bin".into())
+            e.map(|e| {
+                e.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(16)
+                    .collect::<String>()
+            })
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| "bin".into())
         };
         assert_eq!(san(Some("png")), "png");
         assert_eq!(san(Some("tar.gz")), "targz");
@@ -478,13 +539,23 @@ mod tests {
         let esc = spaced.display().to_string().replace(' ', "\\ ");
         assert_eq!(dropped_paths(&esc), Some(vec![spaced.clone()]));
         // some terminals quote instead of escaping
-        assert_eq!(dropped_paths(&format!("'{}'", spaced.display())), Some(vec![spaced.clone()]));
-        assert_eq!(dropped_paths(&format!("\"{}\"", spaced.display())), Some(vec![spaced.clone()]));
+        assert_eq!(
+            dropped_paths(&format!("'{}'", spaced.display())),
+            Some(vec![spaced.clone()])
+        );
+        assert_eq!(
+            dropped_paths(&format!("\"{}\"", spaced.display())),
+            Some(vec![spaced.clone()])
+        );
 
         // a trailing lone backslash is kept, not a reason to reject
         let plain = dir.join("c.png");
         std::fs::write(&plain, b"y").unwrap();
-        assert_eq!(dropped_paths(&format!("{}\\", plain.display())), None, "no such file with a trailing backslash");
+        assert_eq!(
+            dropped_paths(&format!("{}\\", plain.display())),
+            None,
+            "no such file with a trailing backslash"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

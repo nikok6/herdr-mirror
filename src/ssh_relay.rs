@@ -22,7 +22,6 @@
 // a small python3 stdio↔unix bridge (see `python_bridge_command`) — chosen
 // once per host by `detect_relay_command` and reused for every connection.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -30,14 +29,18 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::docker::validate_socket_path;
+use crate::platform::{self, LocalStream};
 use crate::remote::RemoteHost;
 use crate::util::{err, Logger, Result};
+
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const STDERR_CLEANUP_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_RELAY_STDERR_BYTES: u64 = 4096;
 
 /// A remote stdio↔unix bridge, run once and reused across probes: not worth
 /// re-detecting on every reconnect within a daemon's lifetime, and `remote`
@@ -53,6 +56,14 @@ pub struct RelayCommand {
 }
 
 impl RelayCommand {
+    /// Build a relay command supplied by a trusted remote command contract.
+    pub fn prebuilt(cmd: impl Into<String>) -> Self {
+        Self {
+            cmd: cmd.into(),
+            tool: "fixed remote relay",
+        }
+    }
+
     pub fn tool(&self) -> &'static str {
         self.tool
     }
@@ -63,11 +74,29 @@ impl RelayCommand {
 /// Errors when neither exists — a clear "install one" beats a silent hang.
 pub async fn detect_relay_command(host: &RemoteHost, remote_sock: &str) -> Result<RelayCommand> {
     validate_socket_path(remote_sock)?;
-    if !host.exec("command -v socat", 8000).await.unwrap_or_default().trim().is_empty() {
-        return Ok(RelayCommand { cmd: socat_bridge_command(remote_sock), tool: "socat" });
+    if !host
+        .exec("command -v socat", 8000)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Ok(RelayCommand {
+            cmd: socat_bridge_command(remote_sock),
+            tool: "socat",
+        });
     }
-    if !host.exec("command -v python3", 8000).await.unwrap_or_default().trim().is_empty() {
-        return Ok(RelayCommand { cmd: python_bridge_command(remote_sock), tool: "python3" });
+    if !host
+        .exec("command -v python3", 8000)
+        .await
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Ok(RelayCommand {
+            cmd: python_bridge_command(remote_sock),
+            tool: "python3",
+        });
     }
     Err(err(
         "remote has neither socat nor python3, which one of is needed to reach herdr's \
@@ -146,12 +175,14 @@ while True:
     format!("python3 -c '{BRIDGE}' '{sock_b64}'")
 }
 
-/// Where and how to reach the remote: reuses the daemon's own ControlMaster
-/// (`-S ctl_path`) so a relay exec costs no new ssh handshake, exactly like
-/// every other multiplexed exec this daemon already runs.
+/// Where and how to reach the remote. `ctl_path` is `Some` when the daemon's
+/// own ControlMaster can be reused (`-S ctl_path`), so a relay exec costs no
+/// new ssh handshake, exactly like every other multiplexed exec this daemon
+/// runs. It is `None` when multiplexing is unavailable or unsafe — see
+/// `RemoteHost::uses_control_master` — and each relay then pays a handshake.
 #[derive(Debug, Clone)]
 struct ExecTarget {
-    ctl_path: PathBuf,
+    ctl_path: Option<PathBuf>,
     ssh_target: String,
     relay_cmd: RelayCommand,
 }
@@ -159,14 +190,30 @@ struct ExecTarget {
 impl ExecTarget {
     fn relay_child(&self) -> Result<tokio::process::Child> {
         let mut cmd = Command::new("ssh");
-        cmd.args([
-            "-S",
-            &self.ctl_path.display().to_string(),
-            "-o",
-            "BatchMode=yes",
-            &self.ssh_target,
-            &self.relay_cmd.cmd,
-        ]);
+        match &self.ctl_path {
+            Some(ctl) => {
+                cmd.args([
+                    "-S",
+                    &ctl.display().to_string(),
+                    "-o",
+                    "BatchMode=yes",
+                    &self.ssh_target,
+                    &self.relay_cmd.cmd,
+                ]);
+            }
+            // Explicit, not merely omitted: the user's ssh_config may enable
+            // ControlMaster for this host, which would put multiplexing back.
+            None => {
+                cmd.args([
+                    "-o",
+                    "ControlPath=none",
+                    "-o",
+                    "BatchMode=yes",
+                    &self.ssh_target,
+                    &self.relay_cmd.cmd,
+                ]);
+            }
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // kept, not nulled: an sshd that killed the channel, or a relay
@@ -176,7 +223,8 @@ impl ExecTarget {
             // if we drop the connection the child must die rather than linger
             // holding an exec channel open on the ControlMaster
             .kill_on_drop(true);
-        cmd.spawn().map_err(|e| err(format!("ssh exec (relay) failed: {e}")))
+        cmd.spawn()
+            .map_err(|e| err(format!("ssh exec (relay) failed: {e}")))
     }
 }
 
@@ -188,24 +236,33 @@ impl ExecTarget {
 /// comments for the accept-loop and shutdown reasoning, which apply unchanged
 /// here.
 pub fn serve_relay(
-    ctl_path: PathBuf,
+    ctl_path: Option<PathBuf>,
     ssh_target: String,
     relay_cmd: RelayCommand,
     local_sock: PathBuf,
     log: Logger,
 ) -> Result<RelayHandle> {
-    let target = ExecTarget { ctl_path, ssh_target, relay_cmd };
-    let _ = std::fs::remove_file(&local_sock);
+    let target = ExecTarget {
+        ctl_path,
+        ssh_target,
+        relay_cmd,
+    };
+    let _ = platform::remove_endpoint(&local_sock);
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let listener = UnixListener::bind(&local_sock)
+    let mut listener = platform::LocalListener::bind(&local_sock)
         .map_err(|e| err(format!("cannot bind {}: {e}", local_sock.display())))?;
     // anyone who can connect here drives the remote herdr API unauthenticated,
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
-    if let Err(e) = std::fs::set_permissions(&local_sock, std::fs::Permissions::from_mode(0o600)) {
-        log.log(&format!("relay: cannot restrict {}: {e}", local_sock.display()));
+    if let Err(e) = platform::set_private_endpoint(&local_sock) {
+        drop(listener);
+        let _ = platform::remove_endpoint(&local_sock);
+        return Err(err(format!(
+            "cannot restrict relay endpoint {}: {e}",
+            local_sock.display()
+        )));
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -215,7 +272,7 @@ pub fn serve_relay(
         loop {
             let stream = tokio::select! {
                 accepted = listener.accept() => match accepted {
-                    Ok((s, _)) => s,
+                    Ok(s) => s,
                     Err(e) => {
                         consecutive_errors += 1;
                         log.log(&format!("exec relay accept failed ({consecutive_errors}): {e}"));
@@ -241,7 +298,11 @@ pub fn serve_relay(
             });
         }
     });
-    Ok(RelayHandle { path, task, shutdown: shutdown_tx })
+    Ok(RelayHandle {
+        path,
+        task,
+        shutdown: shutdown_tx,
+    })
 }
 
 async fn wait_shutdown(mut rx: watch::Receiver<bool>) {
@@ -264,17 +325,30 @@ impl Drop for RelayHandle {
     fn drop(&mut self) {
         let _ = self.shutdown.send(true);
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
+        let _ = platform::remove_endpoint(&self.path);
     }
 }
 
 /// Copy bytes both ways until the remote side closes or we are shut down.
-async fn pump(target: &ExecTarget, stream: UnixStream, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn pump(
+    target: &ExecTarget,
+    stream: LocalStream,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let mut child = target.relay_child()?;
-    let mut cin = child.stdin.take().ok_or_else(|| err("relay: no child stdin"))?;
-    let mut cout = child.stdout.take().ok_or_else(|| err("relay: no child stdout"))?;
-    let mut cerr = child.stderr.take().ok_or_else(|| err("relay: no child stderr"))?;
-    let (mut lr, mut lw) = stream.into_split();
+    let mut cin = child
+        .stdin
+        .take()
+        .ok_or_else(|| err("relay: no child stdin"))?;
+    let mut cout = child
+        .stdout
+        .take()
+        .ok_or_else(|| err("relay: no child stdout"))?;
+    let cerr = child
+        .stderr
+        .take()
+        .ok_or_else(|| err("relay: no child stderr"))?;
+    let (mut lr, mut lw) = platform::split(stream);
 
     // Client → remote. Finishing means the client half-closed after sending
     // its request, which is NOT the end of the exchange: forward the EOF and
@@ -315,21 +389,91 @@ async fn pump(target: &ExecTarget, stream: UnixStream, shutdown: watch::Receiver
         _ = wait_shutdown(shutdown) => {}
     }
     upper.abort();
+    let _ = upper.await;
+
+    // Do not rely on Child's Drop implementation for cleanup: an SSH child can
+    // keep an exec channel (and descendants such as a ProxyCommand) alive after
+    // the local stream has gone away. Terminate it first, reap it with a bound,
+    // and only then inspect stderr for the diagnostic.
+    let _ = child.start_kill();
+    let _ = timeout(CHILD_CLEANUP_TIMEOUT, child.wait()).await;
 
     // surface why the relay gave up, instead of presenting every distinct
     // fault as an indistinguishable "connection closed"
-    let mut errtext = String::new();
-    let _ = timeout(Duration::from_millis(200), cerr.read_to_string(&mut errtext)).await;
-    let errtext = errtext.trim();
+    let mut errbytes = Vec::new();
+    let mut limited_stderr = cerr.take(MAX_RELAY_STDERR_BYTES);
+    let _ = timeout(
+        STDERR_CLEANUP_TIMEOUT,
+        limited_stderr.read_to_end(&mut errbytes),
+    )
+    .await;
+    let errtext = String::from_utf8_lossy(&errbytes);
+    let errtext = relay_fault(&errtext);
     if !errtext.is_empty() {
         return Err(err(format!("relay: {errtext}")));
     }
     Ok(())
 }
 
+/// Reduce a relay child's stderr to the part that actually indicates a fault.
+///
+/// Anything on stderr used to mean failure, but `ssh` also writes purely
+/// informational notices there — OpenSSH 10 warns on every connection to a
+/// server without post-quantum key exchange. Treating those as faults turns a
+/// healthy relay into a permanent reconnect loop, so they are dropped and an
+/// otherwise-quiet stderr reports success.
+fn relay_fault(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !is_ssh_notice(l))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn is_ssh_notice(line: &str) -> bool {
+    // OpenSSH prefixes these advisories with `**`; the banner text itself is
+    // version-specific, so match the marker rather than the wording.
+    line.starts_with("**")
+        || line.starts_with("Warning: Permanently added")
+        || line.starts_with("Pseudo-terminal will not be allocated")
+}
+
+#[cfg(test)]
+mod relay_fault_tests {
+    use super::relay_fault;
+
+    #[test]
+    fn openssh_advisories_are_not_faults() {
+        let banner = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                      ** This session may be vulnerable to \"store now, decrypt later\" attacks.\n\
+                      ** The server may need to be upgraded. See https://openssh.com/pq.html\n";
+        assert_eq!(relay_fault(banner), "");
+        assert_eq!(relay_fault("   \n\n"), "");
+        assert_eq!(
+            relay_fault("Warning: Permanently added 'host' to the list of known hosts."),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_real_fault_survives_alongside_an_advisory() {
+        let mixed = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n\
+                     herdr server is not running\n";
+        assert_eq!(relay_fault(mixed), "herdr server is not running");
+        assert_eq!(
+            relay_fault("Permission denied (publickey).\nsomething else\n"),
+            "Permission denied (publickey).; something else"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     /// The socat form is a cross-process contract with the remote's socat, and
     /// the path must arrive whole: `UNIX-CONNECT:` takes the rest of the word
@@ -337,17 +481,30 @@ mod tests {
     #[test]
     fn socat_command_uses_dash_stdio_form() {
         let cmd = socat_bridge_command("/home/vscode/.config/herdr/herdr.sock");
-        assert_eq!(cmd, "socat - UNIX-CONNECT:/home/vscode/.config/herdr/herdr.sock");
+        assert_eq!(
+            cmd,
+            "socat - UNIX-CONNECT:/home/vscode/.config/herdr/herdr.sock"
+        );
     }
 
     /// A relay reports which bridge it is, so the log line can say so: catching
     /// a per-request relay child in `ps` after the fact is not a diagnostic.
     #[test]
     fn relay_command_reports_its_tool() {
-        let socat = RelayCommand { cmd: socat_bridge_command("/tmp/x.sock"), tool: "socat" };
+        let socat = RelayCommand {
+            cmd: socat_bridge_command("/tmp/x.sock"),
+            tool: "socat",
+        };
         assert_eq!(socat.tool(), "socat");
-        let py = RelayCommand { cmd: python_bridge_command("/tmp/x.sock"), tool: "python3" };
+        let py = RelayCommand {
+            cmd: python_bridge_command("/tmp/x.sock"),
+            tool: "python3",
+        };
         assert_eq!(py.tool(), "python3");
+        assert_eq!(
+            RelayCommand::prebuilt("exec C:\\relay.exe relay").tool(),
+            "fixed remote relay"
+        );
     }
 
     /// The response half must be written in full. `os.write` returns a count,
@@ -356,7 +513,10 @@ mod tests {
     fn python_bridge_loops_until_the_write_completes() {
         let cmd = python_bridge_command("/tmp/x.sock");
         assert!(cmd.contains("n=os.write(1,b)"), "{cmd}");
-        assert!(cmd.contains("b=b[n:]"), "expected the remainder to be re-written: {cmd}");
+        assert!(
+            cmd.contains("b=b[n:]"),
+            "expected the remainder to be re-written: {cmd}"
+        );
     }
 
     /// The socket path must never appear verbatim in the command line: it is
@@ -366,9 +526,15 @@ mod tests {
     fn python_bridge_never_interpolates_the_raw_path() {
         let sock = "/tmp/x'; rm -rf ~ #.sock";
         let cmd = python_bridge_command(sock);
-        assert!(!cmd.contains(sock), "raw socket path leaked into the command line: {cmd}");
+        assert!(
+            !cmd.contains(sock),
+            "raw socket path leaked into the command line: {cmd}"
+        );
         let b64 = B64.encode(sock.as_bytes());
-        assert!(cmd.contains(&b64), "expected the base64 form present: {cmd}");
+        assert!(
+            cmd.contains(&b64),
+            "expected the base64 form present: {cmd}"
+        );
     }
 
     #[test]
@@ -377,7 +543,10 @@ mod tests {
         // an embedded one would end the quoting early and corrupt the command
         let cmd = python_bridge_command("/tmp/x.sock");
         let inner = cmd.split('\'').nth(1).expect("script segment");
-        assert!(!inner.contains('\''), "script must not contain single quotes: {inner}");
+        assert!(
+            !inner.contains('\''),
+            "script must not contain single quotes: {inner}"
+        );
     }
 
     /// End-to-end relay check against a real unix socket over a real ssh
@@ -389,6 +558,7 @@ mod tests {
     ///   HERDR_MIRROR_IT_SSH_TARGET=my-host.example \
     ///   HERDR_MIRROR_IT_SSH_SOCK=/home/user/.config/herdr/herdr.sock \
     ///   cargo test -- --ignored --nocapture relay_reaches_real_ssh_host
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore]
     async fn relay_reaches_real_ssh_host() {
@@ -423,26 +593,45 @@ mod tests {
             .expect("ssh master spawn");
         assert!(start.success(), "ssh ControlMaster failed to start");
 
-        let relay_cmd =
-            RelayCommand { cmd: python_bridge_command(&sock), tool: "python3" };
-        let handle = serve_relay(ctl_path.clone(), ssh_target.clone(), relay_cmd, local_sock.clone(), Logger::new(&dir, false))
-            .unwrap();
+        let relay_cmd = RelayCommand {
+            cmd: python_bridge_command(&sock),
+            tool: "python3",
+        };
+        let handle = serve_relay(
+            Some(ctl_path.clone()),
+            ssh_target.clone(),
+            relay_cmd,
+            local_sock.clone(),
+            Logger::new(&dir, false),
+        )
+        .unwrap();
 
-        let mode = std::fs::metadata(&handle.path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&handle.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
 
-        let api = crate::api::ApiClient::connect(&handle.path).await.expect("ping through exec relay");
+        let api = crate::api::ApiClient::connect(&handle.path)
+            .await
+            .expect("ping through exec relay");
         eprintln!("ping ok");
 
         let snap = api
             .request("session.snapshot", serde_json::json!({}))
             .await
             .expect("session.snapshot through exec relay");
-        assert!(snap.pointer("/snapshot/workspaces").is_some(), "snapshot shape: {snap}");
+        assert!(
+            snap.pointer("/snapshot/workspaces").is_some(),
+            "snapshot shape: {snap}"
+        );
         eprintln!("snapshot ok ({} bytes)", snap.to_string().len());
 
         for _ in 0..5 {
-            api.request("session.snapshot", serde_json::json!({})).await.expect("repeat request");
+            api.request("session.snapshot", serde_json::json!({}))
+                .await
+                .expect("repeat request");
         }
         eprintln!("5 sequential requests ok");
 
@@ -453,4 +642,128 @@ mod tests {
             .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Removes the test's temp dir even when an assertion unwinds. No ssh
+    /// master to tear down: this test deliberately runs unmultiplexed.
+    #[cfg(unix)]
+    struct WindowsRelayItCleanup {
+        dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for WindowsRelayItCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// End-to-end check of the *real* Unix→Windows API relay. Uses the Windows
+    /// `herdr-mirror.exe relay` path instead of a manual socat/python bridge,
+    /// exercising the prebuilt relay command.
+    ///
+    /// Deliberately runs with NO ControlMaster and checks CONCURRENT
+    /// connections, because that is what the daemon does and what a sequential
+    /// multiplexed check misses: two exec channels opened at once on one master
+    /// against Windows sshd can return a truncated or empty stream.
+    ///
+    /// Requires:
+    ///   HERDR_MIRROR_IT_WINDOWS_TARGET=<ssh target of the Windows host>
+    ///   HERDR_MIRROR_IT_WINDOWS_RELAY_BIN=<remote path to herdr-mirror.exe>
+    /// Optional:
+    ///   HERDR_MIRROR_IT_WINDOWS_SESSION=<session-name>
+    ///
+    /// Run with:
+    ///   HERDR_MIRROR_IT_WINDOWS_TARGET=win-box \
+    ///   HERDR_MIRROR_IT_WINDOWS_RELAY_BIN='C:\tools\herdr-mirror.exe' \
+    ///   cargo test -- --ignored --nocapture relay_reaches_windows_api
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn relay_reaches_windows_api() {
+        let Ok(target) = std::env::var("HERDR_MIRROR_IT_WINDOWS_TARGET") else {
+            eprintln!("skipped: set HERDR_MIRROR_IT_WINDOWS_TARGET");
+            return;
+        };
+        let session: Option<String> = std::env::var("HERDR_MIRROR_IT_WINDOWS_SESSION").ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-it-win-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local_sock = dir.join("it-api.sock");
+        let _cleanup = WindowsRelayItCleanup { dir: dir.clone() };
+
+        // Build the fixed Windows relay command (herdr-mirror.exe relay).
+        let relay_bin = std::env::var("HERDR_MIRROR_IT_WINDOWS_RELAY_BIN")
+            .expect("set HERDR_MIRROR_IT_WINDOWS_RELAY_BIN to the remote herdr-mirror.exe path");
+        let relay_cmd = RelayCommand::prebuilt(
+            crate::config::fixed_relay_command(
+                &crate::config::HostKind::Windows,
+                &relay_bin,
+                session.as_deref(),
+            )
+            .unwrap(),
+        );
+
+        // None: no ControlMaster, matching what the daemon uses for a Windows
+        // host.
+        let handle = serve_relay(
+            None,
+            target.clone(),
+            relay_cmd,
+            local_sock.clone(),
+            Logger::new(&dir, false),
+        )
+        .unwrap();
+
+        // The local relay socket must be 0600 (same as ssh -L).
+        let mode = std::fs::metadata(&handle.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+
+        // First connection: ping + snapshot through the relay.
+        let api = crate::api::ApiClient::connect(&handle.path)
+            .await
+            .expect("ping through windows exec relay");
+        eprintln!("ping ok");
+
+        let snap = api
+            .request("session.snapshot", serde_json::json!({}))
+            .await
+            .expect("session.snapshot through windows exec relay");
+        assert!(
+            snap.pointer("/snapshot/workspaces").is_some(),
+            "snapshot shape: {snap}"
+        );
+        eprintln!("snapshot ok ({} bytes)", snap.to_string().len());
+
+        // Four CONCURRENT API connections through the same listener. The daemon
+        // overlaps the events subscription with ordinary requests, so this — not
+        // a sequential loop — is the shape that has to hold.
+        let mut tasks = Vec::new();
+        for i in 0..4 {
+            let path = handle.path.clone();
+            tasks.push(tokio::spawn(async move {
+                let fresh = crate::api::ApiClient::connect(&path)
+                    .await
+                    .unwrap_or_else(|e| panic!("concurrent connection {i}: {e}"));
+                fresh
+                    .request("ping", serde_json::json!({}))
+                    .await
+                    .unwrap_or_else(|e| panic!("ping on concurrent connection {i}: {e}"));
+            }));
+        }
+        for t in tasks {
+            t.await.expect("concurrent relay connection panicked");
+        }
+        eprintln!("4 concurrent connections ok");
+
+        drop(handle);
+        // _cleanup removes the temp dir on the way out.
+    }
+
 }
