@@ -2235,37 +2235,6 @@ mod tests {
         );
     }
 
-    /// A Windows host has no remote resolver to fall back on: if remote_bin
-    /// does not reach the streamer, it builds `exec  terminal session ...`
-    /// with an empty binary and every mirror pane stays blank. It also must
-    /// not be handed a ControlMaster, which Windows sshd multiplexes unsafely.
-    #[cfg(unix)]
-    #[test]
-    fn windows_pane_argv_carries_remote_bin_and_no_ctl_path() {
-        let mut host = ssh_host();
-        host.kind = crate::config::HostKind::Windows;
-        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
-        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
-        let argv = cmd("w1:p1");
-        assert_eq!(
-            argv[1..],
-            [
-                "pane",
-                "vps",
-                "w1:p1",
-                "--remote-bin",
-                r"C:\tools\herdr.exe",
-                "--always-control",
-                "--windows-host",
-            ]
-        );
-        assert!(
-            !argv.iter().any(|a| a == "--ctl-path"),
-            "a Windows host must not be multiplexed: {argv:?}"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn ssh_pane_argv_carries_remote_session() {
@@ -2369,41 +2338,29 @@ mod tests {
         host.kind = crate::config::HostKind::Windows;
         host.target = "windows".into();
         host.session = Some("team".into());
+        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
+        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
         let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
-        #[cfg(windows)]
+        // Same argv on both platforms: a Windows host is never multiplexed,
+        // whichever OS the client runs on.
         assert_eq!(
             argv[1..],
             [
                 "pane",
                 "windows",
                 "w1:p1",
+                "--remote-bin",
+                r"C:\tools\herdr.exe",
                 "--session",
                 "team",
                 "--always-control",
                 "--windows-host",
-            ]
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            argv[1..],
-            [
-                "pane",
-                "windows",
-                "w1:p1",
-                "--session",
-                "team",
-                "--always-control",
-                "--windows-host",
-                "--ctl-path",
-                "/state/windows.ctl",
             ]
         );
         let parsed = crate::pane::parse_args(&argv[2..]).unwrap();
         assert!(parsed.windows_host);
-        #[cfg(windows)]
+        assert_eq!(parsed.remote_bin.as_deref(), Some(r"C:\tools\herdr.exe"));
         assert_eq!(parsed.ctl_path, None);
-        #[cfg(not(windows))]
-        assert_eq!(parsed.ctl_path.as_deref(), Some("/state/windows.ctl"));
     }
 
     /// An uncapped host's argv must not grow, and a capped one must round-trip
