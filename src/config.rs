@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Deserialize;
 
 use crate::util::{err, Result};
@@ -14,8 +16,101 @@ use crate::util::{err, Result};
 /// `~/.local/bin/herdr` if `command -v` finds nothing. A configured session is
 /// added as Herdr's global `--session` option so every remote command selects
 /// the same server.
+#[allow(dead_code)]
 pub fn remote_herdr_expr(remote_bin: Option<&str>, session: Option<&str>) -> String {
-    let bin = match remote_bin {
+    remote_herdr_expr_for_kind(&HostKind::Ssh, remote_bin, session)
+}
+
+/// Relay executable assumed to sit next to a Windows host's `herdr.exe` when
+/// `relay_bin` is not configured. The relay resolves its own trusted `herdr.exe`
+/// as a sibling (see `relay::trusted_herdr_path`), so "installed side by side"
+/// is already the contract; defaulting to it keeps hosts.toml to one path.
+const WINDOWS_RELAY_FILE_NAME: &str = "herdr-mirror.exe";
+
+const WINDOWS_COMMAND_METACHARS: &[char] = &['\'', '"', '&', '|', ';', '<', '>', '%', '`'];
+
+/// Validate a remote Windows executable path before it becomes the literal
+/// prefix of an `exec <path> ...` ForceCommand.
+///
+/// The wrapper matches that prefix byte-for-byte and neither side quotes it, so
+/// anything the wrapper's grammar could reinterpret has to be rejected here
+/// rather than silently changing which binary runs.
+pub fn validate_windows_bin(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(err("Windows binary path must not be empty"));
+    }
+    if path.chars().any(char::is_control) {
+        return Err(err("Windows binary path contains a control character"));
+    }
+    if path.chars().any(|c| WINDOWS_COMMAND_METACHARS.contains(&c)) {
+        return Err(err("Windows binary path contains command metacharacters"));
+    }
+    if !crate::util::is_absolute_windows_path(path) {
+        return Err(err(
+            "Windows binary path must be absolute (\"C:\\...\" or a UNC path)",
+        ));
+    }
+    Ok(())
+}
+
+/// Derive the default `relay_bin` as `herdr-mirror.exe` beside `remote_bin`.
+pub fn windows_relay_sibling(remote_bin: &str) -> Result<String> {
+    let cut = remote_bin
+        .rfind(['\\', '/'])
+        .ok_or_else(|| err("Windows binary path has no parent directory"))?;
+    Ok(format!(
+        "{}{WINDOWS_RELAY_FILE_NAME}",
+        &remote_bin[..=cut]
+    ))
+}
+
+/// Validate a session selector before it is put into a Windows ForceCommand.
+///
+/// Session selectors are also transported in the relay's base64url value, so
+/// path-like and Unicode characters remain valid. The direct command path is
+/// the boundary that needs to reject shell/ForceCommand grammar instead.
+pub fn validate_windows_session(session: &str) -> Result<()> {
+    if session.is_empty() {
+        return Err(err("Windows session must not be empty"));
+    }
+    if session
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || WINDOWS_COMMAND_METACHARS.contains(&c))
+    {
+        return Err(err(
+            "Windows session contains whitespace, control characters, or command metacharacters",
+        ));
+    }
+    Ok(())
+}
+
+/// Serialize one token for the restricted Windows ForceCommand grammar.
+///
+/// This intentionally does not quote: quoting would make POSIX shell syntax
+/// look valid while still being interpreted by the Windows command wrapper.
+pub fn windows_force_command_token(token: &str) -> Result<String> {
+    validate_windows_session(token)?;
+    if token.contains('\\') {
+        return Err(err("Windows ForceCommand token contains a backslash"));
+    }
+    Ok(token.to_string())
+}
+
+/// Build the command expression accepted by the remote herdr wrapper.
+///
+/// Unix keeps the original resolver and quoting byte-for-byte. Windows hosts
+/// use their configured `remote_bin` directly — there is no remote shell to
+/// resolve a name through, so the path is required by `parse_config` and
+/// validated by `validate_windows_bin`. The configured session is likewise data
+/// validated by the hosts config and is not shell-quoted.
+pub fn remote_herdr_expr_for_kind(
+    kind: &HostKind,
+    remote_bin: Option<&str>,
+    session: Option<&str>,
+) -> String {
+    let bin = match kind {
+        HostKind::Windows => remote_bin.unwrap_or_default().to_string(),
+        HostKind::Ssh | HostKind::DockerContainer(_) | HostKind::DockerFolder(_) => match remote_bin {
         Some(b) if !b.is_empty() => b.to_string(),
         // The `$(...)` substitution must run under a POSIX sh, never the remote
         // login shell: `ssh host cmd` hands the string to that shell, and fish
@@ -26,11 +121,38 @@ pub fn remote_herdr_expr(remote_bin: Option<&str>, session: Option<&str>) -> Str
         // substitution prevent word-splitting if the resolved path contains
         // spaces; ~ still expands inside the unquoted `echo` arg.
         _ => "sh -c 'exec \"$(command -v herdr 2>/dev/null || echo ~/.local/bin/herdr)\" \"$@\"' herdr".into(),
+        },
     };
-    match session {
-        Some(session) => format!("{bin} --session {}", shell_quote(session)),
-        None => bin,
+    match (kind, session) {
+        (HostKind::Windows, Some(session)) => format!("{bin} --session {session}"),
+        (_, Some(session)) => format!("{bin} --session {}", shell_quote(session)),
+        (_, None) => bin,
     }
+}
+
+/// Construct the fixed relay command used by a Windows ForceCommand host.
+/// The session selector is transported as URL-safe base64 so it never becomes
+/// part of the restricted command grammar.
+pub fn fixed_relay_command(
+    kind: &HostKind,
+    relay_bin: &str,
+    session: Option<&str>,
+) -> Result<String> {
+    if !matches!(kind, HostKind::Windows) {
+        return Err(err("fixed relay command requires a Windows host"));
+    }
+    validate_windows_bin(relay_bin)?;
+    let mut command = format!("exec {relay_bin} relay");
+    if let Some(session) = session {
+        validate_windows_session(session)?;
+        if session.len() > 128 {
+            return Err(err("Windows relay session must be 1..=128 bytes without control characters"));
+        }
+        let token = URL_SAFE_NO_PAD.encode(session.as_bytes());
+        command.push_str(" --session-b64=");
+        command.push_str(&token);
+    }
+    Ok(command)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -42,6 +164,8 @@ fn shell_quote(s: &str) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostKind {
     Ssh,
+    /// Windows host reached through the restricted SSH ForceCommand wrapper.
+    Windows,
     /// container named explicitly (brittle: docker regenerates devcontainer
     /// names on rebuild)
     DockerContainer(String),
@@ -52,7 +176,7 @@ pub enum HostKind {
 
 impl HostKind {
     pub fn is_docker(&self) -> bool {
-        !matches!(self, HostKind::Ssh)
+        matches!(self, HostKind::DockerContainer(_) | HostKind::DockerFolder(_))
     }
 }
 
@@ -98,7 +222,13 @@ pub struct HostConfig {
     pub prefix: String,
     /// Remote herdr binary. `None` = auto-resolve on the remote: PATH first
     /// (`command -v herdr`), then `~/.local/bin/herdr`. See `remote_herdr_expr`.
+    /// Required (and always `Some`) for `HostKind::Windows`, which has no
+    /// remote shell to resolve a bare name through.
     pub remote_bin: Option<String>,
+    /// `HostKind::Windows` only: the `herdr-mirror.exe` that serves `relay` on
+    /// the remote. Defaults to the sibling of `remote_bin`; `None` for every
+    /// other kind, which reaches the API through socat/python3 detection.
+    pub relay_bin: Option<String>,
     /// Herdr session name on the remote. `None` selects the default session.
     pub session: Option<String>,
     /// ssh hosts only; see `ApiTransport`. Default `Auto`.
@@ -176,6 +306,7 @@ struct RawHost {
     docker_bin: Option<String>,
     prefix: Option<String>,
     remote_bin: Option<String>,
+    relay_bin: Option<String>,
     session: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
@@ -206,6 +337,13 @@ fn resolve_kind(name: &str, h: &RawHost) -> Result<(HostKind, String)> {
             let target = h.target.clone().ok_or_else(|| bad("missing target".into()))?;
             Ok((HostKind::Ssh, nonempty("target", &target)?))
         }
+        "windows" => {
+            if h.container.is_some() || h.folder.is_some() {
+                return Err(bad("container/folder need kind = \"docker\"".into()));
+            }
+            let target = h.target.clone().ok_or_else(|| bad("missing target".into()))?;
+            Ok((HostKind::Windows, nonempty("target", &target)?))
+        }
         "docker" => {
             // the ssh arm rejects the mirror-image mistake, so silently
             // discarding target here would be an inconsistent trap
@@ -227,7 +365,7 @@ fn resolve_kind(name: &str, h: &RawHost) -> Result<(HostKind, String)> {
                 }
             }
         }
-        other => Err(bad(format!("unknown kind \"{other}\" (expected ssh or docker)"))),
+        other => Err(bad(format!("unknown kind \"{other}\" (expected ssh, windows, or docker)"))),
     }
 }
 
@@ -299,6 +437,61 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 continue;
             }
         };
+        let remote_bin = h.remote_bin.filter(|s| !s.is_empty());
+        let configured_relay_bin = h.relay_bin.filter(|s| !s.is_empty());
+        let configured_session_is_empty = h.session.as_deref() == Some("");
+        let session = h.session.filter(|s| !s.is_empty());
+        // Non-Windows kinds resolve the API relay by probing the remote for
+        // socat/python3, so a relay_bin there would be silently ignored.
+        if !matches!(&kind, HostKind::Windows) && configured_relay_bin.is_some() {
+            warnings.push(format!(
+                "skipping host: [hosts.{name}]: relay_bin needs kind = \"windows\""
+            ));
+            continue;
+        }
+        let mut relay_bin = None;
+        if matches!(&kind, HostKind::Windows) {
+            // No remote shell resolves a bare name here, and the ForceCommand
+            // wrapper matches the path literally, so it has to be explicit.
+            let Some(bin) = remote_bin.as_deref() else {
+                warnings.push(format!(
+                    "skipping host: [hosts.{name}]: kind = \"windows\" needs remote_bin \
+                     (the absolute path to herdr.exe on the remote)"
+                ));
+                continue;
+            };
+            if let Err(e) = validate_windows_bin(bin) {
+                warnings.push(format!("skipping host: [hosts.{name}]: remote_bin: {e}"));
+                continue;
+            }
+            let resolved = match configured_relay_bin {
+                Some(configured) => configured,
+                None => match windows_relay_sibling(bin) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!("skipping host: [hosts.{name}]: remote_bin: {e}"));
+                        continue;
+                    }
+                },
+            };
+            if let Err(e) = validate_windows_bin(&resolved) {
+                warnings.push(format!("skipping host: [hosts.{name}]: relay_bin: {e}"));
+                continue;
+            }
+            relay_bin = Some(resolved);
+            if configured_session_is_empty {
+                warnings.push(format!(
+                    "skipping host: [hosts.{name}]: Windows session must not be empty"
+                ));
+                continue;
+            }
+            if let Some(session) = session.as_deref() {
+                if let Err(e) = validate_windows_session(session) {
+                    warnings.push(format!("skipping host: [hosts.{name}]: {e}"));
+                    continue;
+                }
+            }
+        }
         let api_transport = match h.api_transport.as_deref() {
             None => ApiTransport::Auto,
             Some(s) => match ApiTransport::parse(s) {
@@ -315,8 +508,9 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             // empty string is treated as unset (auto PATH → ~/.local/bin/herdr)
-            remote_bin: h.remote_bin.filter(|s| !s.is_empty()),
-            session: h.session.filter(|s| !s.is_empty()),
+            remote_bin,
+            relay_bin,
+            session,
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
@@ -474,6 +668,124 @@ mod tests {
         assert_eq!(c.hosts[0].target, "work");
         assert_eq!(c.hosts[0].remote_bin, None);
         assert_eq!(c.hosts[0].session, None);
+    }
+
+    #[test]
+    fn parses_windows_hosts_and_uses_the_configured_command_paths() {
+        let c = parse_config(
+            "[hosts.work]\nkind = \"windows\"\ntarget = \"windows-host\"\n\
+             remote_bin = \"C:\\\\tools\\\\herdr.exe\"\nsession = \"team\"\n",
+        )
+        .unwrap();
+        let host = &c.hosts[0];
+        assert_eq!(host.kind, HostKind::Windows);
+        assert!(!host.kind.is_docker());
+        assert_eq!(host.remote_bin.as_deref(), Some(r"C:\tools\herdr.exe"));
+        // relay_bin defaults to the sibling herdr-mirror.exe.
+        assert_eq!(host.relay_bin.as_deref(), Some(r"C:\tools\herdr-mirror.exe"));
+        assert_eq!(
+            remote_herdr_expr_for_kind(&host.kind, host.remote_bin.as_deref(), host.session.as_deref()),
+            r"C:\tools\herdr.exe --session team"
+        );
+    }
+
+    #[test]
+    fn windows_hosts_need_an_absolute_remote_bin_and_may_override_the_relay() {
+        // Missing remote_bin: skipped with a warning, never defaulted to some
+        // other machine's install path.
+        let c = parse_config("[hosts.a]\nkind = \"windows\"\ntarget = \"w\"\n");
+        assert!(c.is_err(), "a Windows host without remote_bin must not load");
+
+        // Relative or metacharacter-bearing paths are rejected, not passed
+        // through into the ForceCommand prefix.
+        for bad in [r"herdr.exe", r"tools\herdr.exe", r"C:\a&b\herdr.exe"] {
+            assert!(
+                validate_windows_bin(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(validate_windows_bin(r"C:\tools\herdr.exe").is_ok());
+        assert!(validate_windows_bin(r"\\host\share\herdr.exe").is_ok());
+
+        let c = parse_config(
+            "[hosts.a]\nkind = \"windows\"\ntarget = \"w\"\n\
+             remote_bin = \"C:\\\\tools\\\\herdr.exe\"\n\
+             relay_bin = \"D:\\\\other\\\\herdr-mirror.exe\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].relay_bin.as_deref(), Some(r"D:\other\herdr-mirror.exe"));
+
+        // relay_bin is meaningless for a kind that probes for socat/python3.
+        assert!(parse_config(
+            "[hosts.a]\ntarget = \"w\"\nrelay_bin = \"D:\\\\x\\\\herdr-mirror.exe\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fixed_windows_relay_command_encodes_session() {
+        let relay = r"C:\tools\herdr-mirror.exe";
+        let command = fixed_relay_command(&HostKind::Windows, relay, Some("team/é")).unwrap();
+        let token = URL_SAFE_NO_PAD.encode("team/é".as_bytes());
+        assert_eq!(command, format!("exec {relay} relay --session-b64={token}"));
+        assert_eq!(
+            fixed_relay_command(&HostKind::Windows, relay, None).unwrap(),
+            format!("exec {relay} relay")
+        );
+        assert!(fixed_relay_command(&HostKind::Ssh, relay, None).is_err());
+        assert!(fixed_relay_command(&HostKind::Windows, relay, Some("bad\nname")).is_err());
+        // A relay path that could re-shape the command is refused here too.
+        assert!(fixed_relay_command(&HostKind::Windows, r"C:\a|b\r.exe", None).is_err());
+    }
+
+    #[test]
+    fn windows_relay_sibling_sits_next_to_the_configured_herdr() {
+        assert_eq!(
+            windows_relay_sibling(r"C:\tools\herdr.exe").unwrap(),
+            r"C:\tools\herdr-mirror.exe"
+        );
+        assert_eq!(
+            windows_relay_sibling(r"\\host\share\bin/herdr.exe").unwrap(),
+            r"\\host\share\bin/herdr-mirror.exe"
+        );
+        assert!(windows_relay_sibling("herdr.exe").is_err());
+    }
+
+    #[test]
+    fn windows_sessions_reject_direct_command_grammar_but_keep_safe_paths() {
+        assert!(validate_windows_session("team/é").is_ok());
+        for unsafe_name in ["", "team name", "team\tname", "team'name", "team\"name", "team&name", "team|name", "team;name", "team<name", "team>name", "team%name", "team`name"] {
+            assert!(validate_windows_session(unsafe_name).is_err(), "accepted {unsafe_name:?}");
+        }
+    }
+
+    #[test]
+    fn windows_force_command_tokens_reject_shell_and_path_separators() {
+        assert_eq!(windows_force_command_token("w1:p1").unwrap(), "w1:p1");
+        for unsafe_token in ["", "w1 p1", "w1'p1", "w1\"p1", "w1&p1", "w1|p1", "w1;p1", "w1<p1", "w1>p1", "w1%p1", "w1`p1", r"w1\p1"] {
+            assert!(
+                windows_force_command_token(unsafe_token).is_err(),
+                "accepted {unsafe_token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_config_rejects_a_missing_or_unsafe_remote_bin_and_unsafe_session() {
+        let config = parse_config(
+            "[hosts.good]\nkind = \"windows\"\ntarget = \"win\"\n\
+             remote_bin = \"C:\\\\tools\\\\herdr.exe\"\nsession = \"team/é\"\n\
+             [hosts.no_bin]\nkind = \"windows\"\ntarget = \"win\"\n\
+             [hosts.bad_bin]\nkind = \"windows\"\ntarget = \"win\"\nremote_bin = \"evil.exe\"\n\
+             [hosts.bad_session]\nkind = \"windows\"\ntarget = \"win\"\n\
+             remote_bin = \"C:\\\\tools\\\\herdr.exe\"\nsession = \"team name\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.hosts.len(), 1);
+        assert_eq!(config.hosts[0].name, "good");
+        assert!(config.warnings.iter().any(|w| w.contains("needs remote_bin")));
+        assert!(config.warnings.iter().any(|w| w.contains("must be absolute")));
+        assert!(config.warnings.iter().any(|w| w.contains("whitespace")));
     }
 
     #[test]

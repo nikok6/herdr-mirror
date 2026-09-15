@@ -41,6 +41,7 @@ pub struct Container {
 fn docker_filter(kind: &HostKind) -> Result<String> {
     match kind {
         HostKind::Ssh => Err(err("container resolution called on an ssh host")),
+        HostKind::Windows => Err(err("container resolution called on a Windows host")),
         // `name=` is a substring match in docker, so pin it with anchors to
         // avoid the same class of collision that broke streamer counting
         HostKind::DockerContainer(name) => Ok(format!("name=^{name}$")),
@@ -256,10 +257,12 @@ pub fn serve_relay(
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
     if let Err(e) = platform::set_private_endpoint(&local_sock) {
-        log.log(&format!(
-            "relay: cannot restrict {}: {e}",
+        drop(listener);
+        let _ = platform::remove_endpoint(&local_sock);
+        return Err(err(format!(
+            "cannot restrict relay endpoint {}: {e}",
             local_sock.display()
-        ));
+        )));
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

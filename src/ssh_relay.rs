@@ -38,6 +38,10 @@ use crate::platform::{self, LocalStream};
 use crate::remote::RemoteHost;
 use crate::util::{err, Logger, Result};
 
+const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const STDERR_CLEANUP_TIMEOUT: Duration = Duration::from_millis(200);
+const MAX_RELAY_STDERR_BYTES: u64 = 4096;
+
 /// A remote stdio↔unix bridge, run once and reused across probes: not worth
 /// re-detecting on every reconnect within a daemon's lifetime, and `remote`
 /// already remembers the *transport* choice across reconnects for the same
@@ -52,6 +56,14 @@ pub struct RelayCommand {
 }
 
 impl RelayCommand {
+    /// Build a relay command supplied by a trusted remote command contract.
+    pub fn prebuilt(cmd: impl Into<String>) -> Self {
+        Self {
+            cmd: cmd.into(),
+            tool: "fixed remote relay",
+        }
+    }
+
     pub fn tool(&self) -> &'static str {
         self.tool
     }
@@ -237,10 +249,12 @@ pub fn serve_relay(
     // which can start agents with arbitrary argv. ssh's -L forward is 0600, so
     // match it rather than inheriting the ambient umask.
     if let Err(e) = platform::set_private_endpoint(&local_sock) {
-        log.log(&format!(
-            "relay: cannot restrict {}: {e}",
+        drop(listener);
+        let _ = platform::remove_endpoint(&local_sock);
+        return Err(err(format!(
+            "cannot restrict relay endpoint {}: {e}",
             local_sock.display()
-        ));
+        )));
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -322,7 +336,7 @@ async fn pump(
         .stdout
         .take()
         .ok_or_else(|| err("relay: no child stdout"))?;
-    let mut cerr = child
+    let cerr = child
         .stderr
         .take()
         .ok_or_else(|| err("relay: no child stderr"))?;
@@ -367,15 +381,25 @@ async fn pump(
         _ = wait_shutdown(shutdown) => {}
     }
     upper.abort();
+    let _ = upper.await;
+
+    // Do not rely on Child's Drop implementation for cleanup: an SSH child can
+    // keep an exec channel (and descendants such as a ProxyCommand) alive after
+    // the local stream has gone away. Terminate it first, reap it with a bound,
+    // and only then inspect stderr for the diagnostic.
+    let _ = child.start_kill();
+    let _ = timeout(CHILD_CLEANUP_TIMEOUT, child.wait()).await;
 
     // surface why the relay gave up, instead of presenting every distinct
     // fault as an indistinguishable "connection closed"
-    let mut errtext = String::new();
+    let mut errbytes = Vec::new();
+    let mut limited_stderr = cerr.take(MAX_RELAY_STDERR_BYTES);
     let _ = timeout(
-        Duration::from_millis(200),
-        cerr.read_to_string(&mut errtext),
+        STDERR_CLEANUP_TIMEOUT,
+        limited_stderr.read_to_end(&mut errbytes),
     )
     .await;
+    let errtext = String::from_utf8_lossy(&errbytes);
     let errtext = errtext.trim();
     if !errtext.is_empty() {
         return Err(err(format!("relay: {errtext}")));
@@ -415,6 +439,10 @@ mod tests {
             tool: "python3",
         };
         assert_eq!(py.tool(), "python3");
+        assert_eq!(
+            RelayCommand::prebuilt("exec C:\\relay.exe relay").tool(),
+            "fixed remote relay"
+        );
     }
 
     /// The response half must be written in full. `os.write` returns a count,
@@ -552,4 +580,158 @@ mod tests {
             .await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[cfg(unix)]
+    struct WindowsRelayItCleanup {
+        dir: PathBuf,
+        ctl_path: PathBuf,
+        target: String,
+        master_started: bool,
+    }
+
+    #[cfg(unix)]
+    impl Drop for WindowsRelayItCleanup {
+        fn drop(&mut self) {
+            if self.master_started {
+                let _ = std::process::Command::new("ssh")
+                    .args([
+                        "-S",
+                        self.ctl_path.to_str().unwrap(),
+                        "-O",
+                        "exit",
+                        &self.target,
+                    ])
+                    .status();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// End-to-end check of the *real* Unix→Windows API relay. Uses the Windows
+    /// `herdr-mirror.exe relay` path instead of a manual socat/python bridge,
+    /// exercising the prebuilt relay command and repeated SSH exec channels
+    /// through the same ControlMaster.
+    ///
+    /// Requires:
+    ///   HERDR_MIRROR_IT_WINDOWS_TARGET=<ssh target of the Windows host>
+    ///   HERDR_MIRROR_IT_WINDOWS_RELAY_BIN=<remote path to herdr-mirror.exe>
+    /// Optional:
+    ///   HERDR_MIRROR_IT_WINDOWS_SESSION=<session-name>
+    ///
+    /// Run with:
+    ///   HERDR_MIRROR_IT_WINDOWS_TARGET=win-box \
+    ///   HERDR_MIRROR_IT_WINDOWS_RELAY_BIN='C:\tools\herdr-mirror.exe' \
+    ///   cargo test -- --ignored --nocapture relay_reaches_windows_api
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn relay_reaches_windows_api() {
+        let Ok(target) = std::env::var("HERDR_MIRROR_IT_WINDOWS_TARGET") else {
+            eprintln!("skipped: set HERDR_MIRROR_IT_WINDOWS_TARGET");
+            return;
+        };
+        let session: Option<String> = std::env::var("HERDR_MIRROR_IT_WINDOWS_SESSION").ok();
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-it-win-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctl_path = dir.join("it.ctl");
+        let local_sock = dir.join("it-api.sock");
+        let mut cleanup = WindowsRelayItCleanup {
+            dir: dir.clone(),
+            ctl_path: ctl_path.clone(),
+            target: target.clone(),
+            master_started: false,
+        };
+
+        // Establish a ControlMaster so relay execs are multiplexed.
+        let start = Command::new("ssh")
+            .args([
+                "-M",
+                "-S",
+                ctl_path.to_str().unwrap(),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ControlPersist=yes",
+                "-f",
+                "-N",
+                &target,
+            ])
+            .status()
+            .await
+            .expect("ssh master spawn");
+        cleanup.master_started = true;
+        assert!(start.success(), "ssh ControlMaster failed to start");
+
+        // Build the fixed Windows relay command (herdr-mirror.exe relay).
+        let relay_bin = std::env::var("HERDR_MIRROR_IT_WINDOWS_RELAY_BIN")
+            .expect("set HERDR_MIRROR_IT_WINDOWS_RELAY_BIN to the remote herdr-mirror.exe path");
+        let relay_cmd = RelayCommand::prebuilt(
+            crate::config::fixed_relay_command(
+                &crate::config::HostKind::Windows,
+                &relay_bin,
+                session.as_deref(),
+            )
+            .unwrap(),
+        );
+
+        let handle = serve_relay(
+            ctl_path.clone(),
+            target.clone(),
+            relay_cmd,
+            local_sock.clone(),
+            Logger::new(&dir, false),
+        )
+        .unwrap();
+
+        // The local relay socket must be 0600 (same as ssh -L).
+        let mode = std::fs::metadata(&handle.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "relay socket must be 0600, got {mode:o}");
+
+        // First connection: ping + snapshot through the relay.
+        let api = crate::api::ApiClient::connect(&handle.path)
+            .await
+            .expect("ping through windows exec relay");
+        eprintln!("ping ok");
+
+        let snap = api
+            .request("session.snapshot", serde_json::json!({}))
+            .await
+            .expect("session.snapshot through windows exec relay");
+        assert!(
+            snap.pointer("/snapshot/workspaces").is_some(),
+            "snapshot shape: {snap}"
+        );
+        eprintln!("snapshot ok ({} bytes)", snap.to_string().len());
+
+        // Three fresh sequential API connections through the same listener,
+        // each creating a new SSH exec channel on the ControlMaster.
+        for i in 0..3 {
+            let fresh = crate::api::ApiClient::connect(&handle.path)
+                .await
+                .unwrap_or_else(|e| panic!("connection {i} through relay: {e}"));
+            fresh
+                .request("ping", serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("ping on connection {i}: {e}"));
+            eprintln!("connection {i} ok");
+        }
+        eprintln!("3 sequential connections ok");
+
+        drop(handle);
+        let _ = Command::new("ssh")
+            .args(["-S", ctl_path.to_str().unwrap(), "-O", "exit", &target])
+            .status()
+            .await;
+        cleanup.master_started = false;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

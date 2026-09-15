@@ -19,6 +19,22 @@ pub fn err(msg: impl Into<String>) -> Error {
     msg.into().into()
 }
 
+/// Is this a rooted Windows path — `C:\...`/`C:/...` or a UNC `\\server\share`?
+///
+/// Deliberately a string predicate, not a `Path` one: both callers judge a path
+/// that names a location on a *remote* Windows machine, so `std::path`'s
+/// host-platform rules (where a Unix build reads `C:\x` as one relative
+/// component) would answer the wrong question.
+pub fn is_absolute_windows_path(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let drive_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    let unc_path = raw.starts_with(r"\\") && bytes.len() > 2;
+    drive_path || unc_path
+}
+
 #[cfg(windows)]
 pub fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")

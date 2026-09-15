@@ -1,166 +1,136 @@
-# Windows Port
+# Windows support
 
-This port adapts `herdr-mirror` only. The installed `herdr` on Windows remains
-unchanged and is treated as the protocol endpoint.
+`herdr` itself is not modified by any of this. It is treated as the protocol
+endpoint on both sides.
 
-## What "control plane" means here
+There are two independent directions, and they are worth naming separately
+because they fail differently:
 
-The control plane is the part that talks JSON to the local herdr and to remote
-herdr servers, drives the daemon lifecycle, and issues remote actions. It does
-not render a terminal. Porting it means:
+- **Windows as client** — `herdr-mirror` runs on Windows and mirrors remote
+  Unix hosts. This is the port of the control plane and data plane.
+- **Windows as host** — a Unix `herdr-mirror` mirrors a Windows machine's herdr
+  over SSH, via `kind = "windows"`. This is the relay.
 
-- local IPC connects to herdr's Windows named pipe and keeps the byte-stream
-  contract identical to a Unix socket;
-- the relays (ssh exec and docker) listen on their own named pipes;
-- file locks, pid liveness, and daemon start/stop work without `libc` signals.
+## Windows as client
 
-## Evidence path
+### Local IPC
 
-Each claim has a command that can be rerun on Windows:
+herdr exposes its API at `\\.\pipe\` followed by the absolute socket path it
+reports (`HERDR_SOCKET_PATH`, e.g.
+`C:\Users\me\AppData\Roaming\herdr\herdr.sock`). `platform::pipe_name` applies
+that translation once, for both `connect` and `LocalListener::bind`, so relays
+and clients agree. Without it, opening `C:\...\herdr.sock` as a pipe fails and
+every control-plane call is dead.
 
-- `cargo test --locked` on Windows — 192 passed, 2 ignored (the ignored ones are
+`src/platform.rs` abstracts local byte streams and listeners: Unix sockets on
+Unix, named pipes on Windows. `src/api.rs` keeps the JSON protocol unchanged and
+connects through it.
+
+### Daemon and process lifecycle
+
+- Unix `flock` is replaced with cross-platform `fs2` file locks.
+- Shutdown and poke use `.poke`/`.stop` markers on Windows, since a detached
+  process has no console to receive Ctrl+C. Unix keeps signals. `start` clears
+  stale markers so a resumed daemon cannot consume an old stop.
+- Detached daemon spawn uses `CREATE_NO_WINDOW`.
+- Pidfiles record PID *and* process creation time, so PID reuse fails closed.
+- Process-tree cleanup uses a Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, covering pane streams and timed-out ssh
+  commands including `ProxyCommand` descendants. (On Unix this is a process
+  group kill; a plain child kill would leak the ProxyCommand.)
+
+### Terminal
+
+- `term_size()` uses `GetConsoleScreenBufferInfo`, falling back to 80x24 when
+  there is no console (CI, pipes).
+- `RawMode` enables `ENABLE_VIRTUAL_TERMINAL_INPUT` on stdin and
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout, restoring both on drop.
+- Unix signals (`SIGWINCH`, `SIGUSR1`, `SIGTERM`, `SIGHUP`, `SIGINT`) are
+  `#[cfg(unix)]`. Windows uses `tokio::signal::ctrl_c()` in the same
+  `tokio::select!` loop and polls for console size changes; `Msg::Resize` is
+  shared by both paths.
+
+### Not ported
+
+- The interactive host picker (`pick.rs`).
+- `api_transport = "socket"` is rejected: Windows OpenSSH has no ControlMaster,
+  so the exec relay is used and the relay child drops `-S`.
+- The docker container transport.
+
+## Windows as host
+
+A Unix client reaches a Windows herdr through `kind = "windows"`. Configuration
+is in the README; this section is the design.
+
+`herdr-mirror relay` (`src/relay.rs`) is a stateless stdio-to-named-pipe bridge
+run on the Windows machine over an SSH exec channel. The Unix daemon opens a
+local Unix relay socket and starts one SSH exec channel per accepted API
+connection. API requests and the long-lived events subscription use the same
+mechanism. Terminal session streams continue over the existing SSH stdio path,
+but their remote commands are built for Windows rather than POSIX.
+
+The relay's trust boundary is deliberately narrow:
+
+- It never accepts an endpoint path. It resolves `herdr.exe` as the sibling of
+  its own executable, invokes it with argv (never through a shell), asks for
+  `status --json`, and connects only to the socket that reports.
+- The only value it accepts from the command line is a URL-safe-no-padding
+  base64 session selector: optional, valid UTF-8, no control characters,
+  1..=128 decoded bytes.
+- After connecting, stdout carries pipe bytes only; diagnostics go to stderr,
+  bounded. Pre-connection failures exit nonzero without writing to stdout, so a
+  failure can never be mistaken for protocol data.
+- Because a Windows duplex named pipe has no verified Win32 half-close here,
+  stdin EOF is treated as a logical write-side close: the relay stops reading
+  stdin, keeps the pipe handle, and drains pipe-to-stdout for a bounded deadline.
+  This preserves the ordinary response-after-EOF case while bounding quiet
+  subscription leaks.
+
+Remote command construction on the client side is an explicit matrix rather than
+POSIX quoting:
+
+- Status and terminal streams invoke the configured `remote_bin` directly.
+- Foreground classification uses two separate calls, not a `;` pipeline.
+- CWD policy falls back to the inherited cwd.
+- Paste and file upload are disabled, rather than emitting `mkdir`/`cat`/
+  `base64` and shell redirection through a wrapper.
+
+`remote_bin` and `relay_bin` are required to be absolute and free of characters
+a command wrapper could reinterpret, because they are used as literal command
+prefixes. `scripts/herdr-forcecommand.ps1` is an optional wrapper that restricts
+a dedicated key to exactly those two command shapes.
+
+## Evidence
+
+Each claim below has a command that can be rerun.
+
+- `cargo test --locked` on Windows — 216 passed, 2 ignored (the ignored ones are
   live integration tests).
 - `cargo clippy --all-targets --locked -- -D warnings` on Windows — clean.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
-  — clean. The port initially left `cfg(unix)` test code without its
-  `PermissionsExt` import and an unused `CommandExt` import; a Windows-only
-  check cannot see either, so the Unix target must be cross-checked too.
+  — clean. This cross-check is load-bearing, not ceremony: a Windows-only run
+  cannot see `cfg(unix)` code at all, so Unix-gated mistakes pass Windows CI
+  silently.
 - `cargo build --release --locked` — produces `target/release/herdr-mirror.exe`.
 - `cargo test --locked -- --ignored connects_to_the_live_herdr_pipe` — connects
   to the installed herdr over `\\.\pipe\<HERDR_SOCKET_PATH>` and completes a
-  `ping` round-trip. This is the load-bearing test for the local transport.
-- `herdr-mirror status` — reads config/state and prints host status.
+  `ping` round-trip. The load-bearing test for the local transport.
+- `cargo test --locked -- --ignored relay_reaches_windows_api` on a Unix client
+  — API relay against a real Windows host, including repeated SSH exec channels
+  over one ControlMaster. Needs `HERDR_MIRROR_IT_WINDOWS_TARGET` and
+  `HERDR_MIRROR_IT_WINDOWS_RELAY_BIN`.
 
-The evidence does not establish terminal rendering, raw input, resize, mouse
-forwarding, or the interactive picker. Those are separate claims and remain out
-of scope for the first stage.
+Live mirror lifecycle against a Windows host (observe stream, `--always-control`
+input, resize, reconnect across a replaced SSH child, and clean shutdown with no
+leftover streamer process or temporary files) has been exercised manually; it is
+not automated.
 
-## Named-pipe mapping
+## Known gaps
 
-herdr exposes its API at `\\.\pipe\` followed by the absolute socket path it
-reports (`HERDR_SOCKET_PATH`, e.g. `C:\Users\me\AppData\Roaming\herdr\herdr.sock`).
-`platform::pipe_name` applies that translation once, for both `connect` and
-`LocalListener::bind`, so relays and clients agree. Without it, opening
-`C:\...\herdr.sock` as a pipe fails and every control-plane call is dead.
-
-## Stages
-
-### Stage 0: Baseline and Sync
-
-Completed. The clone was fast-forwarded with `git pull --ff-only` to upstream
-`v0.4.3` (`195398c`).
-
-### Stage 1: Control Plane and Local IPC
-
-Completed and verified in this working tree.
-
-- `src/platform.rs` abstracts local byte streams/listeners: Unix sockets on
-  Unix, named pipes on Windows, with the path→pipe-name mapping above.
-- `src/api.rs` keeps the JSON protocol unchanged and connects through
-  `platform`.
-- The ssh and docker relays use `platform::LocalListener`; on Windows they listen
-  on pipes instead of TCP loopback.
-- Unix `flock` is replaced with cross-platform `fs2` file locks.
-- Daemon shutdown/poke use `.poke`/`.stop` markers on Windows (a detached
-  process has no console to receive Ctrl+C); Unix keeps signals. Stale markers
-  are cleared by `start` so a resumed daemon cannot consume an old stop.
-- `ensure_master`/`base_args` are Unix-only paths: Windows OpenSSH has no
-  ControlMaster, so `api_transport = "socket"` is rejected and the exec relay is
-  used. The relay child also drops `-S` on Windows.
-- Detached daemon spawn uses `CREATE_NO_WINDOW`.
-- `herdr-plugin.toml`, CI, the release workflow, and `scripts/install.sh` cover
-  `x86_64-pc-windows-msvc`.
-- Pane and picker commands fail explicitly.
-
-Acceptance: Windows build is warning-free under Clippy, unit tests pass, and the
-live named-pipe ping round-trips.
-
-### Stage 2: Windows Data Plane
-
-#### Phase 2A: Shared Data-Plane Compilation (completed)
-
-The shared `src/pane.rs` state machine now compiles and runs on Windows for the
-attended `pane <linux-host> <remote-pane> --dump` diagnostic. The Windows-specific
-`pane_windows.rs` stub is retained but no longer compiled; the shared file is used
-on both platforms.
-
-Platform-specific changes in `src/pane.rs`:
-
-- **Imports**: `tokio::signal::unix::{signal, SignalKind}` gated behind `#[cfg(unix)]`.
-- **`term_size()`**: Windows impl uses `GetConsoleScreenBufferInfo` from
-  `Win32::System::Console`; falls back to 80×24 when the console API is unavailable
-  (CI, pipes).
-- **`RawMode`**: Windows impl enables `ENABLE_VIRTUAL_TERMINAL_INPUT` on stdin and
-  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout, restoring original modes on drop.
-- **Process-tree cleanup**: Windows transports use a shared job-object helper with
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; it covers pane streams and timed-out daemon
-  ssh commands, including ProxyCommand descendants.
-- **`isolate_session_process_group()`**: Windows path sets `CREATE_NO_WINDOW`
-  (0x0800_0000) via `CommandExt::creation_flags`.
-- **Signal handling**: Unix signals (`SIGWINCH`, `SIGUSR1`, `SIGTERM`, `SIGHUP`,
-  `SIGINT`) gated behind `#[cfg(unix)]`. Windows uses `tokio::signal::ctrl_c()`
-  inside the same `tokio::select!` loop and polls console size changes.
-- **Tty detection**: `!args.dump` on Windows (no `libc::isatty`).
-- **Pidfile management**: streamer and local-pane identity files plus exclusive
-  pending launch claims work on both platforms. Windows records PID and process
-  creation time, so PID reuse fails closed.
-- **Docker container transport**: `resolve_blocking` gated behind `#[cfg(unix)]`;
-  returns an explicit error on Windows.
-- **`Msg::Resize` and `Msg::Hint`**: Resize is shared by Unix signals and the
-  Windows polling path; hints remain Unix signal-driven.
-
-Acceptance evidence:
-
-- `cargo clippy --all-targets --locked -- -D warnings` — clean on Windows.
-- `cargo test --locked` — 192 passed, 0 failed (including 7 Windows-specific tests
-  for `term_size`, `isolate_session_process_group`, `attach_and_kill_process_group`,
-  `attach_process_job` error path, `stdout_is_tty`, `RawMode` round-trip).
-- `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` —
-  clean (cross-target check).
-- `cargo build --release --locked` — produces `target/release/herdr-mirror.exe`.
-
-#### Phase 2B: Windows Streamer Lifecycle (attended path implemented; live gate pending)
-
-- The attended Windows pane path uses identity files and Windows Job Objects for
-  transport cleanup. Automatic daemon streamer launch and zombie healing remain
-  fenced until the complete interactive lifecycle is validated.
-- The attended pane polls console size and restores console modes on Ctrl-C and
-  normal shutdown.
-
-Remaining runtime blocker (not a compilation blocker):
-
-- A live Windows-to-Linux mirror still needs manual validation for resize, Ctrl-C,
-  reconnect, and clean shutdown. Output and input were exercised with a dedicated
-  headless pane; the current executor cannot provide a Windows TTY for the
-  remaining console-specific checks.
-- The `pane_windows.rs` stub is retained but unused.
-
-### Stage 3: Interactive Picker and File UX
-
-Pending. Port the picker after ConPTY exists, reusing the same console layer.
-Then validate Windows drag/drop path parsing and clipboard behavior separately.
-
-Acceptance: host picker creation and Windows paths work without changing the
-remote shell contract.
-
-### Stage 4: Release and Operational Validation
-
-Pending until Stages 2 and 3 are accepted.
-
-- Publish signed/checksummed Windows assets alongside Unix assets.
-- Validate `herdr plugin install` and `herdr plugin link` from Git Bash.
-- Test upgrade, stale daemon recovery, pause/resume, and named-pipe cleanup.
-- Remove the staged-support limitation only after the data-plane evidence exists.
-
-## Boundaries and known gaps
-
-- `herdr` itself is not modified by this port.
-- Remote Linux/macOS sockets remain remote; only the local transport changes.
-- `api_transport = "socket"` is rejected on Windows.
-- The plugin manifest still invokes `./target/release/herdr-mirror` while the
-  Windows asset is `herdr-mirror.exe`; confirm herdr appends `.exe` before
-  relying on install-from-release, otherwise switch the manifest to the `.exe`
-  name on Windows.
-- `ssh` timeout on Windows kills only the direct child, not `ProxyCommand`
-  descendants; Stage 2 owns the job-object fix.
-- A Windows build passing Stage 1 must not be described as full pane support.
+- The plugin manifest invokes `./target/release/herdr-mirror`; confirm herdr
+  appends `.exe` on Windows before relying on install-from-release, otherwise
+  the manifest needs the `.exe` name on Windows.
+- Windows drag/drop path parsing and clipboard behaviour are unvalidated.
+- Release assets for `x86_64-pc-windows-msvc` are wired into CI but the upgrade,
+  stale-daemon recovery, and named-pipe cleanup paths have not been exercised
+  through `herdr plugin install`.

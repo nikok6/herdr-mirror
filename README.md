@@ -288,6 +288,9 @@ an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and
 dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 ~/.cache/herdr-mirror/pastes` is always safe.
 
+File and image uploads are disabled for `kind = "windows"` hosts in this
+release; ordinary text pastes and terminal input continue to work.
+
 ### Mouse
 
 - **Drag to select, release to copy** — The text reaches your own clipboard, even over ssh.
@@ -338,6 +341,46 @@ target = "work"
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
 ```
+
+### Remote Windows host
+
+Use `kind = "windows"` for a Windows host reached over SSH, as described in
+`WINDOWS_PORT.md`.
+
+`remote_bin` is **required** here and must be the absolute path to `herdr.exe`
+on that machine: there is no remote POSIX shell to resolve a bare name through,
+and the path is used verbatim. `relay_bin` is the `herdr-mirror.exe` that serves
+the API relay; it defaults to the sibling of `remote_bin`, so installing the two
+side by side needs no second setting. `api_transport` remains `auto` or `exec`;
+streamlocal socket forwarding is not used for this host kind.
+
+```toml
+[hosts.windows]
+kind = "windows"
+target = "win-box"                          # ssh target
+remote_bin = 'C:\tools\herdr.exe'           # required, absolute
+# relay_bin = 'C:\tools\herdr-mirror.exe'   # default: sibling of remote_bin
+# session = "project"                       # optional named Herdr session
+# always_control = true                     # default
+# max_cols = 212                            # optional control-size cap
+# max_rows = 58
+```
+
+Both paths are rejected unless they are absolute and free of characters a
+command wrapper could reinterpret. Use single-quoted TOML strings so backslashes
+stay literal.
+
+If the key is restricted with a `ForceCommand` wrapper — recommended, see
+`scripts/herdr-forcecommand.ps1` — it must allow exactly two command shapes:
+`exec <remote_bin> <args...>` and `exec <relay_bin> relay [--session-b64=...]`.
+A plain SSH account with no wrapper works too.
+
+The client uses the SSH stdio path for terminal streams and the relay for API
+requests and events.
+
+Note that herdr's Windows self-updater installs `herdr.exe` behind an NTFS
+junction, which a network-logon SSH session cannot traverse. Point `remote_bin`
+at a plain copy outside that tree and refresh it after each herdr update.
 
 ## Devcontainer
 
@@ -418,11 +461,12 @@ identified as disposable merely because their directory matches.
 
 ## Limitations
 
-- **Windows is staged support**: named-pipe IPC, the daemon lifecycle, remote
-  actions, and the ssh exec relay work, but the pane/PTY data plane (ConPTY)
-  and the interactive host picker are not ported. `api_transport = "socket"`
-  is rejected on Windows (no OpenSSH ControlMaster), and mirror panes report
-  "not supported on Windows" instead of streaming.
+- **Windows is staged support**: when `herdr-mirror` itself runs on Windows,
+  named-pipe IPC, daemon lifecycle, and remote actions are supported, while the
+  interactive host picker remains unported. A Unix client can mirror a remote
+  `kind = "windows"` host — stream, input, resize, reconnect, and shutdown are
+  validated — but file and image uploads are disabled for that host kind, and
+  cwd policy falls back to the inherited cwd.
 - **Version-locked to preview** until the `terminal session` streams reach
   stable; keep both ends on the same build.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so

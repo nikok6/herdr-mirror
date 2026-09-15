@@ -93,7 +93,14 @@ pub async fn remote_policy(
     remote: &crate::remote::RemoteHost,
     host: &crate::config::HostConfig,
 ) -> Option<Policy> {
-    let bin = crate::config::remote_herdr_expr(host.remote_bin.as_deref(), host.session.as_deref());
+    if matches!(&host.kind, crate::config::HostKind::Windows) {
+        return Some(Policy::Follow);
+    }
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &host.kind,
+        host.remote_bin.as_deref(),
+        host.session.as_deref(),
+    );
     // Pass the reported path as data to POSIX sh, never interpolate it into
     // shell source. Missing config means Herdr's default; read errors don't.
     let reader = r#"IFS= read -r config || exit 1
@@ -159,6 +166,26 @@ mod tests {
                 assert_eq!(inherit(kind, Some(&policy)), kind == "split");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn windows_hosts_follow_without_remote_config_probe() {
+        let host = crate::config::HostConfig {
+            name: "windows".into(),
+            target: "windows-host".into(),
+            kind: crate::config::HostKind::Windows,
+            docker_bin: "docker".into(),
+            prefix: "windows".into(),
+            remote_bin: Some(r"C:\tools\herdr.exe".into()),
+            relay_bin: Some(r"C:\tools\herdr-mirror.exe".into()),
+            session: Some("team".into()),
+            api_transport: crate::config::ApiTransport::Auto,
+            always_control: true,
+            max_cols: None,
+            max_rows: None,
+        };
+        let remote = crate::remote::RemoteHost::new(&host, Path::new("/tmp/herdr-mirror-test"));
+        assert_eq!(remote_policy(&remote, &host).await, Some(Policy::Follow));
     }
 
     #[cfg(unix)]

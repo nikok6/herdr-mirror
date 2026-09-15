@@ -62,6 +62,8 @@ pub struct Args {
     pub rows: usize,
     pub dump: bool,
     pub session: Option<String>,
+    /// remote Windows host using the restricted SSH ForceCommand wrapper
+    pub windows_host: bool,
     /// auto-release control after this much input idle; 0 disables
     pub control_idle_secs: u64,
     /// start and stay in control: writable, no idle release, and sized to the
@@ -98,6 +100,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         rows: 72,
         dump: false,
         session: None,
+        windows_host: false,
         control_idle_secs: 3600,
         always_control: false,
         max_cols: None,
@@ -129,6 +132,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     .map_err(|_| err("--rows must be a number"))?;
             }
             "--session" => args.session = Some(next("--session")?),
+            "--windows-host" => args.windows_host = true,
             "--control-idle" => {
                 args.control_idle_secs = next("--control-idle")?
                     .parse()
@@ -166,7 +170,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     }
     if positional.len() != 2 {
         return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
+            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--session NAME] [--windows-host] [--cols N --rows N] [--max-cols N --max-rows N] [--dump]",
         ));
     }
     args.container = match (container_name, container_folder) {
@@ -183,6 +187,17 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     };
     args.ssh_target = positional.remove(0);
     args.pane_target = positional.remove(0);
+    if args.windows_host {
+        if args.remote_bin.is_some() {
+            return Err(err(
+                "--remote-bin is not allowed with --windows-host; the Windows binary is fixed",
+            ));
+        }
+        if let Some(session) = args.session.as_deref() {
+            crate::config::validate_windows_session(session)?;
+        }
+        crate::config::windows_force_command_token(&args.pane_target)?;
+    }
     Ok(args)
 }
 
@@ -321,12 +336,29 @@ fn spawn_session(
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
-    let bin = crate::config::remote_herdr_expr(args.remote_bin.as_deref(), args.session.as_deref());
+    let kind = if args.windows_host {
+        crate::config::HostKind::Windows
+    } else {
+        args.container
+            .as_ref()
+            .map(|container| container.kind.clone())
+            .unwrap_or(crate::config::HostKind::Ssh)
+    };
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &kind,
+        args.remote_bin.as_deref(),
+        args.session.as_deref(),
+    );
+    let pane_target = if matches!(kind, crate::config::HostKind::Windows) {
+        crate::config::windows_force_command_token(&args.pane_target)?
+    } else {
+        sh_quote(&args.pane_target)
+    };
     let cmd = format!(
         "exec {} terminal session {} {} --cols {} --rows {}",
         bin,
         mode.as_str(),
-        sh_quote(&args.pane_target),
+        pane_target,
         cols,
         rows
     );
@@ -1142,6 +1174,7 @@ impl App {
         let pane = self.args.pane_target.clone();
         let ctl = self.args.ctl_path.clone();
         let container = self.args.container.clone();
+        let windows_host = self.args.windows_host;
         tokio::spawn(async move {
             let v = crate::foreground::poll(
                 &ssh,
@@ -1150,6 +1183,7 @@ impl App {
                 &pane,
                 ctl.as_deref(),
                 container.as_ref(),
+                windows_host,
             )
             .await;
             let _ = tx.send(Msg::Foreground(v)).await;
@@ -1528,6 +1562,12 @@ impl App {
             return;
         };
 
+        if self.args.windows_host {
+            self.hint("file upload unavailable on Windows hosts; forwarding drop");
+            self.deliver_input(crate::paste::bracketed_bytes(&body)).await;
+            return;
+        }
+
         self.paste_inflight = true;
         self.paste_original = Some(body);
         self.hint_sticky(&format!("uploading {} file(s)…", paths.len()));
@@ -1583,6 +1623,10 @@ impl App {
 
     async fn handle_stdin_inner(&mut self, buf: Vec<u8>) {
         if buf.len() == 1 && buf[0] == 0x16 && !self.paste_inflight {
+            if self.args.windows_host {
+                self.deliver_input(buf).await;
+                return;
+            }
             self.paste_inflight = true;
             let tx = self.tx.clone();
             let ssh = self.args.ssh_target.clone();
@@ -2481,6 +2525,54 @@ mod tests {
             "x".into()
         ])
         .is_err());
+    }
+
+    #[test]
+    fn windows_host_flag_round_trips() {
+        let argv: Vec<String> = ["windows", "w9:p1", "--windows-host"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_args(&argv).unwrap();
+        assert!(args.windows_host);
+        assert_eq!(args.ctl_path, None);
+        assert!(args.container.is_none());
+    }
+
+    #[test]
+    fn windows_force_command_inputs_fail_closed() {
+        for pane in [
+            "w9 p1",
+            "w9'p1",
+            "w9\"p1",
+            "w9&p1",
+            "w9|p1",
+            "w9;p1",
+            "w9<p1",
+            "w9>p1",
+            "w9%p1",
+            "w9`p1",
+            r"w9\p1",
+        ] {
+            let argv = vec!["windows".into(), pane.into(), "--windows-host".into()];
+            assert!(parse_args(&argv).is_err(), "accepted unsafe pane {pane:?}");
+        }
+        let argv = vec![
+            "windows".into(),
+            "w9:p1".into(),
+            "--windows-host".into(),
+            "--remote-bin".into(),
+            r"D:\evil.exe".into(),
+        ];
+        assert!(parse_args(&argv).is_err());
+        let argv = vec![
+            "windows".into(),
+            "w9:p1".into(),
+            "--windows-host".into(),
+            "--session".into(),
+            "team name".into(),
+        ];
+        assert!(parse_args(&argv).is_err());
     }
 
     // --- birth size trust (#23) ---

@@ -433,12 +433,8 @@ impl RemoteHost {
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
-        let bin = crate::config::remote_herdr_expr(
-            self.cfg.remote_bin.as_deref(),
-            self.cfg.session.as_deref(),
-        );
         let out = self
-            .exec(&format!("exec {} status --json", bin), 15000)
+            .exec(&status_command(&self.cfg), 15000)
             .await?;
         #[derive(Deserialize)]
         struct Client {
@@ -608,7 +604,22 @@ impl RemoteHost {
             return Ok(self.exec_sock.clone());
         }
         self.exec_relay = None;
-        let relay_cmd = crate::ssh_relay::detect_relay_command(self, remote_socket).await?;
+        let relay_cmd = if matches!(&self.cfg.kind, crate::config::HostKind::Windows) {
+            // parse_config always resolves relay_bin for a Windows host, so a
+            // missing one is a construction bug, not a user misconfiguration.
+            let relay_bin = self
+                .cfg
+                .relay_bin
+                .as_deref()
+                .ok_or_else(|| crate::util::err("Windows host has no relay_bin"))?;
+            crate::ssh_relay::RelayCommand::prebuilt(crate::config::fixed_relay_command(
+                &self.cfg.kind,
+                relay_bin,
+                self.cfg.session.as_deref(),
+            )?)
+        } else {
+            crate::ssh_relay::detect_relay_command(self, remote_socket).await?
+        };
         self.log.log(&format!(
             "[{}] exec relay via {} → {remote_socket}",
             self.cfg.name,
@@ -638,17 +649,18 @@ impl RemoteHost {
     /// cost before this fallback existed.
     async fn connect_ssh_api(&mut self, remote_socket: &str) -> Result<ApiClient> {
         let configured = self.cfg.api_transport;
+        let windows_host = matches!(&self.cfg.kind, crate::config::HostKind::Windows);
+        if windows_host && configured == ApiTransport::Socket {
+            return Err(err(
+                "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\"",
+            ));
+        }
         if cfg!(windows) && configured == ApiTransport::Socket {
             return Err(err(
                 "api_transport = \"socket\" is not supported on Windows; use \"exec\" or \"auto\"",
             ));
         }
-        let start_with_socket = cfg!(not(windows))
-            && (if configured == ApiTransport::Auto {
-                self.transport_hint
-            } else {
-                configured
-            }) != ApiTransport::Exec;
+        let start_with_socket = should_try_socket(&self.cfg.kind, configured, self.transport_hint);
 
         if start_with_socket {
             match self.try_socket_transport(remote_socket).await {
@@ -678,6 +690,13 @@ impl RemoteHost {
     }
 
     pub async fn connect_api(&mut self) -> Result<(ApiClient, RemoteStatus)> {
+        if matches!(&self.cfg.kind, crate::config::HostKind::Windows)
+            && self.cfg.api_transport == ApiTransport::Socket
+        {
+            return Err(err(
+                "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\"",
+            ));
+        }
         self.ensure_ready().await?;
         let status = match self.status().await {
             Ok(s) => s,
@@ -725,6 +744,21 @@ impl RemoteHost {
         let api = ApiClient::connect(&sock).await?;
         Ok((api, status))
     }
+}
+
+fn should_try_socket(kind: &crate::config::HostKind, configured: ApiTransport, hint: ApiTransport) -> bool {
+    !matches!(kind, crate::config::HostKind::Windows)
+        && cfg!(not(windows))
+        && (if configured == ApiTransport::Auto { hint } else { configured }) != ApiTransport::Exec
+}
+
+fn status_command(cfg: &HostConfig) -> String {
+    let bin = crate::config::remote_herdr_expr_for_kind(
+        &cfg.kind,
+        cfg.remote_bin.as_deref(),
+        cfg.session.as_deref(),
+    );
+    format!("exec {bin} status --json")
 }
 
 fn nonempty(e: &str, code: i32) -> String {
@@ -780,12 +814,68 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: name.into(),
             remote_bin: None,
+            relay_bin: None,
             session: None,
             max_cols: None,
             max_rows: None,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }
+    }
+
+    #[test]
+    fn windows_status_command_uses_the_configured_binary_without_posix_resolver() {
+        let mut host = ssh_host("windows");
+        host.kind = crate::config::HostKind::Windows;
+        host.remote_bin = Some(r"C:\tools\herdr.exe".into());
+        host.relay_bin = Some(r"C:\tools\herdr-mirror.exe".into());
+        assert_eq!(
+            status_command(&host),
+            r"exec C:\tools\herdr.exe status --json"
+        );
+        host.session = Some("team".into());
+        assert_eq!(
+            status_command(&host),
+            r"exec C:\tools\herdr.exe --session team status --json"
+        );
+    }
+
+    #[test]
+    fn windows_remote_hosts_never_try_streamlocal_transport() {
+        assert!(!should_try_socket(
+            &crate::config::HostKind::Windows,
+            ApiTransport::Auto,
+            ApiTransport::Socket
+        ));
+        assert!(!should_try_socket(
+            &crate::config::HostKind::Windows,
+            ApiTransport::Exec,
+            ApiTransport::Exec
+        ));
+        assert_eq!(
+            should_try_socket(
+                &crate::config::HostKind::Ssh,
+                ApiTransport::Auto,
+                ApiTransport::Socket
+            ),
+            cfg!(not(windows))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_socket_for_windows_remote_reports_unavailable_streamlocal() {
+        let mut host = ssh_host("windows");
+        host.kind = crate::config::HostKind::Windows;
+        host.api_transport = ApiTransport::Socket;
+        let mut remote = RemoteHost::new(&host, std::path::Path::new("/state"));
+        let error = match remote.connect_ssh_api("C:\\herdr.sock").await {
+            Ok(_) => panic!("explicit socket unexpectedly connected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "streamlocal forwarding is unavailable for the configured Windows remote host; use api_transport = \"exec\" or \"auto\""
+        );
     }
 
     #[test]

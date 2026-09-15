@@ -495,8 +495,10 @@ pub(crate) fn cmd_for_pane(
         ];
         // omit --remote-bin when auto (PATH then ~/.local/bin/herdr); pane
         // defaults to the same resolution so the argv stays short
-        if let Some(bin) = &remote_bin {
-            argv.extend(["--remote-bin".into(), bin.clone()]);
+        if !matches!(&kind, crate::config::HostKind::Windows) {
+            if let Some(bin) = &remote_bin {
+                argv.extend(["--remote-bin".into(), bin.clone()]);
+            }
         }
         if let Some(session) = &session {
             argv.extend(["--session".into(), session.clone()]);
@@ -517,6 +519,11 @@ pub(crate) fn cmd_for_pane(
         // is running in each pane instead (see daemon::has_live_streamer).
         match &kind {
             crate::config::HostKind::Ssh => {
+                argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+            }
+            crate::config::HostKind::Windows => {
+                argv.push("--windows-host".into());
+                #[cfg(not(windows))]
                 argv.extend(["--ctl-path".into(), ctl_path.clone()]);
             }
             crate::config::HostKind::DockerContainer(name) => {
@@ -2054,6 +2061,7 @@ mod tests {
             docker_bin: "docker".into(),
             prefix: "vps".into(),
             remote_bin: None,
+            relay_bin: None,
             session: None,
             always_control: true,
             max_cols: None,
@@ -2320,6 +2328,50 @@ mod tests {
             argv[1..],
             ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
         );
+    }
+
+    #[test]
+    fn windows_pane_argv_uses_windows_transport_without_ctl_path() {
+        let mut host = ssh_host();
+        host.name = "windows".into();
+        host.kind = crate::config::HostKind::Windows;
+        host.target = "windows".into();
+        host.session = Some("team".into());
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        #[cfg(windows)]
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "windows",
+                "w1:p1",
+                "--session",
+                "team",
+                "--always-control",
+                "--windows-host",
+            ]
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            argv[1..],
+            [
+                "pane",
+                "windows",
+                "w1:p1",
+                "--session",
+                "team",
+                "--always-control",
+                "--windows-host",
+                "--ctl-path",
+                "/state/windows.ctl",
+            ]
+        );
+        let parsed = crate::pane::parse_args(&argv[2..]).unwrap();
+        assert!(parsed.windows_host);
+        #[cfg(windows)]
+        assert_eq!(parsed.ctl_path, None);
+        #[cfg(not(windows))]
+        assert_eq!(parsed.ctl_path.as_deref(), Some("/state/windows.ctl"));
     }
 
     /// An uncapped host's argv must not grow, and a capped one must round-trip
