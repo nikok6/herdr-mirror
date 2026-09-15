@@ -188,10 +188,15 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     args.ssh_target = positional.remove(0);
     args.pane_target = positional.remove(0);
     if args.windows_host {
-        if args.remote_bin.is_some() {
-            return Err(err(
-                "--remote-bin is not allowed with --windows-host; the Windows binary is fixed",
-            ));
+        // The Windows binary is configuration, not a constant: validate it the
+        // same way hosts.toml does, since it becomes a literal command prefix.
+        match args.remote_bin.as_deref() {
+            None => {
+                return Err(err(
+                    "--windows-host needs --remote-bin (the absolute path to herdr.exe on the remote)",
+                ))
+            }
+            Some(bin) => crate::config::validate_windows_bin(bin)?,
         }
         if let Some(session) = args.session.as_deref() {
             crate::config::validate_windows_session(session)?;
@@ -344,17 +349,9 @@ fn spawn_session(
             .map(|container| container.kind.clone())
             .unwrap_or(crate::config::HostKind::Ssh)
     };
-    // A Windows host has no remote resolver to fall back on. Without this the
-    // command would be built with an empty binary — `exec  terminal session …`
-    // — which the remote rejects and the pane renders as a blank reconnecting
-    // screen, hiding the actual cause (the daemon not passing --remote-bin).
-    if matches!(kind, crate::config::HostKind::Windows)
-        && args.remote_bin.as_deref().unwrap_or("").is_empty()
-    {
-        return Err(err(
-            "a Windows host needs --remote-bin (the absolute path to herdr.exe on the remote)",
-        ));
-    }
+    // remote_bin is guaranteed present and validated for a Windows host by
+    // parse_args: without it the command would carry an empty binary and the
+    // pane would render as a blank reconnecting screen with no stated cause.
     let bin = crate::config::remote_herdr_expr_for_kind(
         &kind,
         args.remote_bin.as_deref(),
@@ -2540,14 +2537,28 @@ mod tests {
 
     #[test]
     fn windows_host_flag_round_trips() {
-        let argv: Vec<String> = ["windows", "w9:p1", "--windows-host"]
+        let argv: Vec<String> = [
+            "windows",
+            "w9:p1",
+            "--windows-host",
+            "--remote-bin",
+            r"C:\tools\herdr.exe",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = parse_args(&argv).unwrap();
+        assert!(args.windows_host);
+        assert_eq!(args.remote_bin.as_deref(), Some(r"C:\tools\herdr.exe"));
+        assert_eq!(args.ctl_path, None);
+        assert!(args.container.is_none());
+        // A Windows host cannot resolve a bare name on the remote, so the path
+        // is required rather than optional.
+        let missing: Vec<String> = ["windows", "w9:p1", "--windows-host"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let args = parse_args(&argv).unwrap();
-        assert!(args.windows_host);
-        assert_eq!(args.ctl_path, None);
-        assert!(args.container.is_none());
+        assert!(parse_args(&missing).is_err());
     }
 
     #[test]
@@ -2565,17 +2576,31 @@ mod tests {
             "w9`p1",
             r"w9\p1",
         ] {
-            let argv = vec!["windows".into(), pane.into(), "--windows-host".into()];
+            // A valid remote_bin is supplied so the rejection can only come
+            // from the pane target itself.
+            let argv = vec![
+                "windows".into(),
+                pane.into(),
+                "--windows-host".into(),
+                "--remote-bin".into(),
+                r"C:\tools\herdr.exe".into(),
+            ];
             assert!(parse_args(&argv).is_err(), "accepted unsafe pane {pane:?}");
         }
-        let argv = vec![
-            "windows".into(),
-            "w9:p1".into(),
-            "--windows-host".into(),
-            "--remote-bin".into(),
-            r"D:\evil.exe".into(),
-        ];
-        assert!(parse_args(&argv).is_err());
+        // A remote_bin that is relative, or carries grammar the ForceCommand
+        // wrapper could reinterpret, is refused. (`D:\evil.exe` is not on this
+        // list: an unexpected *location* is the operator's call, an unparseable
+        // command is not.)
+        for bin in [r"herdr.exe", r"tools\herdr.exe", r"C:\a&b\herdr.exe", r"C:\a b\he|rdr.exe"] {
+            let argv = vec![
+                "windows".into(),
+                "w9:p1".into(),
+                "--windows-host".into(),
+                "--remote-bin".into(),
+                bin.into(),
+            ];
+            assert!(parse_args(&argv).is_err(), "accepted unsafe remote_bin {bin:?}");
+        }
         let argv = vec![
             "windows".into(),
             "w9:p1".into(),
