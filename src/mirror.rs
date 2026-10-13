@@ -397,6 +397,13 @@ fn resolve_label(
     local_label: &str,
     last_remote: Option<&str>,
 ) -> LabelAction {
+    // a "[N] " jump-key number (herdr-automatic-rename) is per-machine
+    // decoration, not part of the name: compare without it on both sides, or
+    // each side's numbering reads as a rename of the other and the labels
+    // ping-pong, growing by a "<prefix>: [N] " every round
+    let remote_label = strip_index(remote_label);
+    let local_label = strip_index(local_label);
+    let last_remote = last_remote.map(strip_index);
     let expected = match prefix {
         Some(p) => format!("{p}: {remote_label}"),
         None => remote_label.to_string(),
@@ -419,6 +426,15 @@ fn resolve_label(
     } else {
         LabelAction::PushRemote(stripped.to_string())
     }
+}
+
+/// `label` without a leading "[N] " jump-key number, if it has one.
+pub(crate) fn strip_index(label: &str) -> &str {
+    label
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(label, |(_, tail)| tail)
 }
 
 pub struct ConvergeDeps {
@@ -985,7 +1001,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if mirror_ws_ids.contains(&rws.workspace_id) {
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
+        let label = format!("{}: {}", host.prefix, strip_index(&rws.label));
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
         }
@@ -1361,7 +1377,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                         // user rename and push it over the remote's
                         if deps
                             .local
-                            .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
+                            .request("tab.rename", json!({ "tab_id": tab_local, "label": strip_index(&rtab.label) }))
                             .await
                             .is_ok()
                         {
@@ -2014,6 +2030,24 @@ mod tests {
         );
         // degenerate: renamed to just the prefix-colon or whitespace → restamp
         assert_eq!(resolve_label(Some("pm"), "scratch", "pm:  ", Some("scratch")), LabelAction::RestampLocal);
+    }
+
+    #[test]
+    fn label_ignores_jump_key_numbers() {
+        // local and remote each number their own workspaces → still in sync
+        assert_eq!(resolve_label(Some("pm"), "[1] ~", "[2] pm: ~", Some("[1] ~")), LabelAction::InSync);
+        // remote renumbered only → not a remote rename, nothing to push
+        assert_eq!(resolve_label(Some("pm"), "[3] ~", "[2] pm: ~", Some("[1] ~")), LabelAction::InSync);
+        // tabs: same, without a prefix
+        assert_eq!(resolve_label(None, "[1] infra", "[4] infra", Some("[1] infra")), LabelAction::InSync);
+        // a real rename under a number still pushes, number-free
+        assert_eq!(
+            resolve_label(Some("pm"), "[1] ~", "[2] pm: api", Some("[1] ~")),
+            LabelAction::PushRemote("api".into())
+        );
+        assert_eq!(strip_index("[12] x"), "x");
+        assert_eq!(strip_index("[a] x"), "[a] x");
+        assert_eq!(strip_index("[3]"), "[3]");
     }
 
     /// Tabs carry the remote label verbatim, so the same resolution runs with no
