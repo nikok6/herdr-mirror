@@ -455,6 +455,55 @@ fn write_stdout(s: &str) {
     let _ = out.flush();
 }
 
+/// Longest remote title relayed, in chars. Titles are one-line labels (an
+/// agent's task summary); the bound only stops a hostile or broken remote from
+/// pushing an arbitrarily large string through every herdr client's pane list.
+const TITLE_MAX_CHARS: usize = 256;
+
+/// Make a remote title safe to re-emit inside OSC 2. It travels from another
+/// machine into the local terminal stream, where a control char ends the string
+/// early — BEL, ESC (the start of ST), a C1 ST — and runs whatever follows as
+/// terminal input. `is_control` covers all of C0, DEL and C1.
+fn sanitize_title(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(TITLE_MAX_CHARS).collect()
+}
+
+/// The OSC 2 that makes this pane's title the relayed one, or `None` when
+/// there is nothing to write: no relay for us, a relay addressed to a different
+/// remote pane (a previous holder of this reused local id), or no change.
+///
+/// A remote pane with no title is written as an empty OSC 2, which herdr reads
+/// as "no title" — rather than leaving the one the shell set before `exec`.
+fn title_update(
+    relayed: Option<crate::state::PaneTitle>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) -> Option<String> {
+    let relayed = relayed.filter(|t| t.remote == pane_target)?;
+    let clean = sanitize_title(relayed.title.as_deref().unwrap_or(""));
+    if shown.as_deref() == Some(clean.as_str()) {
+        return None;
+    }
+    let seq = format!("\x1b]2;{clean}\x07");
+    *shown = Some(clean);
+    Some(seq)
+}
+
+/// Show the remote pane's title as this pane's own, so herdr's `terminal_title`
+/// for the mirror is the remote's. Only a streamer drawing into a herdr pane
+/// (tty, `HERDR_PANE_ID` known) has a title to set.
+fn relay_title(
+    state_dir: &std::path::Path,
+    local_pane_id: Option<&str>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) {
+    let Some(id) = local_pane_id else { return };
+    if let Some(seq) = title_update(crate::state::read_pane_title(state_dir, id), pane_target, shown) {
+        write_stdout(&seq);
+    }
+}
+
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
 /// press, total len) for a sequence starting at `bytes[at]`.
 fn parse_mouse(bytes: &[u8], at: usize) -> Option<(u32, u32, u32, bool, usize)> {
@@ -1532,6 +1581,11 @@ pub async fn run(args: Args) -> Result<()> {
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
     let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
 
+    // Before either pidfile below exists: a pidfile is what tells the daemon
+    // and the hooks they may SIGUSR1 us, and that signal's default disposition
+    // is terminate. The daemon pokes a pane as soon as its first title lands,
+    // which is typically while this streamer is still starting up.
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
     // daemon-spawned streamer, so it must not claim the slot
@@ -1644,6 +1698,9 @@ pub async fn run(args: Args) -> Result<()> {
         paste_queue: Vec::new(),
         paste_original: None,
     };
+    // what this pane last wrote as its OSC 2 title, so repeats cost nothing
+    let mut shown_title: Option<String> = None;
+    relay_title(&state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1658,8 +1715,6 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
-    // someone left a notice for this pane and wants it seen now
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
     app.connect(initial_mode(app.args.always_control, term_size())).await;
@@ -1738,6 +1793,8 @@ pub async fn run(args: Args) -> Result<()> {
                         app.hint_for(&msg, Duration::from_secs(4));
                     }
                 }
+                // the daemon pokes the same way when the remote title changed
+                relay_title(&state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
             }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
@@ -2409,6 +2466,61 @@ mod tests {
     #[tokio::test]
     async fn copying_selection_preserves_next_drag_in_same_read() {
         selection_followed_by_press(true).await;
+    }
+
+    fn relayed(remote: &str, title: Option<&str>) -> Option<crate::state::PaneTitle> {
+        Some(crate::state::PaneTitle {
+            host: "vibe1".into(),
+            remote: remote.into(),
+            title: title.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn a_remote_title_cannot_break_out_of_the_osc() {
+        // BEL and ESC \ end an OSC; C1 ST (U+009C) does too for a terminal
+        // that reads C1. Anything after them would run as local terminal input.
+        let hostile = "task\x07\x1b]0;owned\x1b\\\u{9c}\x1b[2J done";
+        assert_eq!(sanitize_title(hostile), "task]0;owned\\[2J done");
+        let mut shown = None;
+        let seq = title_update(relayed("wD:p3", Some(hostile)), "wD:p3", &mut shown).unwrap();
+        let body = seq.strip_prefix("\x1b]2;").and_then(|s| s.strip_suffix('\x07')).unwrap();
+        assert!(!body.chars().any(char::is_control), "{seq:?}");
+    }
+
+    #[test]
+    fn a_remote_title_is_bounded_on_a_char_boundary() {
+        let long = "π".repeat(TITLE_MAX_CHARS + 50);
+        let clean = sanitize_title(&long);
+        assert_eq!(clean.chars().count(), TITLE_MAX_CHARS);
+        assert!(clean.chars().all(|c| c == 'π'));
+    }
+
+    #[test]
+    fn the_remote_title_is_written_once_per_change() {
+        let mut shown = None;
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π ⠴ jev-game\x07")
+        );
+        // a poke for a hint, or a relay that repeats itself, writes nothing
+        assert_eq!(title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown), None);
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π > jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π > jev-game\x07")
+        );
+        // the remote dropping its title clears ours instead of keeping the last
+        assert_eq!(title_update(relayed("wD:p3", None), "wD:p3", &mut shown).as_deref(), Some("\x1b]2;\x07"));
+    }
+
+    #[test]
+    fn a_title_for_another_remote_pane_is_ignored() {
+        // herdr reuses local pane ids: a record left for the previous holder of
+        // this pane must not name the mirror now standing in it
+        let mut shown = None;
+        assert_eq!(title_update(relayed("wD:p1", Some("rpg designer")), "wD:p3", &mut shown), None);
+        assert_eq!(shown, None);
+        assert_eq!(title_update(None, "wD:p3", &mut shown), None);
     }
 
 }

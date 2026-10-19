@@ -139,6 +139,13 @@ blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
 
+**Remote titles** — a mirror pane takes its remote pane's live terminal title
+as its own, so herdr's `terminal_title` for the mirror (and anything that names
+panes by it — `herdr pane list`, other herdr clients) reads what the remote
+says rather than the local `.mirror-pane` placeholder. Changes follow within a
+second or so; a remote too old to publish `pane.updated` catches up on each
+sync instead.
+
 ### Keybinds
 
 Actions have no default keys; bind them in `~/.config/herdr/config.toml`, then
@@ -434,6 +441,15 @@ identified as disposable merely because their directory matches.
   never move a byte) fall back automatically to an exec relay — see
   `api_transport` above. The remote needs `socat` or `python3` for that path;
   almost everything has one or the other.
+- **Mirror panes report a placeholder cwd** — herdr takes a pane's directory
+  from its process, or from OSC 7 / OSC 1337 `CurrentDir`, but accepts only a
+  local host and a directory that exists locally, so a remote path can't be
+  handed to it. `cwd` for a mirror stays the `.mirror-pane` placeholder; publish
+  the remote directory as a [sidebar token](#sidebar-tokens) instead.
+- **No local scrollback on mirror panes** — the streamer draws on the alternate
+  screen, which herdr keeps no history for, so `herdr pane read` on a mirror
+  returns its visible rows only. Scroll with the wheel (it scrolls the remote),
+  or read the remote pane itself.
 
 ## License
 

@@ -52,6 +52,10 @@ pub struct PaneInfo {
     pub label: Option<String>,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
+    /// the remote pane's live terminal title, relayed to its mirror's streamer
+    /// (see `relay_titles`). Present on every pane, agent or not.
+    #[serde(default)]
+    pub terminal_title: Option<String>,
 }
 
 /// Agent fields as they appear both in snapshot `agents[]` and in
@@ -1402,6 +1406,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
 
     // 5. push authoritative agent status onto mirror panes
     push_statuses(deps, &remote_snap, state).await;
+    // 6. and each remote pane's terminal title into its mirror
+    relay_titles(deps, &remote_snap, state);
     Ok(())
 }
 
@@ -1553,6 +1559,45 @@ pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
         push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
     }
+}
+
+/// Relay one remote pane's terminal title to the streamer drawing its mirror,
+/// waking that streamer only when the title actually changed. Shared by the
+/// converge pass and the daemon's `pane.updated` fast-path.
+pub fn relay_pane_title(
+    state_dir: &std::path::Path,
+    host_name: &str,
+    remote_id: &str,
+    entry: &PaneEntry,
+    title: Option<&str>,
+) {
+    if entry.is_tombstoned() {
+        return;
+    }
+    let record = crate::state::PaneTitle {
+        host: host_name.to_string(),
+        remote: remote_id.to_string(),
+        title: title.map(str::to_string),
+    };
+    if crate::state::put_pane_title(state_dir, &entry.local_id, &record) {
+        // a streamer that is not up yet reads the record when it starts
+        crate::util::poke_pane_streamer(state_dir, &entry.local_id);
+    }
+}
+
+/// The converge half of title relay: every mirrored pane, from the snapshot.
+/// Between converges `pane.updated` carries changes live; a remote too old to
+/// publish that event relies on this alone. Then drop the records of panes
+/// this host no longer mirrors.
+fn relay_titles(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &HostState) {
+    for pane in &remote_snap.panes {
+        if let Some(entry) = state.panes.get(&pane.pane_id) {
+            relay_pane_title(&deps.state_dir, &deps.host.name, &pane.pane_id, entry, pane.terminal_title.as_deref());
+        }
+    }
+    let live: HashSet<&str> =
+        state.panes.values().filter(|e| !e.is_tombstoned()).map(|e| e.local_id.as_str()).collect();
+    crate::state::prune_pane_titles(&deps.state_dir, &deps.host.name, &live);
 }
 
 /// Mark mirrored agents unknown (ssh drop) — statuses recover on reconnect.
@@ -2118,6 +2163,27 @@ mod tests {
 
         let bare = AgentInfo { name: None, ..Default::default() };
         assert_eq!(bare.effective_title(), None);
+    }
+
+    /// `pane.report_agent` accepts exactly idle/working/blocked/unknown, and it
+    /// rejects the WHOLE report on anything else (verified against herdr 0.9.0:
+    /// `unknown variant `done``) — so a verbatim `done` would not degrade, it
+    /// would freeze the mirror on its previous state. The live states pass
+    /// through unchanged; `done` lands as `idle`, from which the local server
+    /// derives its own done-while-unseen; anything unrecognized is `unknown`.
+    #[test]
+    fn remote_statuses_map_onto_what_report_agent_accepts() {
+        for (remote, local) in [
+            ("working", "working"),
+            ("blocked", "blocked"),
+            ("idle", "idle"),
+            ("done", "idle"),
+            ("unknown", "unknown"),
+            ("", "unknown"),
+            ("finished", "unknown"),
+        ] {
+            assert_eq!(map_status(remote), local, "{remote}");
+        }
     }
 
     // simulate herdr's move_workspace(source, insert_index) on an id list
