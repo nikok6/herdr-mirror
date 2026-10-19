@@ -314,6 +314,10 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# compression = true     # default. ssh Compression for every pane stream and
+                         # the daemon's connection. Set on the command line, so
+                         # it beats `Compression no` in ~/.ssh/config; set
+                         # false here (globally or per host) to turn it off.
 
 [hosts.work]
 target = "work"
@@ -331,6 +335,7 @@ target = "work"
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
+# compression = false                # per-host override of the global default
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"

@@ -19,6 +19,7 @@
 //   --max-rows N        uncapped — control fills the local pane). Set for a
 //                       remote with its own display: the remote keeps its own
 //                       geometry and the rest of the local pane stays blank.
+//   --no-compression    ssh without Compression=yes (the default)
 //
 // Every stream gets its own direct ssh connection (no shared ControlMaster):
 // isolated, and nothing persists to go stale on a flaky network.
@@ -77,6 +78,8 @@ pub struct Args {
     pub ctl_path: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
+    /// ssh `Compression` for the pane stream (`--no-compression` turns it off)
+    pub compression: bool,
 }
 
 /// How the pane process should reach its container. The daemon passes a *ref*,
@@ -103,6 +106,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         max_rows: None,
         ctl_path: None,
         container: None,
+        compression: true,
     };
     let mut container_name: Option<String> = None;
     let mut container_folder: Option<String> = None;
@@ -143,6 +147,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
+            "--no-compression" => args.compression = false,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -234,8 +239,8 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
-    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
+fn ssh_stream_args(ssh_target: &str, cmd: &str, compression: bool) -> Vec<String> {
+    let mut argv: Vec<String> = crate::remote::ssh_common_opts(compression)
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
@@ -268,7 +273,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let mut builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &cmd));
+            c.args(ssh_stream_args(&args.ssh_target, &cmd, args.compression));
             c
         }
         Some(ct) => {
@@ -1874,7 +1879,7 @@ mod tests {
 
     #[test]
     fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM", true);
 
         assert_eq!(
             &argv[crate::remote::SSH_COMMON_OPTS.len()..],
@@ -1885,6 +1890,21 @@ mod tests {
                 "exec herdr terminal session observe w5:pM",
             ]
         );
+    }
+
+    /// Compression is on unless a host turns it off, and the choice sits on the
+    /// command line, ahead of anything ~/.ssh/config could say: ssh keeps the
+    /// first value it sees for an option.
+    #[test]
+    fn pane_streams_compress_unless_told_not_to() {
+        let on = ssh_stream_args("work", "cmd", parse_args(&["work".into(), "w1:p1".into()]).unwrap().compression);
+        assert!(on.windows(2).any(|w| w == ["-o", "Compression=yes"]));
+        let off_args = parse_args(&["work".into(), "w1:p1".into(), "--no-compression".into()]).unwrap();
+        let off = ssh_stream_args("work", "cmd", off_args.compression);
+        assert!(off.windows(2).any(|w| w == ["-o", "Compression=no"]));
+        assert!(!off.iter().any(|a| a == "Compression=yes"));
+        let target = off.iter().position(|a| a == "work").unwrap();
+        assert!(off.iter().position(|a| a == "Compression=no").unwrap() < target);
     }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or

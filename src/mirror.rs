@@ -449,6 +449,7 @@ pub(crate) fn cmd_for_pane(
     let always_control = host.always_control;
     let max_cols = host.max_cols;
     let max_rows = host.max_rows;
+    let compression = host.compression;
     let kind = host.kind.clone();
     let docker_bin = host.docker_bin.clone();
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
@@ -474,6 +475,10 @@ pub(crate) fn cmd_for_pane(
         }
         if always_control {
             argv.push("--always-control".into());
+        }
+        // absent at the default, so an unconfigured host's argv is unchanged
+        if !compression {
+            argv.push("--no-compression".into());
         }
         // absent when uncapped, so the argv of an unconfigured host is unchanged
         if let Some(c) = max_cols {
@@ -1759,6 +1764,7 @@ mod tests {
             always_control: true,
             max_cols: None,
             max_rows: None,
+            compression: true,
             api_transport: crate::config::ApiTransport::Auto,
         }
     }

@@ -26,14 +26,28 @@ pub const DORMANT: &str = "dormant";
 const MIN_PREVIEW_BUILD: &str = "2026-06-30";
 
 /// Common ssh options, shared by the daemon's master and every pane stream.
-pub const SSH_COMMON_OPTS: [&str; 6] = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=3",
-];
+///
+/// Compression is on by default: pane streams are base64 JSON frames of mostly
+/// repeated escape sequences, and the daemon's snapshots are JSON, both of which
+/// compress several-fold. ssh takes the FIRST value it sees for an option and
+/// the command line comes before every ssh_config file, so these beat a
+/// `Compression no` in `~/.ssh/config`; the per-host `compression = false`
+/// setting is the override (see `ssh_common_opts`).
+pub const SSH_COMMON_OPTS: [&str; 8] = ssh_common_opts(true);
+
+/// `SSH_COMMON_OPTS` with compression chosen explicitly.
+pub const fn ssh_common_opts(compression: bool) -> [&'static str; 8] {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        if compression { "Compression=yes" } else { "Compression=no" },
+    ]
+}
 
 #[derive(Debug)]
 pub struct RemoteStatus {
@@ -328,7 +342,7 @@ impl RemoteHost {
             "-S".into(),
             self.ctl_path.display().to_string(),
         ];
-        start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
+        start.extend(ssh_common_opts(self.cfg.compression).iter().map(|s| s.to_string()));
         start.extend([
             "-o".into(),
             "ControlPersist=yes".into(),
@@ -657,6 +671,7 @@ mod tests {
             session: None,
             max_cols: None,
             max_rows: None,
+            compression: true,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }

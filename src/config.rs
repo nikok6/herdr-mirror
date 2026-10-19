@@ -115,6 +115,10 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// ssh `Compression` for this host's daemon traffic and pane streams.
+    /// Default on; set false for a host on a fast LAN where the CPU matters
+    /// more than the bytes. On the command line, so it beats ssh_config.
+    pub compression: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +164,7 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    compression: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -181,6 +186,7 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    compression: Option<bool>,
     api_transport: Option<String>,
 }
 
@@ -320,6 +326,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
+            compression: h.compression.or(raw.compression).unwrap_or(true),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -474,6 +481,17 @@ mod tests {
         assert_eq!(c.hosts[0].target, "work");
         assert_eq!(c.hosts[0].remote_bin, None);
         assert_eq!(c.hosts[0].session, None);
+    }
+
+    #[test]
+    fn compression_defaults_on_with_global_and_per_host_override() {
+        let c = parse_config(
+            "compression = false\n[hosts.a]\ntarget = \"a\"\n[hosts.b]\ntarget = \"b\"\ncompression = true\n",
+        )
+        .unwrap();
+        assert!(!c.hosts[0].compression);
+        assert!(c.hosts[1].compression);
+        assert!(parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap().hosts[0].compression);
     }
 
     #[test]
