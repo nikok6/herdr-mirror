@@ -7,7 +7,11 @@
 // (close the mirror).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,6 +20,100 @@ use crate::api::ApiClient;
 use crate::config::HostConfig;
 use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
+
+// --- change-detecting reporter ---
+
+/// What the hub was last told, per object, as a hash of the payload sent.
+///
+/// Every converge and every status update recomputes each mirror's report from the
+/// remote; without this they were all re-sent unconditionally, and each one is
+/// a request into the hub herdr's single app thread plus, for shell clients, a
+/// changed shell projection queued on their (unbounded) control lane. Only a
+/// payload that differs from the last one sent goes out now.
+///
+/// Kept in memory, one per connection (a reconnect starts empty, which is the
+/// right resync point after `mark_unknown`), and forgotten wholesale when the
+/// local server may have lost what it was told (`bump_local_epoch`) and every
+/// `REPORT_RESYNC` as a safety net for anything else that drops a report.
+#[derive(Default)]
+pub struct ReportCache {
+    epoch: u64,
+    since: Option<Instant>,
+    entries: HashMap<(ReportKind, String), u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReportKind {
+    /// `pane.report_agent` + `pane.report_metadata`, keyed by local pane id
+    Pane,
+    /// `workspace.report_metadata` tokens, keyed by local workspace id
+    Workspace,
+    /// tab geometry (`layout.export` pair + ratio sync), keyed `remote|local`
+    Geometry,
+}
+
+pub type Reports = Arc<Mutex<ReportCache>>;
+
+/// Safety resync period: everything is re-sent once this often.
+pub const REPORT_RESYNC: Duration = Duration::from_secs(600);
+
+/// Bumped whenever the local server may have restarted (its event stream was
+/// re-established), which invalidates everything any cache believes it sent.
+static LOCAL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn bump_local_epoch() {
+    LOCAL_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn new_reports() -> Reports {
+    Arc::new(Mutex::new(ReportCache::default()))
+}
+
+pub fn payload_hash(v: &impl Hash) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+impl ReportCache {
+    fn refresh(&mut self, now: Instant) {
+        let epoch = LOCAL_EPOCH.load(Ordering::Relaxed);
+        let stale = self.since.is_none_or(|t| now.duration_since(t) >= REPORT_RESYNC);
+        if epoch != self.epoch || stale {
+            self.entries.clear();
+            self.epoch = epoch;
+            self.since = Some(now);
+        }
+    }
+
+    /// Record `hash` for `key`; true when it differs from what was recorded
+    /// (i.e. the payload must be sent).
+    pub fn changed_at(&mut self, kind: ReportKind, key: &str, hash: u64, now: Instant) -> bool {
+        self.refresh(now);
+        self.entries.insert((kind, key.to_string()), hash) != Some(hash)
+    }
+
+    pub fn changed(&mut self, kind: ReportKind, key: &str, hash: u64) -> bool {
+        self.changed_at(kind, key, hash, Instant::now())
+    }
+
+    /// Drop a record so the next pass sends again (a send failed, or the
+    /// object was retracted).
+    pub fn forget(&mut self, kind: ReportKind, key: &str) {
+        self.entries.remove(&(kind, key.to_string()));
+    }
+}
+
+fn report_changed(reports: &Reports, kind: ReportKind, key: &str, hash: u64) -> bool {
+    // a poisoned lock only means a panic elsewhere; sending is the safe answer
+    reports.lock().map(|mut c| c.changed(kind, key, hash)).unwrap_or(true)
+}
+
+fn report_forget(reports: &Reports, kind: ReportKind, key: &str) {
+    if let Ok(mut c) = reports.lock() {
+        c.forget(kind, key);
+    }
+}
 
 // --- snapshot shapes (subset of the API's SessionSnapshot) ---
 
@@ -111,6 +209,10 @@ impl AgentInfo {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayoutRect {
+    #[serde(default)]
+    pub x: u32,
+    #[serde(default)]
+    pub y: u32,
     pub width: u32,
     pub height: u32,
 }
@@ -122,11 +224,43 @@ pub struct LayoutPaneSnapshot {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct LayoutSplitSnapshot {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub direction: Value,
+    #[serde(default)]
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LayoutSnapshot {
-    #[allow(dead_code)]
     pub tab_id: String,
     #[serde(default)]
     pub panes: Vec<LayoutPaneSnapshot>,
+    #[serde(default)]
+    pub splits: Vec<LayoutSplitSnapshot>,
+}
+
+impl LayoutSnapshot {
+    /// The arrangement a geometry reconcile compares: which pane sits where
+    /// (reading order) and every split's direction and ratio. Deliberately not
+    /// the absolute rects: resizing the window that shows a tab moves every
+    /// rect without changing anything the two sides could disagree about.
+    pub fn fingerprint(&self) -> String {
+        let mut panes: Vec<&LayoutPaneSnapshot> = self.panes.iter().collect();
+        panes.sort_by_key(|p| (p.rect.y, p.rect.x));
+        let mut out = String::new();
+        for p in panes {
+            out.push_str(&p.pane_id);
+            out.push(',');
+        }
+        for s in &self.splits {
+            // ratios are f32 on the wire; three places is far finer than a cell
+            out.push_str(&format!("|{}:{}:{:.3}", s.id, s.direction, s.ratio));
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -433,6 +567,8 @@ pub struct ConvergeDeps {
     /// ambiguous (rebuild in flight, failed converge, server restart), so only a
     /// close event that wasn't our own may close the remote.
     pub closes: crate::closes::Closes,
+    /// what the hub was last told (see `ReportCache`)
+    pub reports: Reports,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -524,13 +660,17 @@ fn sh_quote(s: &str) -> String {
 /// remote's pane sizes" (the remote is headless, the local window is the only
 /// one anyone looks at), so the local side wins there; a watch-only host has its
 /// own display and its layout is authoritative.
+///
+/// Returns true when the two sides were found already agreeing (nothing was
+/// written and both exports succeeded), which is when the caller may skip this
+/// tab until either side's arrangement changes.
 async fn reconcile_tab_geometry(
     deps: &ConvergeDeps,
     state: &mut HostState,
     remote_tab: &str,
     local_tab: &str,
     remote_panes: &[&PaneInfo],
-) {
+) -> bool {
     #[derive(Deserialize)]
     struct Exported {
         layout: ExportedLayout,
@@ -543,7 +683,7 @@ async fn reconcile_tab_geometry(
         deps.remote.request_t::<Exported>("layout.export", json!({ "tab_id": remote_tab })).await;
     let local_layout =
         deps.local.request_t::<Exported>("layout.export", json!({ "tab_id": local_tab })).await;
-    let (Ok(remote), Ok(local)) = (remote_layout, local_layout) else { return };
+    let (Ok(remote), Ok(local)) = (remote_layout, local_layout) else { return false };
 
     let map: BTreeMap<String, String> = remote_panes
         .iter()
@@ -578,7 +718,7 @@ async fn reconcile_tab_geometry(
             log_geometry_drift(&deps.log, remote_tab);
         }
         state.ratios.retain(|k, _| !k.starts_with(&prefix));
-        return;
+        return true;
     }
 
     // swaps first: a ratio describes a position, so it only means the right
@@ -590,7 +730,7 @@ async fn reconcile_tab_geometry(
             .await
         {
             deps.log.log(&format!("{remote_tab}: pane swap failed ({e}) — retrying next pass"));
-            return;
+            return false;
         }
     }
 
@@ -615,6 +755,7 @@ async fn reconcile_tab_geometry(
         }
         state.ratios.insert(format!("{prefix}{path}"), ratio);
     }
+    plan.swaps.is_empty() && plan.ratios.is_empty()
 }
 
 fn log_geometry_drift(log: &Logger, remote_tab: &str) {
@@ -1109,13 +1250,21 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
             continue;
         }
-        let _ = deps
+        let tokens: BTreeMap<&String, &String> = rws.tokens.iter().collect();
+        if !report_changed(&deps.reports, ReportKind::Workspace, &entry.local_id, payload_hash(&tokens)) {
+            continue;
+        }
+        if deps
             .local
             .request(
                 "workspace.report_metadata",
                 json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
             )
-            .await;
+            .await
+            .is_err()
+        {
+            report_forget(&deps.reports, ReportKind::Workspace, &entry.local_id);
+        }
     }
 
     // 4. remote tabs → replicate layout with wrapper commands
@@ -1387,10 +1536,31 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             // exports and moves whichever side didn't change.
             //
             // A tab with fewer than two panes has no split to reconcile, which
-            // is most tabs, so it costs nothing there.
+            // is most tabs, so it costs nothing there. A tab whose arrangement
+            // on both sides is unchanged since it last reconciled clean is
+            // skipped too: that pair of exports was most of every converge.
             if remote_panes_in_tab.len() > 1 {
-                reconcile_tab_geometry(deps, state, &rtab.tab_id, tab_local, &remote_panes_in_tab)
-                    .await;
+                let fingerprint = |layouts: &[LayoutSnapshot], tab: &str| {
+                    layouts.iter().find(|l| l.tab_id == tab).map(LayoutSnapshot::fingerprint)
+                };
+                let key = format!("{}|{tab_local}", rtab.tab_id);
+                let arrangement = (
+                    fingerprint(&remote_snap.layouts, &rtab.tab_id),
+                    fingerprint(&local_snap.layouts, tab_local),
+                );
+                let both_known = arrangement.0.is_some() && arrangement.1.is_some();
+                if !both_known
+                    || report_changed(&deps.reports, ReportKind::Geometry, &key, payload_hash(&arrangement))
+                {
+                    let settled =
+                        reconcile_tab_geometry(deps, state, &rtab.tab_id, tab_local, &remote_panes_in_tab)
+                            .await;
+                    // anything written moves the arrangement, so look again
+                    // next pass; only a clean comparison is remembered
+                    if !settled || !both_known {
+                        report_forget(&deps.reports, ReportKind::Geometry, &key);
+                    }
+                }
             }
         }
     }
@@ -1401,28 +1571,32 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     state.ratios.retain(|k, _| k.split('|').next().is_some_and(|t| live_tabs.contains(t)));
 
     // 5. push authoritative agent status onto mirror panes
-    push_statuses(deps, &remote_snap, state).await;
+    push_statuses(&deps.local, &deps.reports, &deps.host.name, &deps.log, &remote_snap.agents, state).await;
     Ok(())
 }
 
 /// Push one pane's authoritative status (or retract it when the remote agent
 /// is gone). Mutates only its own entry (seq/reported). Reused by both the
 /// full converge and the daemon's status fast-path.
+///
+/// Sends nothing when the payload is the one last sent for this mirror (see
+/// `ReportCache`). Returns whether anything was sent, i.e. whether the entry's
+/// seq moved and the state needs saving.
 pub async fn push_pane_status(
     local: &ApiClient,
+    reports: &Reports,
     host_name: &str,
     remote_id: &str,
     entry: &mut PaneEntry,
     agent: Option<&AgentInfo>,
     log: &Logger,
-) {
+) -> bool {
     if entry.is_tombstoned() {
-        return;
+        return false;
     }
     let source = mirror_source(host_name);
     match agent {
         Some(agent) => {
-            entry.seq += 1;
             let display = agent.display_agent.clone().or_else(|| agent.agent.clone());
             // Identity is the remote's CANONICAL id ("claude"), not the pretty
             // name: herdr canonicalizes a reported label, so this resolves the
@@ -1444,13 +1618,9 @@ pub async fn push_pane_status(
                 "source": source,
                 "agent": label,
                 "state": map_status(status),
-                "seq": entry.seq,
             });
             if let Some(c) = &custom {
                 report["custom_status"] = json!(c);
-            }
-            if let Err(e) = local.request("pane.report_agent", report).await {
-                log.log(&format!("report_agent {}: {e}", entry.local_id));
             }
             // forward the remote's own tokens so a mirrored agent row carries the
             // same values a native one does, under whatever layout is configured
@@ -1462,16 +1632,32 @@ pub async fn push_pane_status(
                 "title": agent.effective_title(),
                 "state_labels": agent.state_labels.clone().unwrap_or_default(),
                 "tokens": agent.tokens.clone(),
-                "seq": entry.seq,
             });
             if custom.is_none() {
                 meta["clear_custom_status"] = json!(true);
             }
-            let _ = local.request("pane.report_metadata", meta).await;
+            // serde_json maps are ordered here (no preserve_order), so equal
+            // payloads serialize, and hash, identically
+            let hash = payload_hash(&(remote_id, report.to_string(), meta.to_string()));
+            if !report_changed(reports, ReportKind::Pane, &entry.local_id, hash) {
+                return false;
+            }
+            entry.seq += 1;
+            report["seq"] = json!(entry.seq);
+            meta["seq"] = json!(entry.seq);
+            if let Err(e) = local.request("pane.report_agent", report).await {
+                log.log(&format!("report_agent {}: {e}", entry.local_id));
+                report_forget(reports, ReportKind::Pane, &entry.local_id);
+            }
+            if local.request("pane.report_metadata", meta).await.is_err() {
+                report_forget(reports, ReportKind::Pane, &entry.local_id);
+            }
             entry.reported = Some(label);
+            true
         }
         None => {
-            let Some(reported) = entry.reported.clone() else { return };
+            report_forget(reports, ReportKind::Pane, &entry.local_id);
+            let Some(reported) = entry.reported.clone() else { return false };
             // remote agent exited — retract our claim so the mirror pane doesn't
             // show a phantom agent row forever
             entry.seq += 1;
@@ -1501,6 +1687,7 @@ pub async fn push_pane_status(
                 )
                 .await;
             entry.reported = None;
+            true
         }
     }
 }
@@ -1546,13 +1733,24 @@ pub async fn apply_remote_closes(
     }
 }
 
-pub async fn push_statuses(deps: &ConvergeDeps, remote_snap: &Snapshot, state: &mut HostState) {
-    let agent_by_pane: HashMap<&str, &AgentInfo> =
-        remote_snap.agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+/// Push every mirrored pane's status from one list of remote agents (a
+/// snapshot's `agents`): a pane absent from the list has no agent. Returns
+/// whether anything was sent (the state needs saving).
+pub async fn push_statuses(
+    local: &ApiClient,
+    reports: &Reports,
+    host_name: &str,
+    log: &Logger,
+    agents: &[AgentInfo],
+    state: &mut HostState,
+) -> bool {
+    let agent_by_pane: HashMap<&str, &AgentInfo> = agents.iter().map(|a| (a.pane_id.as_str(), a)).collect();
+    let mut sent = false;
     for (remote_id, entry) in state.panes.iter_mut() {
         let agent = agent_by_pane.get(remote_id.as_str()).copied();
-        push_pane_status(&deps.local, &deps.host.name, remote_id, entry, agent, &deps.log).await;
+        sent |= push_pane_status(local, reports, host_name, remote_id, entry, agent, log).await;
     }
+    sent
 }
 
 /// Mark mirrored agents unknown (ssh drop) — statuses recover on reconnect.
@@ -2190,5 +2388,161 @@ mod tests {
         });
         let info: AgentInfo = serde_json::from_value(data).unwrap();
         assert!(!info.has_agent());
+    }
+
+    /// A hub stand-in: answers every request with an empty result and records
+    /// the method names, one request per connection like herdr.
+    async fn fake_hub(tag: &str) -> (ApiClient, Arc<Mutex<Vec<String>>>, PathBuf) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("hm-hub-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen2.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    if let Ok(Some(line)) = lines.next_line().await {
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let method = req["method"].as_str().unwrap_or("").to_string();
+                        if method != "ping" {
+                            seen.lock().unwrap().push(method);
+                        }
+                        let reply = json!({ "id": req["id"], "result": {} }).to_string() + "\n";
+                        let _ = write.write_all(reply.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        let api = ApiClient::connect(&sock).await.unwrap();
+        (api, seen, dir)
+    }
+
+    fn agent(pane: &str, status: &str) -> AgentInfo {
+        AgentInfo {
+            pane_id: pane.into(),
+            agent: Some("omp".into()),
+            agent_status: Some(status.into()),
+            ..Default::default()
+        }
+    }
+
+    fn take(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        std::mem::take(&mut *seen.lock().unwrap())
+    }
+
+    /// What the hub receives over a status poll's life: a report only when the
+    /// remote's agent changed, a release once, a re-report after a release, and
+    /// everything again once the local server may have lost it.
+    #[tokio::test]
+    async fn statuses_are_sent_only_when_they_change() {
+        let (local, seen, dir) = fake_hub("dedupe").await;
+        let log = Logger::new(&dir, false);
+        let reports = new_reports();
+        let mut state = HostState::default();
+        state.panes.insert(
+            "w1:p1".into(),
+            PaneEntry { local_id: "w7:p1".into(), tombstone: None, seq: 0, reported: None },
+        );
+        state.panes.insert(
+            "w1:p2".into(),
+            PaneEntry { local_id: "w7:p2".into(), tombstone: None, seq: 0, reported: None },
+        );
+        let working = vec![agent("w1:p1", "working")];
+        let push = |agents: Vec<AgentInfo>, state: &mut HostState| {
+            let (local, reports, log) = (local.clone(), reports.clone(), log.clone());
+            let mut owned = std::mem::take(state);
+            async move {
+                let sent = push_statuses(&local, &reports, "vps", &log, &agents, &mut owned).await;
+                (sent, owned)
+            }
+        };
+
+        let (sent, s) = push(working.clone(), &mut state).await;
+        state = s;
+        assert!(sent);
+        assert_eq!(take(&seen), ["pane.report_agent", "pane.report_metadata"]);
+
+        // twenty identical polls: nothing reaches the hub, seq does not move
+        let seq = state.panes["w1:p1"].seq;
+        for _ in 0..20 {
+            let (sent, s) = push(working.clone(), &mut state).await;
+            state = s;
+            assert!(!sent);
+        }
+        assert!(take(&seen).is_empty());
+        assert_eq!(state.panes["w1:p1"].seq, seq);
+
+        // a real change is one report pair
+        let (_, s) = push(vec![agent("w1:p1", "blocked")], &mut state).await;
+        state = s;
+        assert_eq!(take(&seen), ["pane.report_agent", "pane.report_metadata"]);
+
+        // the agent leaves: one release, then silence
+        let (_, s) = push(vec![], &mut state).await;
+        state = s;
+        assert_eq!(take(&seen), ["pane.release_agent", "pane.report_metadata"]);
+        let (sent, s) = push(vec![], &mut state).await;
+        state = s;
+        assert!(!sent);
+        assert!(take(&seen).is_empty());
+
+        // it comes back exactly as it was before the release: still a report
+        let (_, s) = push(vec![agent("w1:p1", "blocked")], &mut state).await;
+        state = s;
+        assert_eq!(take(&seen), ["pane.report_agent", "pane.report_metadata"]);
+
+        // the local server may have restarted: everything goes out again once
+        bump_local_epoch();
+        let (_, s) = push(vec![agent("w1:p1", "blocked")], &mut state).await;
+        state = s;
+        assert_eq!(take(&seen), ["pane.report_agent", "pane.report_metadata"]);
+        let (sent, _) = push(vec![agent("w1:p1", "blocked")], &mut state).await;
+        assert!(!sent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The safety resync: a payload unchanged for REPORT_RESYNC is sent again.
+    #[test]
+    fn unchanged_reports_are_resent_after_the_resync_period() {
+        let mut cache = ReportCache::default();
+        let t0 = Instant::now();
+        assert!(cache.changed_at(ReportKind::Pane, "w1:p1", 7, t0));
+        assert!(!cache.changed_at(ReportKind::Pane, "w1:p1", 7, t0 + Duration::from_secs(599)));
+        assert!(cache.changed_at(ReportKind::Pane, "w1:p1", 7, t0 + REPORT_RESYNC + Duration::from_secs(1)));
+        // kinds do not collide on the same id
+        assert!(cache.changed_at(ReportKind::Workspace, "w1:p1", 7, t0 + REPORT_RESYNC + Duration::from_secs(2)));
+        cache.forget(ReportKind::Pane, "w1:p1");
+        assert!(cache.changed_at(ReportKind::Pane, "w1:p1", 7, t0 + REPORT_RESYNC + Duration::from_secs(3)));
+    }
+
+    fn layout(panes: &[(&str, u32, u32, u32)], ratio: f64) -> LayoutSnapshot {
+        serde_json::from_value(json!({
+            "tab_id": "w1:t1",
+            "panes": panes.iter().map(|(id, x, y, w)| json!({
+                "pane_id": id, "rect": { "x": x, "y": y, "width": w, "height": 20 }
+            })).collect::<Vec<_>>(),
+            "splits": [{ "id": "s0", "direction": "right", "ratio": ratio, "rect": {"x":0,"y":0,"width":1,"height":1} }],
+        }))
+        .unwrap()
+    }
+
+    /// The geometry skip compares arrangements, not window sizes: a resized
+    /// window (every rect scaled) is the same arrangement, a moved divider or a
+    /// swap is not.
+    #[test]
+    fn layout_fingerprint_tracks_arrangement_not_window_size() {
+        let base = layout(&[("a", 0, 0, 40), ("b", 40, 0, 40)], 0.5);
+        let wider = layout(&[("a", 0, 0, 60), ("b", 60, 0, 60)], 0.5);
+        let dragged = layout(&[("a", 0, 0, 30), ("b", 30, 0, 50)], 0.375);
+        let swapped = layout(&[("b", 0, 0, 40), ("a", 40, 0, 40)], 0.5);
+        assert_eq!(base.fingerprint(), wider.fingerprint());
+        assert_ne!(base.fingerprint(), dragged.fingerprint());
+        assert_ne!(base.fingerprint(), swapped.fingerprint());
     }
 }

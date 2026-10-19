@@ -28,8 +28,8 @@ use tokio::time::Instant;
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
-    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    teardown, AgentInfo, ConvergeDeps,
+    apply_remote_closes, bump_local_epoch, converge, mark_unknown, mirror_source, new_reports,
+    push_pane_status, regroup_sidebar, teardown, AgentInfo, ConvergeDeps, Reports,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
@@ -177,15 +177,28 @@ const BROADCAST_SUBS: &[&str] = &[
     "pane.exited",
     "pane.agent_detected",
     // a bare remote resize (no pane created/closed) has no other event to
-    // hang a converge off of; falls into the generic converge_at branch below
-    // like any subscription this daemon doesn't special-case.
+    // hang a converge off of
     "layout.updated",
 ];
+
+/// Debounce for a converge after a structural remote event.
+const CONVERGE_DEBOUNCE: Duration = Duration::from_millis(500);
+/// Longer for a bare remote resize: dragging a split emits a stream of these,
+/// and only where it stopped matters.
+const LAYOUT_DEBOUNCE: Duration = Duration::from_millis(1500);
 
 fn sub_list(pane_ids: &[String]) -> Vec<Value> {
     let mut subs: Vec<Value> = BROADCAST_SUBS.iter().map(|t| json!({ "type": t })).collect();
     subs.extend(pane_ids.iter().map(|p| json!({ "type": "pane.agent_status_changed", "pane_id": p })));
     subs
+}
+
+/// Earliest of `current` and `at`: a sooner request wins, a later one never
+/// postpones what is already scheduled.
+fn schedule(current: &mut Option<Instant>, at: Instant) {
+    if current.is_none_or(|t| at < t) {
+        *current = Some(at);
+    }
 }
 
 /// Broadcast structure/lifecycle events + per-pane agent-status subscriptions
@@ -228,9 +241,10 @@ async fn resubscribe(
     }
 }
 
-/// Fast-path: apply coalesced status updates without a remote snapshot.
-/// Returns true if an event referenced a pane we don't mirror yet.
-async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
+/// Fast-path: apply coalesced status updates without a remote snapshot, through
+/// the change-detecting reporter. Returns true if an event referenced a pane we
+/// don't mirror yet.
+async fn flush_status(ctx: &HostCtx, reports: &Reports, pending: HashMap<String, Value>) -> bool {
     let mut state = load_state(&ctx.env_state_dir, &ctx.host.name);
     let mut need_converge = false;
     for (remote_id, data) in pending {
@@ -243,7 +257,7 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
         }
         let info: AgentInfo = serde_json::from_value(data).unwrap_or_default();
         let agent = info.has_agent().then_some(&info);
-        push_pane_status(&ctx.local, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
+        push_pane_status(&ctx.local, reports, &ctx.host.name, &remote_id, entry, agent, &ctx.log).await;
     }
     if let Err(e) = save_state(&ctx.env_state_dir, &ctx.host.name, &state) {
         ctx.log.log(&format!("[{}] state save failed: {e}", ctx.host.name));
@@ -302,6 +316,9 @@ async fn run_connected(
         log: ctx.log.clone(),
         close_remote_on_local_close: ctx.close_remote_on_local_close,
         closes: ctx.closes.clone(),
+        // fresh per connection: `mark_unknown` overwrote everything on the way
+        // down, so the first pass after a reconnect must send it all again
+        reports: new_reports(),
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -321,6 +338,7 @@ async fn run_connected(
         let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
         tokio::select! {
             ev = stream.next() => {
+                let now = Instant::now();
                 match ev {
                     None => return Err(err("event stream closed")),
                     // status changes take the fast-path; structure changes
@@ -329,7 +347,7 @@ async fn run_connected(
                         if let Some(pid) = e.data.get("pane_id").and_then(|v| v.as_str()) {
                             // coalesce: keep only the latest per pane
                             pending_status.insert(pid.to_string(), e.data.clone());
-                            status_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                            status_at.get_or_insert(now + Duration::from_millis(150));
                         }
                     }
                     // explicit remote closes are authoritative: remove the mirror
@@ -342,25 +360,28 @@ async fn run_connected(
                         };
                         if let Some(rid) = e.data.get(key).and_then(|v| v.as_str()) {
                             pending_closes.push(rid.to_string());
-                            closes_at.get_or_insert(Instant::now() + Duration::from_millis(150));
+                            closes_at.get_or_insert(now + Duration::from_millis(150));
                         }
                     }
+                    Some(e) if e.event == "layout_updated" => {
+                        schedule(&mut converge_at, now + LAYOUT_DEBOUNCE);
+                    }
                     Some(_) => {
-                        converge_at.get_or_insert(Instant::now() + Duration::from_millis(500));
+                        schedule(&mut converge_at, now + CONVERGE_DEBOUNCE);
                     }
                 }
             }
             Some(()) = poke.recv() => {
-                converge_at.get_or_insert(Instant::now());
+                converge_at = Some(Instant::now());
             }
             _ = sleep => {
                 let now = Instant::now();
                 if status_at.is_some_and(|t| t <= now) {
                     status_at = None;
                     let pending = std::mem::take(&mut pending_status);
-                    if flush_status(ctx, pending).await {
+                    if flush_status(ctx, &deps.reports, pending).await {
                         // unknown pane → let a full pass create it
-                        converge_at.get_or_insert(now);
+                        converge_at = Some(now);
                     }
                 }
                 if closes_at.is_some_and(|t| t <= now) {
@@ -368,7 +389,7 @@ async fn run_connected(
                     let closed = std::mem::take(&mut pending_closes);
                     apply_remote_closes(&ctx.local, &ctx.env_state_dir, &ctx.host.name, &closed, &ctx.log).await;
                     // reconcile + refresh subscriptions after the removals
-                    converge_at.get_or_insert(now);
+                    converge_at = Some(now);
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
@@ -460,11 +481,9 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         // about now, and honouring them would skip the sleep entirely
         while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
-        // us and would otherwise sit behind a 300s dormant sleep. Every other
-        // poke is ordinary local traffic — `local_events_task` fans one out to
-        // every host on every event, `layout.updated` included, so treating them
-        // all as urgent collapses the reconnect ladder and burns a dial (or a
-        // `docker ps`) per split drag.
+        // us and would otherwise sit behind a long sleep. Every other poke is
+        // ordinary local traffic, and treating them as urgent collapses the
+        // backoff and burns a dial (or a `docker ps`) per poke.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
         loop {
             tokio::select! {
@@ -580,8 +599,41 @@ async fn heal_zombie_mirrors(
     }
 }
 
-// Local events: mirror closes drive tombstoning — poke every host so the
-/// next converge records the user's intent promptly.
+/// The local object a hub event is about, when it can concern a mirror: the
+/// id whose owning host must reconcile. `None` for events no host acts on.
+fn local_event_target(event: &str, data: &Value) -> Option<String> {
+    let id = match event {
+        "workspace_closed" => data.get("workspace_id"),
+        "pane_closed" => data.get("pane_id"),
+        "tab_closed" | "tab_renamed" => data.get("tab_id"),
+        // `layout.updated` carries the whole layout of the tab that changed
+        "layout_updated" => data.pointer("/layout/tab_id").or_else(|| data.get("tab_id")),
+        _ => None,
+    };
+    id.and_then(Value::as_str).map(str::to_string)
+}
+
+/// Indices of the hosts whose id map holds `local_id`. herdr ids are unique per
+/// server, so this is at most one host in practice; an unmapped id (a local,
+/// non-mirror object) is none.
+fn owning_hosts(state_dir: &std::path::Path, hosts: &[HostConfig], local_id: &str) -> Vec<usize> {
+    hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            let s = load_state(state_dir, &h.name);
+            s.workspaces.values().any(|e| e.local_id == local_id)
+                || s.tabs.values().any(|e| e.local_id == local_id)
+                || s.panes.values().any(|e| e.local_id == local_id)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Local events: a close, rename or resize of a mirror pokes the host that
+/// owns it, so its next converge records the user's intent promptly. Only that
+/// host: the operator's own resizes and closes elsewhere on the hub used to
+/// make every host take two snapshots per event.
 async fn local_events_task(
     local: ApiClient,
     pokers: Vec<mpsc::Sender<()>>,
@@ -611,6 +663,9 @@ async fn local_events_task(
         ];
         match local.subscribe(subs).await {
             Ok(mut stream) => {
+                // the server may have restarted since anything was reported to
+                // it: every host re-sends its reports on the next pass
+                bump_local_epoch();
                 // catch a sidebar left ungrouped from a previous run
                 regroup_sidebar(&local, &prefixes, &log).await;
                 // subscribe succeeding after a drop = the server is back up;
@@ -634,11 +689,16 @@ async fn local_events_task(
                             }
                         }
                     }
-                    for p in &pokers {
-                        let _ = p.try_send(());
+                    if let Some(id) = local_event_target(&e.event, &e.data) {
+                        for i in owning_hosts(&state_dir, &hosts, &id) {
+                            let _ = pokers[i].try_send(());
+                        }
                     }
-                    // a workspace appeared/left — keep hosts grouped (no-op if already)
-                    regroup_sidebar(&local, &prefixes, &log).await;
+                    // only a workspace appearing or leaving can ungroup the
+                    // sidebar (no-op if already grouped)
+                    if matches!(e.event.as_str(), "workspace_created" | "workspace_closed") {
+                        regroup_sidebar(&local, &prefixes, &log).await;
+                    }
                 }
                 log.log("local event stream dropped — resubscribing");
             }
@@ -927,6 +987,8 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             // close signal — an empty tracker means this pass syncs but never
             // closes a remote object, which is the correct conservative default
             closes: crate::closes::new_closes(),
+            // one pass: nothing was sent before it, so everything is sent
+            reports: new_reports(),
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
@@ -1027,6 +1089,51 @@ mod tests {
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1",
         })));
+    }
+
+    /// A sooner request wins; a later one never postpones a scheduled one.
+    #[test]
+    fn scheduling_keeps_the_earliest_deadline() {
+        let t0 = Instant::now();
+        let mut at = None;
+        schedule(&mut at, t0 + Duration::from_secs(2));
+        schedule(&mut at, t0 + Duration::from_secs(5));
+        assert_eq!(at, Some(t0 + Duration::from_secs(2)));
+        schedule(&mut at, t0);
+        assert_eq!(at, Some(t0));
+    }
+
+    /// Hub events name the object a host would reconcile; everything else is
+    /// none of any host's business.
+    #[test]
+    fn local_events_name_the_object_to_route_by() {
+        let layout = json!({ "layout": { "tab_id": "w3:t2", "workspace_id": "w3", "panes": [] } });
+        assert_eq!(local_event_target("layout_updated", &layout).as_deref(), Some("w3:t2"));
+        assert_eq!(local_event_target("tab_renamed", &json!({ "tab_id": "w3:t1" })).as_deref(), Some("w3:t1"));
+        assert_eq!(local_event_target("pane_closed", &json!({ "pane_id": "w3:p1" })).as_deref(), Some("w3:p1"));
+        assert_eq!(local_event_target("workspace_closed", &json!({ "workspace_id": "w3" })).as_deref(), Some("w3"));
+        assert_eq!(local_event_target("workspace_created", &json!({ "workspace_id": "w4" })), None);
+    }
+
+    /// Only the host whose map holds the id is poked; a hub-only object pokes
+    /// nobody.
+    #[test]
+    fn local_events_poke_only_the_owning_host() {
+        let env = lock_test_env("owners");
+        let hosts: Vec<HostConfig> = crate::config::parse_config(
+            "[hosts.a]\ntarget = \"a\"\n[hosts.b]\ntarget = \"b\"\n",
+        )
+        .unwrap()
+        .hosts;
+        let mut b = crate::state::HostState::default();
+        b.tabs.insert(
+            "w1:t1".into(),
+            crate::state::TabEntry { local_id: "w9:t3".into(), last_remote_label: None },
+        );
+        save_state(&env.state_dir, "b", &b).unwrap();
+        assert_eq!(owning_hosts(&env.state_dir, &hosts, "w9:t3"), vec![1]);
+        assert!(owning_hosts(&env.state_dir, &hosts, "w2:t1").is_empty());
+        let _ = fs::remove_dir_all(&env.state_dir);
     }
 
     fn lock_test_env(tag: &str) -> Env {
