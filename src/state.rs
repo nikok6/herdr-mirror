@@ -158,6 +158,82 @@ pub fn take_pane_hint(state_dir: &Path, local_pane_id: &str) -> Option<String> {
     (fresh && !msg.is_empty()).then_some(msg)
 }
 
+/// A remote pane's live terminal title, relayed to the streamer drawing its
+/// mirror.
+///
+/// Two processes are needed for one fact. The daemon is what sees the title (on
+/// the remote API), but herdr only derives a pane's `terminal_title` from what
+/// the pane's own process writes (OSC 2), and the only process writing into a
+/// mirror pane is its streamer. Without this every mirror reports the title
+/// the shell set before `exec` — the `.mirror-pane` placeholder path — to
+/// every herdr client that names panes by terminal title.
+///
+/// `remote` rides along because herdr reuses freed local pane ids: a streamer
+/// only takes a title addressed to the remote pane it is actually showing.
+/// `host` is what lets each host's daemon prune only its own files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneTitle {
+    pub host: String,
+    pub remote: String,
+    /// `None` when the remote pane has no title, which is relayed as well: the
+    /// mirror then reports none either, instead of the placeholder's.
+    pub title: Option<String>,
+}
+
+fn pane_titles_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("pane-titles")
+}
+
+fn pane_title_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    pane_titles_dir(state_dir).join(format!("{}.json", crate::util::sane_component(local_pane_id)))
+}
+
+pub fn read_pane_title(state_dir: &Path, local_pane_id: &str) -> Option<PaneTitle> {
+    let text = std::fs::read_to_string(pane_title_path(state_dir, local_pane_id)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Record a pane's title. True only when it changed and landed, which is when
+/// the streamer is worth waking: titles are relayed on every converge and on
+/// every remote `pane.updated`, and almost all of those repeat what is there.
+///
+/// Written to a temp file and renamed so a streamer woken mid-write can never
+/// read half a record.
+pub fn put_pane_title(state_dir: &Path, local_pane_id: &str, title: &PaneTitle) -> bool {
+    if read_pane_title(state_dir, local_pane_id).as_ref() == Some(title) {
+        return false;
+    }
+    let path = pane_title_path(state_dir, local_pane_id);
+    let tmp = path.with_extension("json.tmp");
+    let Ok(text) = serde_json::to_string(title) else { return false };
+    std::fs::create_dir_all(pane_titles_dir(state_dir)).is_ok()
+        && std::fs::write(&tmp, text).is_ok()
+        && std::fs::rename(&tmp, &path).is_ok()
+}
+
+/// Drop the titles `host` relayed to local panes it no longer mirrors, so the
+/// directory does not grow by one file per mirror ever made. Other hosts'
+/// files are left alone: each daemon task only knows its own map.
+pub fn prune_pane_titles(state_dir: &Path, host: &str, live_local_ids: &std::collections::HashSet<&str>) {
+    let live: std::collections::HashSet<String> =
+        live_local_ids.iter().map(|id| crate::util::sane_component(id)).collect();
+    let Ok(dir) = std::fs::read_dir(pane_titles_dir(state_dir)) else { return };
+    for file in dir.flatten() {
+        let path = file.path();
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if path.extension().and_then(|e| e.to_str()) != Some("json") || live.contains(stem) {
+            continue;
+        }
+        let ours = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<PaneTitle>(&t).ok())
+            .is_some_and(|t| t.host == host);
+        if ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn state_path(state_dir: &Path, host: &str) -> PathBuf {
     state_dir.join(format!("{host}-map.json"))
 }
@@ -260,6 +336,44 @@ mod tests {
         assert_eq!(unsafe { libc::utimes(c.as_ptr(), [t, t].as_ptr()) }, 0);
         assert_eq!(take_pane_hint(&dir, "wBT:p2"), None);
         assert!(!path.exists(), "stale or not, it is consumed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn title(host: &str, remote: &str, t: Option<&str>) -> PaneTitle {
+        PaneTitle { host: host.into(), remote: remote.into(), title: t.map(str::to_string) }
+    }
+
+    #[test]
+    fn a_pane_title_is_rewritten_only_when_it_changes() {
+        let dir = std::env::temp_dir().join(format!("hm-title-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let working = title("vibe1", "wD:p3", Some("π ⠴ jev-game"));
+        assert!(put_pane_title(&dir, "w5:p4", &working), "first relay lands");
+        assert_eq!(read_pane_title(&dir, "w5:p4").as_ref(), Some(&working));
+        // the converge pass relays every pane every time; a repeat must not
+        // wake the streamer
+        assert!(!put_pane_title(&dir, "w5:p4", &working));
+        let idle = title("vibe1", "wD:p3", Some("π > jev-game"));
+        assert!(put_pane_title(&dir, "w5:p4", &idle));
+        // losing the title is a change too, and is relayed as such
+        assert!(put_pane_title(&dir, "w5:p4", &title("vibe1", "wD:p3", None)));
+        assert_eq!(read_pane_title(&dir, "w5:p4").unwrap().title, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_titles_spares_live_panes_and_other_hosts() {
+        let dir = std::env::temp_dir().join(format!("hm-title-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        put_pane_title(&dir, "w5:p2", &title("vibe1", "wD:p1", Some("live")));
+        put_pane_title(&dir, "w5:p9", &title("vibe1", "wD:p8", Some("closed")));
+        put_pane_title(&dir, "w7:p3", &title("office", "w4:p1M", Some("other host")));
+        let live: std::collections::HashSet<&str> = ["w5:p2"].into_iter().collect();
+        prune_pane_titles(&dir, "vibe1", &live);
+        assert!(read_pane_title(&dir, "w5:p2").is_some());
+        assert!(read_pane_title(&dir, "w5:p9").is_none(), "vibe1 no longer mirrors it");
+        // vibe1's daemon task knows nothing about office's map
+        assert!(read_pane_title(&dir, "w7:p3").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
