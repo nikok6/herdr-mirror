@@ -276,14 +276,27 @@ fn remember_transport(
     }
 }
 
+/// How far one dial got before it failed: the daemon's retry pacing and its
+/// once-per-outage bookkeeping both depend on it.
+#[derive(Default)]
+struct Attempt {
+    /// the remote's own `herdr status` answered (see `RemoteHost::reached`)
+    reached: bool,
+    /// the remote api answered, so this failure ended a live connection
+    connected: bool,
+}
+
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
-/// until the connection drops (returns Err).
+/// until the connection drops (returns Err). `attempt` records how far the
+/// dial got, so the caller can tell an unreachable host from a herdr that is
+/// not serving, and a failed redial from the end of a live connection.
 async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
-    backoff_idx: &mut usize,
+    retry: &mut Retry,
     remembered_transport: &mut Option<crate::config::ApiTransport>,
     exec_streak: &mut u32,
+    attempt: &mut Attempt,
 ) -> Result<()> {
     let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
     // a fresh RemoteHost is built on every reconnect, so what worked last
@@ -291,9 +304,12 @@ async fn run_connected(
     // would otherwise be re-probed via streamlocal on every single reconnect
     // for the life of the daemon
     remote_host.hint_transport(*remembered_transport);
-    let (remote, _status) = remote_host.connect_api().await?;
+    let dialled = remote_host.connect_api().await;
+    attempt.reached = remote_host.reached;
+    let (remote, _status) = dialled?;
     *remembered_transport = remember_transport(remote_host.last_api_transport, exec_streak);
-    *backoff_idx = 0;
+    retry.connected();
+    attempt.connected = true;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
         remote: remote.clone(),
@@ -310,6 +326,7 @@ async fn run_connected(
     let state = converge(&deps).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
+    retry.synced();
 
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
@@ -393,20 +410,174 @@ async fn run_connected(
 
 /// Retry pacing after a lost connection.
 ///
-/// ssh keeps its original ladder: an unreachable machine is a fault, and you
-/// want it back fast. A stopped container is not a fault, it is the resting
-/// state, so retrying every 30s forever would burn a `docker ps` per host per
-/// half-minute and fill the log with non-events.
-const RECONNECT_DELAYS: [u64; 3] = [5, 10, 30];
+/// An unreachable machine backs off exponentially from 5 s to 5 min: the first
+/// retries come quickly (a blip, a reboot), and a machine that is simply off
+/// costs one dial every 5 min instead of two ssh spawns every 31 s forever.
+///
+/// A machine that answers while its herdr does not — the server restarting,
+/// shutting down, or stopped — is redialled every 2 s for up to 3 min. A
+/// restart is over in seconds, and the ladder would leave the mirror (and
+/// every agent status on it) waiting minutes for a server long since back;
+/// each of those redials is one `herdr status` over the live ssh master.
+/// A herdr still down after the window joins the ladder.
+///
+/// A stopped container is not a fault, it is the resting state, and waits the
+/// dormant interval from the start.
+const RECONNECT_FIRST: u64 = 5;
+const RECONNECT_MAX: u64 = 300;
 const DORMANT_DELAY: u64 = 300;
+const HERDR_DOWN_RETRY: u64 = 2;
+const HERDR_DOWN_WINDOW: Duration = Duration::from_secs(180);
+
+fn reconnect_delay(attempt: usize) -> u64 {
+    RECONNECT_FIRST
+        .saturating_mul(1u64 << attempt.min(16))
+        .min(RECONNECT_MAX)
+}
+
+/// Why a dial, or a live connection, failed — as far as pacing cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// ssh (or docker) never got an answer out of the machine: off, off the
+    /// network, refusing us, or timing out
+    Unreachable,
+    /// the machine answered but its herdr is not serving: not running,
+    /// shutting down, its api socket gone, or the event stream cut
+    HerdrDown,
+    /// a stopped container
+    Dormant,
+}
+
+/// `reached` is `Attempt::reached`: the remote's own `herdr status` answered
+/// (and said nothing fast retrying cannot fix), so everything that failed
+/// after it — the server reported down, the api ping, a subscribe or converge
+/// cut short — is herdr's, not the network's. Classifying by how far the dial
+/// got, rather than by matching error text, covers every message herdr and
+/// ssh may print without listing them.
+///
+/// The dormant marker is matched with starts_with, not contains: it is always
+/// emitted as a prefix, while the error text can embed user strings (target,
+/// remote_bin), and a substring test would make an ssh host named
+/// `dormant-box` wait out the dormant interval on every genuine failure.
+fn classify(error: &str, reached: bool) -> Failure {
+    if error.starts_with(crate::remote::DORMANT) {
+        Failure::Dormant
+    } else if reached {
+        Failure::HerdrDown
+    } else {
+        Failure::Unreachable
+    }
+}
+
+/// What a retry's log line should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// first failure of a herdr-down run: announce the fast retries
+    FastStart,
+    /// inside the fast window: quiet, its start was logged
+    Fast,
+    /// the fast window ran out with herdr still down: say so once
+    FastSpent,
+    /// the ladder or the dormant wait: logged per `retry_log_due`
+    Slow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// no herdr-down run in progress
+    Closed,
+    /// fast retrying since this instant
+    Open(Instant),
+    /// fast retrying ran out; herdr-down failures climb the ladder
+    Spent,
+}
+
+/// One host's retry pacing across reconnects.
+struct Retry {
+    /// next rung of the unreachable ladder
+    rung: usize,
+    window: Window,
+}
+
+impl Retry {
+    fn new() -> Retry {
+        Retry { rung: 0, window: Window::Closed }
+    }
+
+    /// The remote api answered: the ladder starts over.
+    fn connected(&mut self) {
+        self.rung = 0;
+    }
+
+    /// Connected and synced: the next herdr outage gets a fresh fast window.
+    /// Not at `connected` — a connection that fails its first sync every time
+    /// would reopen the window forever and redial every 2 s for good.
+    fn synced(&mut self) {
+        self.window = Window::Closed;
+    }
+
+    /// Seconds until the next dial after `failure` at `now`.
+    fn next(&mut self, failure: Failure, now: Instant) -> (u64, Pace) {
+        match failure {
+            // dormant cycles must not advance the ladder they do not use: a
+            // container stopped overnight would otherwise leave the next real
+            // failure while it boots waiting 5 minutes instead of 5 seconds
+            Failure::Dormant => {
+                self.window = Window::Closed;
+                (DORMANT_DELAY, Pace::Slow)
+            }
+            // a host that went unreachable mid-run and came back with herdr
+            // still starting (a reboot) earns a fresh window
+            Failure::Unreachable => {
+                self.window = Window::Closed;
+                (self.climb(), Pace::Slow)
+            }
+            Failure::HerdrDown => match self.window {
+                Window::Closed => {
+                    self.window = Window::Open(now);
+                    (HERDR_DOWN_RETRY, Pace::FastStart)
+                }
+                Window::Open(since) if now.duration_since(since) < HERDR_DOWN_WINDOW => {
+                    (HERDR_DOWN_RETRY, Pace::Fast)
+                }
+                Window::Open(_) => {
+                    self.window = Window::Spent;
+                    (self.climb(), Pace::FastSpent)
+                }
+                Window::Spent => (self.climb(), Pace::Slow),
+            },
+        }
+    }
+
+    fn climb(&mut self) -> u64 {
+        let delay = reconnect_delay(self.rung);
+        self.rung += 1;
+        delay
+    }
+}
+
+/// A repeat of the error last logged stays quiet for this long.
+const RETRY_LOG_QUIET: Duration = Duration::from_secs(3600);
+
+/// Is this failed dial worth a log line? The first of a streak, an error that
+/// differs from the one last logged, or the same one an hour on — so a host
+/// that is off is one line an hour, not one per retry.
+fn retry_log_due(last: Option<&(String, Instant)>, error: &str, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some((logged, at)) => logged != error || now.duration_since(*at) >= RETRY_LOG_QUIET,
+    }
+}
 
 async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
-    let mut backoff_idx = 0usize;
-    let mut was_dormant = false;
+    let mut retry = Retry::new();
     // persists across reconnects for the daemon's whole lifetime — the
     // point of remembering at all (see `run_connected`)
     let mut remembered_transport: Option<crate::config::ApiTransport> = None;
     let mut exec_streak = 0u32;
+    // the error last logged for this host's failure streak, and when
+    let mut last_logged: Option<(String, Instant)> = None;
+    let mut failures = 0u64;
     loop {
         // Before dialling, and again after every failed dial: taking a hidden
         // host's mirrors down needs only the LOCAL api, so it must not wait on a
@@ -420,51 +591,64 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
             &ctx.closes,
         )
         .await;
+        let mut attempt = Attempt::default();
         let e = match run_connected(
             &ctx,
             &mut poke,
-            &mut backoff_idx,
+            &mut retry,
             &mut remembered_transport,
             &mut exec_streak,
+            &mut attempt,
         )
         .await
         {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
-        mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost")
-            .await;
-        // starts_with, not contains: the marker is always emitted as a prefix,
-        // while the error text can embed user strings (target, remote_bin). A
-        // substring test would make an ssh host named `dormant-box` back off
-        // for 5 minutes and stop logging on every genuine failure.
-        let dormant = e.to_string().starts_with(crate::remote::DORMANT);
-        let delay = if dormant {
-            DORMANT_DELAY
-        } else {
-            RECONNECT_DELAYS[backoff_idx.min(RECONNECT_DELAYS.len() - 1)]
-        };
-        // dormant cycles must not advance the ladder they do not use: a
-        // container stopped overnight would otherwise leave backoff_idx pinned
-        // at the 30s rung, so the first real failure while it boots waits 30s
-        // instead of the 5s the ladder exists to give.
-        if !dormant {
-            backoff_idx += 1;
+        if attempt.connected {
+            last_logged = None;
+            failures = 0;
         }
-        // log dormancy once on entry, not on every poll of a stopped container
-        if !dormant || !was_dormant {
-            ctx.log.log(&format!("[{}] disconnected ({e}) — retrying in {delay}s", ctx.host.name));
+        // Once per outage: when a live connection ends, and on the first failed
+        // dial after startup (a previous daemon may have left these mirrors
+        // claiming a state nobody is updating). Every failed redial after that
+        // would only re-send the same "unknown".
+        if failures == 0 {
+            mark_unknown(&ctx.local, &ctx.env_state_dir, &ctx.host.name, "mirror: connection lost").await;
         }
-        was_dormant = dormant;
+        failures += 1;
+        let text = e.to_string();
+        let now = Instant::now();
+        let (delay, pace) = retry.next(classify(&text, attempt.reached), now);
+        let streak = if failures > 1 { format!(", attempt {failures}") } else { String::new() };
+        match pace {
+            Pace::Fast => {}
+            Pace::FastStart => {
+                ctx.log.log(&format!(
+                    "[{}] disconnected ({text}) — retrying every {HERDR_DOWN_RETRY}s for up to {}s while the host answers{streak}",
+                    ctx.host.name,
+                    HERDR_DOWN_WINDOW.as_secs()
+                ));
+                // whatever ends the fast run is news
+                last_logged = None;
+            }
+            Pace::FastSpent | Pace::Slow => {
+                if pace == Pace::FastSpent || retry_log_due(last_logged.as_ref(), &text, now) {
+                    ctx.log.log(&format!(
+                        "[{}] disconnected ({text}) — retrying in {delay}s{streak}; repeats of this error are logged hourly",
+                        ctx.host.name
+                    ));
+                    last_logged = Some((text, now));
+                }
+            }
+        }
         // drain FIRST: pokes that piled up during a multi-second dial say nothing
         // about now, and honouring them would skip the sleep entirely
         while poke.try_recv().is_ok() {}
         // Wake early only for a hidden host, whose close is genuinely waiting on
-        // us and would otherwise sit behind a 300s dormant sleep. Every other
-        // poke is ordinary local traffic — `local_events_task` fans one out to
-        // every host on every event, `layout.updated` included, so treating them
-        // all as urgent collapses the reconnect ladder and burns a dial (or a
-        // `docker ps`) per split drag.
+        // us and would otherwise sit behind a long sleep. Every other poke is
+        // ordinary local traffic, and treating them as urgent collapses the
+        // backoff and burns a dial (or a `docker ps`) per poke.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(delay);
         loop {
             tokio::select! {
@@ -1027,6 +1211,146 @@ mod tests {
             "type": "pane.agent_status_changed",
             "pane_id": "w1:p1",
         })));
+    }
+
+    /// Unreachable hosts back off 5 s doubling to a 5 min ceiling, and stay
+    /// there however long the outage lasts.
+    #[test]
+    fn unreachable_hosts_back_off_exponentially_to_five_minutes() {
+        let ladder: Vec<u64> = (0..9).map(reconnect_delay).collect();
+        assert_eq!(ladder, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+        assert_eq!(reconnect_delay(10_000), 300);
+        // a day at the ceiling is 288 dials, where the old 30 s rung was 2880
+        let day: u64 = (0..400).map(reconnect_delay).scan(0u64, |t, d| { *t += d; Some(*t) })
+            .take_while(|t| *t <= 86_400).count() as u64;
+        assert!(day < 300, "{day} dials in a day");
+    }
+
+    /// A host that stays down logs its error once an hour, not per retry; a
+    /// different error is news and logs at once.
+    #[test]
+    fn a_repeated_dial_failure_is_logged_hourly() {
+        let t0 = Instant::now();
+        assert!(retry_log_due(None, "no route", t0));
+        let logged = ("no route".to_string(), t0);
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(300)));
+        assert!(!retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3599)));
+        assert!(retry_log_due(Some(&logged), "no route", t0 + Duration::from_secs(3600)));
+        assert!(retry_log_due(Some(&logged), "auth failed", t0 + Duration::from_secs(1)));
+    }
+
+    /// Pacing follows how far the dial got, not the wording of the error.
+    #[test]
+    fn failures_are_classified_by_how_far_the_dial_got() {
+        // the machine never answered `herdr status`
+        for e in [
+            "ssh master to office failed: ssh: connect to host office port 22: Connection timed out",
+            "ssh exec failed (exec herdr status --json): ssh timeout",
+            "ssh master to office did not create a usable control socket: exit 255",
+        ] {
+            assert_eq!(classify(e, false), Failure::Unreachable, "{e}");
+        }
+        // it did, so what failed after is herdr: the 0.9.5 shutdown answer,
+        // a socket that is gone, the server reported down, the stream cut
+        for e in [
+            "remote herdr server is not running",
+            "remote herdr session \"work\" is not running",
+            "ping: server is shutting down",
+            "api closed before response: ping",
+            "No such file or directory (os error 2)",
+            "event stream closed",
+            "subscribe: stream closed before ack",
+        ] {
+            assert_eq!(classify(e, true), Failure::HerdrDown, "{e}");
+        }
+        let dormant = format!("{}: no running container for app", crate::remote::DORMANT);
+        assert_eq!(classify(&dormant, false), Failure::Dormant);
+        assert_eq!(classify(&dormant, true), Failure::Dormant);
+        // a user string that merely contains the marker is not dormant
+        assert_eq!(classify("ssh master to dormant-box failed: exit 255", false), Failure::Unreachable);
+    }
+
+    /// A herdr restart on a reachable host is redialled every 2 s for 3 min,
+    /// with one log line at the start; past that it joins the ladder.
+    #[test]
+    fn a_down_herdr_is_redialled_fast_for_a_bounded_window() {
+        let t0 = Instant::now();
+        let mut r = Retry::new();
+        assert_eq!(r.next(Failure::HerdrDown, t0), (2, Pace::FastStart));
+        let mut t = t0;
+        let mut fast = 0;
+        loop {
+            t += Duration::from_secs(2);
+            match r.next(Failure::HerdrDown, t) {
+                (2, Pace::Fast) => fast += 1,
+                (5, Pace::FastSpent) => break,
+                other => panic!("unexpected {other:?} at {:?}", t - t0),
+            }
+        }
+        assert_eq!(t - t0, HERDR_DOWN_WINDOW);
+        assert_eq!(fast, 89, "one dial every 2 s for 3 min");
+        assert_eq!(r.next(Failure::HerdrDown, t + Duration::from_secs(5)), (10, Pace::Slow));
+        assert_eq!(r.next(Failure::HerdrDown, t + Duration::from_secs(15)), (20, Pace::Slow));
+
+        // a sync opens a fresh window for the next restart
+        r.connected();
+        r.synced();
+        assert_eq!(r.next(Failure::HerdrDown, t + Duration::from_secs(600)), (2, Pace::FastStart));
+    }
+
+    /// The outage that motivated the window: the stream closes, herdr is back
+    /// 60 s later. The ladder answered at 75 s (5+10+20+40); the fast retry
+    /// within one 2 s step of the server's return.
+    #[test]
+    fn a_restart_reconnects_within_one_fast_step() {
+        let t0 = Instant::now();
+        let back = Duration::from_secs(60);
+        let mut r = Retry::new();
+        let mut t = t0;
+        loop {
+            let (delay, _) = r.next(Failure::HerdrDown, t);
+            t += Duration::from_secs(delay);
+            if t - t0 >= back {
+                break;
+            }
+        }
+        assert!(t - t0 - back <= Duration::from_secs(HERDR_DOWN_RETRY), "{:?}", t - t0);
+    }
+
+    /// Unreachable keeps the ladder; it closes a fast window, so a host that
+    /// comes back from a reboot with herdr still starting gets a fresh one;
+    /// dormant waits do not climb.
+    #[test]
+    fn unreachable_and_dormant_keep_their_pacing() {
+        let t0 = Instant::now();
+        let mut r = Retry::new();
+        assert_eq!(r.next(Failure::HerdrDown, t0), (2, Pace::FastStart));
+        let ladder: Vec<u64> = (0..4).map(|_| r.next(Failure::Unreachable, t0).0).collect();
+        assert_eq!(ladder, [5, 10, 20, 40]);
+        assert_eq!(r.next(Failure::Dormant, t0), (DORMANT_DELAY, Pace::Slow));
+        assert_eq!(r.next(Failure::Unreachable, t0), (80, Pace::Slow));
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(r.next(Failure::HerdrDown, later), (2, Pace::FastStart));
+        assert_eq!(r.next(Failure::HerdrDown, later + Duration::from_secs(2)), (2, Pace::Fast));
+        r.connected();
+        assert_eq!(r.next(Failure::Unreachable, later), (5, Pace::Slow));
+    }
+
+    /// A connection that answers but never syncs must not keep the 2 s
+    /// cadence forever: only a sync reopens the window.
+    #[test]
+    fn a_connection_that_never_syncs_does_not_reopen_the_window() {
+        let t0 = Instant::now();
+        let mut r = Retry::new();
+        assert_eq!(r.next(Failure::HerdrDown, t0), (2, Pace::FastStart));
+        let mut t = t0;
+        while t - t0 < HERDR_DOWN_WINDOW {
+            t += Duration::from_secs(2);
+            r.connected();
+            r.next(Failure::HerdrDown, t);
+        }
+        r.connected();
+        assert_eq!(r.next(Failure::HerdrDown, t + Duration::from_secs(2)), (5, Pace::Slow));
     }
 
     fn lock_test_env(tag: &str) -> Env {

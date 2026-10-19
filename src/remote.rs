@@ -38,8 +38,20 @@ pub const SSH_COMMON_OPTS: [&str; 6] = [
 #[derive(Debug)]
 pub struct RemoteStatus {
     pub socket: String,
+    /// the remote's `herdr status` says its server is up
+    pub running: bool,
     pub supported: bool,
     pub reason: Option<String>,
+}
+
+impl RemoteStatus {
+    /// The remote answered and nothing about its herdr is permanently wrong:
+    /// the server is up on a usable version, or simply not running (yet). A
+    /// running server on an unusable version is excluded — that is a config
+    /// problem no amount of fast redialling fixes.
+    pub fn worth_fast_retry(&self) -> bool {
+        self.supported || !self.running
+    }
 }
 
 struct SshOutput {
@@ -164,6 +176,11 @@ pub struct RemoteHost {
     /// ssh hosts only: which transport this connection actually used, so the
     /// daemon can feed it back into the next `RemoteHost`'s `hint_transport`.
     pub last_api_transport: Option<ApiTransport>,
+    /// Set by `connect_api` once the remote's own `herdr status` answered and
+    /// `worth_fast_retry` holds: ssh (or `docker exec`) works, so whatever
+    /// fails after that is herdr not serving yet, not the machine being
+    /// unreachable. The daemon paces those two very differently.
+    pub reached: bool,
     log: Logger,
 }
 
@@ -257,6 +274,7 @@ impl RemoteHost {
             exec_relay: None,
             exec_sock: state_dir.join(format!("{stem}-api-exec.sock")),
             last_api_transport: None,
+            reached: false,
             log: Logger::new(state_dir, false),
         }
     }
@@ -377,52 +395,7 @@ impl RemoteHost {
             self.cfg.session.as_deref(),
         );
         let out = self.exec(&format!("exec {} status --json", bin), 15000).await?;
-        #[derive(Deserialize)]
-        struct Client {
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Server {
-            running: Option<bool>,
-            socket: Option<String>,
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct StatusJson {
-            client: Option<Client>,
-            server: Option<Server>,
-        }
-        let parsed: StatusJson = serde_json::from_str(&out)?;
-        let version = parsed
-            .server
-            .as_ref()
-            .and_then(|s| s.version.clone())
-            .or(parsed.client.and_then(|c| c.version))
-            .unwrap_or_else(|| "unknown".into());
-        let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
-        let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
-        let mut status = RemoteStatus { socket, supported: false, reason: None };
-        if !running {
-            // Name the session, or this reads as "that machine's herdr is
-            // down" while the default session is running perfectly and only
-            // the configured one is stopped — which is the common way to get
-            // here once `session` is in play (a typo, or `herdr session stop`).
-            status.reason = Some(match &self.cfg.session {
-                Some(name) => format!("remote herdr session {name:?} is not running"),
-                None => "remote herdr server is not running".into(),
-            });
-            return Ok(status);
-        }
-        match version_supported(&version) {
-            Some(true) => status.supported = true,
-            Some(false) => {
-                status.reason = Some(format!(
-                    "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
-                ))
-            }
-            None => status.reason = Some(format!("cannot parse remote version {version}")),
-        }
-        Ok(status)
+        parse_status(&out, self.cfg.session.as_deref())
     }
 
     pub async fn forward_api(&mut self, remote_socket: &str) -> Result<PathBuf> {
@@ -568,6 +541,7 @@ impl RemoteHost {
                 self.status().await?
             }
         };
+        self.reached = status.worth_fast_retry();
         if !status.supported {
             return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
         }
@@ -613,6 +587,56 @@ fn nonempty(e: &str, code: i32) -> String {
     } else {
         t.to_string()
     }
+}
+
+/// The remote's `herdr status --json`, reduced to what connecting needs.
+fn parse_status(out: &str, session: Option<&str>) -> Result<RemoteStatus> {
+    #[derive(Deserialize)]
+    struct Client {
+        version: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Server {
+        running: Option<bool>,
+        socket: Option<String>,
+        version: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct StatusJson {
+        client: Option<Client>,
+        server: Option<Server>,
+    }
+    let parsed: StatusJson = serde_json::from_str(out)?;
+    let version = parsed
+        .server
+        .as_ref()
+        .and_then(|s| s.version.clone())
+        .or(parsed.client.and_then(|c| c.version))
+        .unwrap_or_else(|| "unknown".into());
+    let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
+    let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
+    let mut status = RemoteStatus { socket, running, supported: false, reason: None };
+    if !running {
+        // Name the session, or this reads as "that machine's herdr is
+        // down" while the default session is running perfectly and only
+        // the configured one is stopped — which is the common way to get
+        // here once `session` is in play (a typo, or `herdr session stop`).
+        status.reason = Some(match session {
+            Some(name) => format!("remote herdr session {name:?} is not running"),
+            None => "remote herdr server is not running".into(),
+        });
+        return Ok(status);
+    }
+    match version_supported(&version) {
+        Some(true) => status.supported = true,
+        Some(false) => {
+            status.reason = Some(format!(
+                "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
+            ))
+        }
+        None => status.reason = Some(format!("cannot parse remote version {version}")),
+    }
+    Ok(status)
 }
 
 /// `Some(true)` = supported, `Some(false)` = too old, `None` = unparseable.
@@ -809,5 +833,41 @@ mod tests {
         assert_eq!(version_supported("0.7.1-preview.2026-07-04-aaaa"), Some(true));
         assert_eq!(version_supported("0.7.1-preview.2026-06-29-aaaa"), Some(false));
         assert_eq!(version_supported("garbage"), None);
+    }
+
+    /// `herdr status --json` as herdr 0.9.5 prints it with no server.
+    const STATUS_DOWN: &str = r#"{"client":{"version":"0.9.5","channel":"stable","protocol":22,"session":null},"server":{"status":"not_running","running":false,"version":null,"protocol":null,"socket":"/home/u/.config/herdr/herdr.sock","session":null,"restart_needed":false}}"#;
+
+    fn status_up(version: &str) -> String {
+        format!(
+            r#"{{"client":{{"version":"0.9.5"}},"server":{{"status":"running","running":true,"version":"{version}","socket":"/home/u/.config/herdr/herdr.sock"}}}}"#
+        )
+    }
+
+    /// A stopped or restarting herdr on a machine that answers is worth the
+    /// fast retry; an unusable version on a running server is not.
+    #[test]
+    fn herdr_status_decides_whether_fast_retry_can_help() {
+        let down = parse_status(STATUS_DOWN, None).unwrap();
+        assert!(!down.running && !down.supported);
+        assert_eq!(down.reason.as_deref(), Some("remote herdr server is not running"));
+        assert!(down.worth_fast_retry());
+
+        let session = parse_status(STATUS_DOWN, Some("work")).unwrap();
+        assert_eq!(session.reason.as_deref(), Some("remote herdr session \"work\" is not running"));
+        assert!(session.worth_fast_retry());
+
+        let up = parse_status(&status_up("0.9.5"), None).unwrap();
+        assert!(up.running && up.supported);
+        assert_eq!(up.socket, "/home/u/.config/herdr/herdr.sock");
+        assert!(up.worth_fast_retry());
+
+        let old = parse_status(&status_up("0.7.1"), None).unwrap();
+        assert!(old.running && !old.supported);
+        assert!(!old.worth_fast_retry());
+        let garbled = parse_status(&status_up("garbage"), None).unwrap();
+        assert!(!garbled.worth_fast_retry());
+
+        assert!(parse_status("not json", None).is_err());
     }
 }

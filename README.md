@@ -139,6 +139,12 @@ blank and a busy pane can't contend with or drop another's stream. Sidebar
 agent status is daemon-driven, not stream-derived, so every agent's state stays
 live regardless of what any stream is doing.
 
+**Light on the machines it mirrors** — an unreachable host is retried after
+5 s, doubling to every 5 minutes, and its error is logged once an hour rather
+than per retry. A host that answers while its herdr is restarting or stopped
+is retried every 2 s for up to 3 minutes, so a restarted server is mirrored
+again within seconds.
+
 ### Keybinds
 
 Actions have no default keys; bind them in `~/.config/herdr/config.toml`, then
