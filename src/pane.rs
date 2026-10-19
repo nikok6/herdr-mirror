@@ -25,9 +25,13 @@
 //
 // One owner of all state, message-driven: frames, keystrokes, timers, and
 // ssh-child exits arrive on one channel; a session generation number tags
-// every message so stale ones are dropped.
+// every message so stale ones are dropped. Nothing in that loop waits on the
+// pane pty or the ssh pipe: output goes through a writer thread (`Output`),
+// input through a bounded per-session writer task.
 
+use std::io::Write;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +42,7 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
 use crate::util::{err, Result};
@@ -213,7 +217,8 @@ struct Session {
     gen: u64,
     mode: Mode,
     process_group: i32,
-    stdin: ChildStdin,
+    /// lines for the remote, written by the session's own task
+    input: mpsc::Sender<Vec<u8>>,
 }
 
 /// Stop the transport and every local helper it spawned (notably an ssh
@@ -265,7 +270,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     );
     // ssh and docker differ only in how the command is carried; the streaming
     // contract (piped stdio, herdr's frames on stdout) is identical
-    let mut builder = match &args.container {
+    let builder = match &args.container {
         None => {
             let mut c = tokio::process::Command::new("ssh");
             c.args(ssh_stream_args(&args.ssh_target, &cmd));
@@ -287,6 +292,19 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             c
         }
     };
+    spawn_transport(builder, mode, gen, tx, INPUT_WRITE_TIMEOUT)
+}
+
+/// Start a transport command and make it a session: its stdout lines are
+/// frames (sent on as `Msg::Frame`), its stdin is fed by a task of its own, and
+/// its exit arrives as `Msg::SessionExit`.
+fn spawn_transport(
+    mut builder: tokio::process::Command,
+    mode: Mode,
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+    write_timeout: Duration,
+) -> Result<Session> {
     // Keep the transport and all of its local descendants in one independently
     // killable group. Killing only ssh can orphan a ProxyCommand and leave its
     // remote terminal controller attached after the mirror pane closes.
@@ -339,7 +357,32 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, process_group, stdin })
+    let input = spawn_input_writer(stdin, process_group, write_timeout);
+    Ok(Session { gen, mode, process_group, input })
+}
+
+/// The only writer of a session's stdin. The event loop hands it lines with
+/// `try_send` and never waits; a write that stalls past `write_timeout` means
+/// the connection is wedged, so the session is killed (and reconnects) rather
+/// than letting input pile up behind it.
+fn spawn_input_writer(
+    mut stdin: ChildStdin,
+    process_group: i32,
+    write_timeout: Duration,
+) -> mpsc::Sender<Vec<u8>> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
+    tokio::spawn(async move {
+        while let Some(buf) = rx.recv().await {
+            match tokio::time::timeout(write_timeout, stdin.write_all(&buf)).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    kill_session_process_group(process_group);
+                    break;
+                }
+            }
+        }
+    });
+    tx
 }
 
 // ---------------------------------------------------------------------------
@@ -448,11 +491,89 @@ impl RawMode {
     }
 }
 
-fn write_stdout(s: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.flush();
+/// Everything this process writes to its pane, written by a thread of its own.
+///
+/// The pane is a pty the hub herdr drains. When it stops draining (a stalled
+/// server, a full pty buffer) a write there blocks, and on the event loop that
+/// froze the whole streamer: no ssh reads, no input, no signals. Here the loop
+/// only hands bytes over. Paints are latest-wins: at most one is in flight;
+/// while it is, new frames only update the grid, and the next paint — a diff
+/// against what the renderer last emitted, so nothing it relies on is lost —
+/// goes out once the writer is free. Superseded intermediate screens are never
+/// painted; the last one always is.
+struct Output {
+    tx: std::sync::mpsc::Sender<(String, bool)>,
+    /// paints handed over and not yet fully written
+    paints: Arc<AtomicUsize>,
+    /// everything handed over and not yet fully written
+    queued: Arc<AtomicUsize>,
+    /// signalled each time the writer finishes a paint
+    drained: Arc<Notify>,
+}
+
+impl Output {
+    fn new(sink: impl Write + Send + 'static) -> Output {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        let paints = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::new(Notify::new());
+        let (p, q, d) = (paints.clone(), queued.clone(), drained.clone());
+        std::thread::Builder::new()
+            .name("pane-output".into())
+            .spawn(move || {
+                let mut sink = sink;
+                for (bytes, is_paint) in rx {
+                    let _ = sink.write_all(bytes.as_bytes());
+                    let _ = sink.flush();
+                    q.fetch_sub(1, Ordering::AcqRel);
+                    if is_paint {
+                        p.fetch_sub(1, Ordering::AcqRel);
+                        d.notify_one();
+                    }
+                }
+            })
+            .expect("spawn pane output thread");
+        Output { tx, paints, queued, drained }
+    }
+
+    /// Mode switches, titles, the clipboard: small, rare, ordered with paints.
+    fn control(&self, s: impl Into<String>) {
+        self.send(s.into(), false);
+    }
+
+    fn paint(&self, s: String) {
+        self.send(s, true);
+    }
+
+    fn send(&self, s: String, is_paint: bool) {
+        if s.is_empty() {
+            return;
+        }
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if is_paint {
+            self.paints.fetch_add(1, Ordering::AcqRel);
+        }
+        if self.tx.send((s, is_paint)).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            if is_paint {
+                self.paints.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// A paint is still being written: hold the next one.
+    fn busy(&self) -> bool {
+        self.paints.load(Ordering::Acquire) > 0
+    }
+
+    /// Give the writer up to `limit` to finish what is queued (the exit path:
+    /// restoring the pane's modes should land, but never hang the exit).
+    async fn settle(&self, limit: Duration) {
+        let end = Instant::now() + limit;
+        while self.queued.load(Ordering::Acquire) > 0 && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
@@ -723,6 +844,26 @@ const GONE_BACKOFF_MS: u64 = 60_000;
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 
+/// Paint at most this often (~20 fps). A burst of remote frames inside one
+/// interval is one paint of the latest screen; a lone frame — a keystroke's
+/// echo after a quiet spell — paints at once.
+const PAINT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Frames arriving this soon after a forwarded keystroke are taken to be its
+/// echo and paint without waiting for `PAINT_INTERVAL` (still latest-wins, and
+/// still never while the writer is busy). Sustained output outside it stays
+/// capped.
+const ECHO_WINDOW: Duration = Duration::from_millis(150);
+
+/// Input lines waiting for the ssh child. Bounded: past this the remote has
+/// not read input for a long while, and replaying a backlog late is worse than
+/// saying it was dropped.
+const INPUT_QUEUE: usize = 256;
+
+/// One write to the ssh child stalled this long means the connection is
+/// wedged: the session is dropped and reconnects.
+const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Is this failure "the pane we stream is gone", as opposed to any other
 /// failure that happens to mention something missing?
 ///
@@ -765,6 +906,7 @@ struct App {
     tty: bool,
     grid: Grid,
     renderer: Renderer,
+    out: Output,
     tx: mpsc::Sender<Msg>,
 
     mode: Mode,
@@ -782,6 +924,14 @@ struct App {
     pending_input: Vec<Vec<u8>>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
+    /// a paint is owed: the grid or an overlay changed since the last one
+    paint_pending: bool,
+    /// the owed paint is held to this time by the frame-rate cap
+    paint_at: Option<Instant>,
+    last_paint: Option<Instant>,
+    /// until then, frames are a keystroke's echo: they paint at once instead
+    /// of waiting out `PAINT_INTERVAL` (see `send_input`)
+    echo_until: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
     /// remote pane foreground classification, None=unknown (fail safe to local).
@@ -828,10 +978,75 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
+    fn new(args: Args, tty: bool, tx: mpsc::Sender<Msg>, out: Output) -> App {
+        App {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            out,
+            tx,
+            mode: Mode::Observe,
+            switching_to: None,
+            switch_at: None,
+            session: None,
+            next_gen: 0,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_failures: 0,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            paint_pending: false,
+            paint_at: None,
+            last_paint: None,
+            echo_until: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first
+            // classification moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        }
+    }
+
+    /// Bring the pane up to date — or owe it: while the writer is still busy
+    /// with the last paint, or within `PAINT_INTERVAL` of it, only the debt is
+    /// recorded, and the run loop pays it when the writer drains or the
+    /// interval ends. Every caller can ask freely; the pane gets the latest
+    /// screen at most ~20 times a second and never blocks anything.
     fn paint(&mut self) {
         if !self.tty {
             return;
         }
+        self.paint_pending = true;
+        if self.out.busy() {
+            return;
+        }
+        let now = Instant::now();
+        let echoing = self.echo_until.is_some_and(|t| t > now);
+        if let Some(next) = self.last_paint.map(|t| t + PAINT_INTERVAL).filter(|&t| t > now && !echoing) {
+            self.paint_at.get_or_insert(next);
+            return;
+        }
+        self.paint_now(now);
+    }
+
+    fn paint_now(&mut self, now: Instant) {
+        self.paint_pending = false;
+        self.paint_at = None;
+        self.last_paint = Some(now);
         let (cols, rows) = term_size();
         // Overlays paint outside the renderer's per-row cache, so the rows they
         // covered must be repainted or the old drawing survives underneath.
@@ -871,7 +1086,7 @@ impl App {
                 out.push_str(&overlay);
             }
         }
-        write_stdout(&out);
+        self.out.paint(out);
     }
 
     fn hint(&mut self, text: &str) {
@@ -938,7 +1153,7 @@ impl App {
             return;
         }
         self.mouse_grabbed = true;
-        write_stdout("\x1b[?1002h\x1b[?1006h");
+        self.out.control("\x1b[?1002h\x1b[?1006h");
     }
 
     /// Match the local pane's cursor-key mode to the remote's, so the arrow bytes
@@ -965,7 +1180,7 @@ impl App {
             return;
         }
         self.app_cursor_keys = want;
-        write_stdout(if want { "\x1b[?1h" } else { "\x1b[?1l" });
+        self.out.control(if want { "\x1b[?1h" } else { "\x1b[?1l" });
     }
 
     fn observe_size(&self) -> (usize, usize) {
@@ -985,10 +1200,10 @@ impl App {
     /// Stop the child (clean release first for control) — never leave an
     /// orphan holding the remote attach lock.
     fn stop_session(&mut self) {
-        if let Some(mut s) = self.session.take() {
+        if let Some(s) = self.session.take() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+                    let _ = s.input.try_send(b"{\"type\":\"terminal.release\"}\n".to_vec());
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 kill_session_process_group(s.process_group);
@@ -996,7 +1211,7 @@ impl App {
         }
     }
 
-    async fn connect(&mut self, m: Mode) {
+    fn connect(&mut self, m: Mode) {
         self.mode = m;
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
@@ -1012,18 +1227,17 @@ impl App {
         }
         self.next_gen += 1;
         match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
-            Ok(mut s) => {
+            Ok(s) => {
+                self.session = Some(s);
                 if m == Mode::Control {
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
+                        self.send_input(&buf);
                     }
                 } else {
                     self.pending_input.clear();
                 }
-                self.session = Some(s);
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
@@ -1067,6 +1281,37 @@ impl App {
         self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
     }
 
+    /// Queue one line for the remote. Never waits: the session's own task does
+    /// the writing. A full queue means the remote has not read input for a long
+    /// while; the line is dropped, and said so, rather than replayed late.
+    fn send_line(&mut self, line: String) -> bool {
+        let Some(s) = self.session.as_ref() else { return false };
+        match s.input.try_send(line.into_bytes()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.hint("remote is not reading input — dropped");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn send(&mut self, msg: serde_json::Value) -> bool {
+        self.send_line(msg.to_string() + "\n")
+    }
+
+    /// Forward keystrokes. The frames that come back within `ECHO_WINDOW` are
+    /// their echo, and paint without waiting for the frame-rate cap: the cap is
+    /// for sustained output, and holding an echo for up to `PAINT_INTERVAL`
+    /// is latency the user feels on every key.
+    fn send_input(&mut self, bytes: &[u8]) -> bool {
+        let sent = self.send(json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }));
+        if sent {
+            self.echo_until = Some(Instant::now() + ECHO_WINDOW);
+        }
+        sent
+    }
+
 
     fn switch_mode(&mut self, m: Mode) {
         // already settled or scheduled — don't restart. Without this guard,
@@ -1103,7 +1348,10 @@ impl App {
         }
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
-        self.renderer.status("");
+        // a frame supersedes a connection status, not a hint still on its timer
+        if self.hint_clear_at.is_none() {
+            self.renderer.status("");
+        }
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
             frame.height.unwrap_or(self.grid.height),
@@ -1160,13 +1408,6 @@ impl App {
             }
         }
         self.schedule_reconnect(exited_mode, &reason_line);
-    }
-
-    async fn send(&mut self, msg: serde_json::Value) {
-        if let Some(s) = self.session.as_mut() {
-            let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
-        }
     }
 
     /// Route ordinary input after preserving a partial SGR mouse sequence.
@@ -1446,14 +1687,14 @@ impl App {
             }
         }
         for s in scrolls {
-            self.send(s).await;
+            self.send(s);
         }
         if let Some((start, end)) = copy_span {
             let text = self.grid.selection_text(start, end);
             match crate::select::osc52(&text) {
                 // no hint on success: herdr shows its own "copied to clipboard"
                 // toast when it takes the OSC 52, so ours would be a duplicate
-                Some(seq) => write_stdout(&seq),
+                Some(seq) => self.out.control(seq),
                 // too big for herdr to accept. Worth saying, because this is the
                 // one path where nothing else reports: we never emit, so there
                 // is no clipboard write for herdr to toast about.
@@ -1469,8 +1710,7 @@ impl App {
             // `dismiss`, not `clear`: a press may have been buffered earlier in
             // this very read, and cancelling it would eat the click.
             sel_changed |= self.select.dismiss();
-            let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
-            self.send(msg).await;
+            self.send_input(&rest);
             // optimistic local echo: draw the keystroke now, verify on frame
             if self.predict.on_input(&rest, &self.grid) {
                 self.paint();
@@ -1497,7 +1737,7 @@ impl App {
             }
             return;
         }
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
+        self.send_input(&buf);
     }
 
     async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
@@ -1568,6 +1808,7 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = crate::state::take_pane_hint(&state_dir, id);
         PidfileGuard(path)
     });
+    let out = Output::new(std::io::stdout());
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
@@ -1582,7 +1823,7 @@ pub async fn run(args: Args) -> Result<()> {
         // no mouse reporting, 1007 on" and type an Up/Down arrow per wheel
         // notch into us, which we'd forward, and a shell would walk command
         // history instead of scrolling (#69).
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
+        out.control("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
         RawMode::enable()
     } else {
         None
@@ -1609,41 +1850,7 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
-    let mut app = App {
-        args,
-        tty,
-        grid: Grid::new(),
-        renderer: Renderer::new(),
-        tx,
-        mode: Mode::Observe,
-        switching_to: None,
-        switch_at: None,
-        session: None,
-        next_gen: 0,
-        backoff_idx: 0,
-        reconnect_at: None,
-        control_failures: 0,
-        control_sticky: false,
-        pending_input: Vec::new(),
-        last_input: Instant::now(),
-        hint_clear_at: None,
-        predict: Predictor::new(),
-        remote_fg: None,
-        select: Select::new(),
-        last_select_rows: None,
-        fg_poll_at: None,
-        settle_at: None,
-        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-        // startup leaves the pane in normal cursor mode; the first classification
-        // moves it if the remote turns out to be a TUI
-        app_cursor_keys: false,
-        paste_inflight: false,
-        paste_buf: Vec::new(),
-        mouse_buf: Vec::new(),
-        mouse_flush_at: None,
-        paste_queue: Vec::new(),
-        paste_original: None,
-    };
+    let mut app = App::new(args, tty, tx, out);
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1662,7 +1869,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
-    app.connect(initial_mode(app.args.always_control, term_size())).await;
+    app.connect(initial_mode(app.args.always_control, term_size()));
     // the pane may have been laid out while the session was spawning; the signal
     // for that is buffered above, but check directly too
     if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
@@ -1672,6 +1879,7 @@ pub async fn run(args: Args) -> Result<()> {
         // F3: otherwise the pane is inert with no explanation
         app.hint("read-only until this pane is sized — type to take control");
     }
+    let drained = app.out.drained.clone();
 
     loop {
         // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
@@ -1689,6 +1897,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.predict.deadline(),
             app.settle_at,
             app.mouse_flush_at,
+            app.paint_at,
         ]);
 
         tokio::select! {
@@ -1714,6 +1923,8 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
+            // the writer finished a paint: pay the one owed meanwhile
+            _ = drained.notified(), if app.paint_pending => app.paint(),
             _ = sigwinch.recv() => {
                 app.renderer.invalidate();
                 // a resize means a client is laying this pane out, so the size is
@@ -1728,7 +1939,7 @@ pub async fn run(args: Args) -> Result<()> {
                     // capped like the initial connect: a local window drag must
                     // not push a capped host past its ceiling either
                     let (cols, rows) = app.control_size();
-                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
+                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows }));
                 }
                 app.paint();
             }
@@ -1747,13 +1958,13 @@ pub async fn run(args: Args) -> Result<()> {
                 if app.switch_at.is_some_and(|t| t <= now) {
                     app.switch_at = None;
                     if let Some(m) = app.switching_to.take() {
-                        app.connect(m).await; // pending input from the gap flushes here
+                        app.connect(m); // pending input from the gap flushes here
                     }
                 }
                 if let Some((t, m)) = app.reconnect_at {
                     if t <= now {
                         app.reconnect_at = None;
-                        app.connect(m).await;
+                        app.connect(m);
                     }
                 }
                 if app.hint_clear_at.is_some_and(|t| t <= now) {
@@ -1777,16 +1988,22 @@ pub async fn run(args: Args) -> Result<()> {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
                 }
+                if app.paint_at.is_some_and(|t| t <= now) {
+                    app.paint_at = None;
+                    if app.paint_pending {
+                        app.paint();
+                    }
+                }
             }
         }
     }
 
     // clean shutdown: release control if held, kill the whole local transport
     // tree (including any ProxyCommand), restore tty
-    if let Some(mut s) = app.session.take() {
+    if let Some(s) = app.session.take() {
         if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = s.input.try_send(b"{\"type\":\"terminal.release\"}\n".to_vec());
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         kill_session_process_group(s.process_group);
     }
@@ -1796,7 +2013,8 @@ pub async fn run(args: Args) -> Result<()> {
         // 1007 back on: it is a default-on mode we turned off, so leaving it
         // clear would silently change the wheel for whatever runs in this pane
         // after the streamer exits
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
+        app.out.control("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
+        app.out.settle(Duration::from_millis(500)).await;
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -2337,48 +2555,9 @@ mod tests {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
         let (tx, _rx) = mpsc::channel(256);
-        let mut app = App {
-            args,
-            tty,
-            grid: Grid::new(),
-            renderer: Renderer::new(),
-            tx,
-            mode: Mode::Observe,
-            switching_to: None,
-            switch_at: None,
-            session: None,
-            next_gen: 0,
-            backoff_idx: 0,
-            reconnect_at: None,
-            control_failures: 0,
-            control_sticky: false,
-            pending_input: Vec::new(),
-            last_input: Instant::now(),
-            hint_clear_at: None,
-            predict: Predictor::new(),
-            remote_fg: None,
-            select: Select::new(),
-            last_select_rows: None,
-            fg_poll_at: None,
-            settle_at: None,
-            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-            // startup leaves the pane in normal cursor mode; the first classification
-            // moves it if the remote turns out to be a TUI
-            app_cursor_keys: false,
-            paste_inflight: false,
-            paste_buf: Vec::new(),
-            mouse_buf: Vec::new(),
-            mouse_flush_at: None,
-            paste_queue: Vec::new(),
-            paste_original: None,
-        };
-        let mut child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
-            .spawn().unwrap();
-        app.session = Some(Session {
-            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
-            stdin: child.stdin.take().unwrap(),
-        });
+        let mut app = App::new(args, tty, tx, Output::new(std::io::sink()));
+        let (session, _input) = test_session(1, Mode::Control);
+        app.session = Some(session);
         app.mode = Mode::Control;
         app.remote_fg = Some(Fg::Mouse);
         // Keep foreground polling local to this fixture: suppress SSH probes.
@@ -2392,8 +2571,6 @@ mod tests {
             if next_drag { (1, 3) } else { (1, 0) }, b"release",
         );
         drop(app);
-        child.kill().await.unwrap();
-        let _ = child.wait().await;
         if next_drag {
             assert_eq!(result, Released::Selection(((1, 0), (1, 3))));
         } else {
@@ -2411,4 +2588,171 @@ mod tests {
         selection_followed_by_press(true).await;
     }
 
+    /// A session whose remote end is a channel the test reads.
+    fn test_session(gen: u64, mode: Mode) -> (Session, mpsc::Receiver<Vec<u8>>) {
+        let (input, rx) = mpsc::channel(INPUT_QUEUE);
+        (Session { gen, mode, process_group: 0, input }, rx)
+    }
+
+    fn sent(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(String::from_utf8(line).unwrap().trim_end().to_string());
+        }
+        out
+    }
+
+    fn input_line(bytes: &[u8]) -> String {
+        json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }).to_string()
+    }
+
+    fn screen(text: &str) -> Frame {
+        serde_json::from_value(json!({
+            "type": "terminal.frame", "full": true, "width": 80, "height": 24,
+            "bytes": B64.encode(format!("\x1b[H\x1b[2J{text}")),
+        }))
+        .unwrap()
+    }
+
+    fn app_in(mode: Mode, tty: bool, out: Output) -> (App, mpsc::Receiver<Vec<u8>>) {
+        let args = parse_args(&["work".into(), "w1:p1".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App::new(args, tty, tx, out);
+        let (session, input) = test_session(1, mode);
+        app.session = Some(session);
+        app.mode = mode;
+        app.next_gen = 1;
+        // no ssh foreground probes from a unit test
+        app.fg_poll_at = Some(Instant::now());
+        (app, input)
+    }
+
+    /// A transport that stops reading its stdin cannot stall the event loop:
+    /// lines queue without waiting, and the stalled write ends the session
+    /// after the timeout instead of hanging it.
+    #[tokio::test]
+    async fn a_wedged_transport_never_stalls_input_and_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let session = spawn_transport(cmd, Mode::Control, 1, tx, Duration::from_millis(300)).unwrap();
+        let started = Instant::now();
+        // far more than a pipe holds
+        let line = vec![b'x'; 4096];
+        let mut queued = 0;
+        for _ in 0..INPUT_QUEUE {
+            if session.input.try_send(line.clone()).is_ok() {
+                queued += 1;
+            }
+        }
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        assert!(queued * line.len() > 64 * 1024);
+        let exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Msg::SessionExit { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(exit.is_ok(), "a wedged transport was never dropped");
+    }
+
+    // --- output: never blocking, latest wins ---
+
+    async fn writer_idle(app: &App) {
+        for _ in 0..200 {
+            if !app.out.busy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("writer never drained");
+    }
+
+    /// Sustained output is capped: a frame right behind a paint waits for the
+    /// interval. A keystroke's echo is not: a frame right behind a paint, but
+    /// right after forwarded input, paints at once. Once the echo window has
+    /// passed, the cap applies again.
+    #[tokio::test]
+    async fn an_echo_frame_is_not_held_by_the_frame_rate_cap() {
+        let (mut app, mut input) = app_in(Mode::Control, true, Output::new(std::io::sink()));
+
+        app.handle_frame(1, screen("$ "));
+        assert!(!app.paint_pending, "a frame after a quiet spell paints at once");
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ output"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "sustained output waits for the cap");
+
+        app.paint_at = None;
+        app.paint_pending = false;
+        app.last_paint = Some(Instant::now());
+        app.handle_stdin(b"x".to_vec()).await;
+        assert_eq!(sent(&mut input), [input_line(b"x")]);
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x"));
+        assert!(!app.paint_pending, "the echo was held by the cap");
+        assert!(app.paint_at.is_none());
+
+        tokio::time::sleep(ECHO_WINDOW + Duration::from_millis(20)).await;
+        app.handle_frame(1, screen("$ x"));
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x more"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "the cap is back after the echo window");
+    }
+
+    /// The hub stops draining the pane while a remote scrolls 2000 frames. The
+    /// event loop never waits on the pane, paints at most one screen while the
+    /// writer is stuck, and once the pane drains it ends on the LAST frame,
+    /// not an intermediate one.
+    #[tokio::test]
+    async fn a_stalled_pane_never_blocks_and_ends_on_the_last_frame() {
+        use std::io::Read;
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let out = Output::new(writer);
+        // wedge the writer: far more than the socket buffer, nobody reading
+        let junk = "j".repeat(4 << 20);
+        out.control(junk.clone());
+        let (mut app, _input) = app_in(Mode::Observe, true, out);
+
+        let started = Instant::now();
+        for i in 0..2000 {
+            app.handle_frame(1, screen(&format!("frame {i:04}")));
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // the first paint is queued behind the junk; every later frame only
+        // updated the grid
+        assert_eq!(app.out.paints.load(Ordering::Acquire), 1);
+        assert!(app.paint_pending);
+
+        let drain = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let _ = reader.read_to_end(&mut all);
+            all
+        });
+        let drained = app.out.drained.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (app.paint_pending || app.out.busy()) && Instant::now() < deadline {
+            if app.out.busy() {
+                let _ = tokio::time::timeout(Duration::from_millis(100), drained.notified()).await;
+            } else if let Some(at) = app.paint_at {
+                tokio::time::sleep_until(at).await;
+                app.paint_at = None;
+            }
+            if app.paint_pending && !app.out.busy() {
+                app.paint();
+            }
+        }
+        assert!(!app.paint_pending && !app.out.busy());
+        drop(app);
+        let bytes = drain.join().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let painted = text.strip_prefix(&junk).expect("output order");
+        // two paints for two thousand frames: the stuck one, then the latest
+        assert!(painted.matches("\x1b[?2026h").count() <= 3, "{}", painted.matches("\x1b[?2026h").count());
+        let mut pane = Grid::new();
+        pane.resize(80, 24);
+        pane.apply(painted);
+        assert_eq!(pane.text_lines().first().map(|l| l.trim_end()), Some("frame 1999"));
+    }
 }

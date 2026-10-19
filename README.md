@@ -135,9 +135,13 @@ installed on whichever end runs it. See
 
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
-blank and a busy pane can't contend with or drop another's stream. Sidebar
-agent status is daemon-driven, not stream-derived, so every agent's state stays
-live regardless of what any stream is doing.
+blank and a busy pane can't contend with or drop another's stream. Output is
+painted at most ~20 times a second, latest screen wins: a fast-scrolling remote
+costs the local pane one repaint per interval, and a local pane that stops
+draining never stalls the stream, input, or signals — it simply gets the
+newest screen once it drains. Sidebar agent status is daemon-driven, not
+stream-derived, so every agent's state stays live regardless of what any
+stream is doing.
 
 ### Keybinds
 
