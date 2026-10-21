@@ -88,7 +88,10 @@ remote, tmux-style; the mouse wheel scrolls remote scrollback.
 **Watch-only** — for a machine with its own display or a human sitting at it,
 set `always_control = false` (globally or per host). Its mirrors become
 read-only: a live view with zero effect on the remote that escalates to control
-when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
+when you type and auto-releases after 30 s idle (`ctrl+\` releases
+immediately). Taking control happens on the pane's existing connection — no
+new ssh, the view keeps streaming — and attaches at the remote pane's own
+size, so typing never resizes the remote.
 
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
 pane/tab/workspace on the remote (`close_remote_on_local_close`; set it false to
@@ -135,9 +138,32 @@ installed on whichever end runs it. See
 
 **Continuous streaming** — every mirror pane streams its remote pane live for
 its whole lifetime, each over its own connection, so panes are never
-blank and a busy pane can't contend with or drop another's stream. Sidebar
-agent status is daemon-driven, not stream-derived, so every agent's state stays
-live regardless of what any stream is doing.
+blank and a busy pane can't contend with or drop another's stream. Output is
+painted at most ~20 times a second, latest screen wins: a fast-scrolling remote
+costs the local pane one repaint per interval, and a local pane that stops
+draining never stalls the stream, input, or signals — it simply gets the
+newest screen once it drains. Sidebar agent status is daemon-driven, not
+stream-derived, so every agent's state stays live regardless of what any
+stream is doing.
+
+**Light on the machines it mirrors** — agent status comes from one
+`agent.list` per host every 2 s, not from a subscription per pane (herdr
+serves those by polling its app thread ten times a second per pane). The
+daemon only tells the local herdr what changed: an unchanged status, token
+set or split layout is not re-sent (everything is re-sent once every 10
+minutes, and after the local server restarts or the connection drops). A
+local close, rename or resize pokes only the host that owns the mirror. An
+unreachable host is retried after 5 s, doubling to every 5 minutes, and its
+error is logged once an hour rather than per retry. A host that answers while
+its herdr is restarting or stopped is retried every 2 s for up to 3 minutes,
+so a restarted server is mirrored again within seconds.
+
+**Remote titles** — a mirror pane takes its remote pane's live terminal title
+as its own, so herdr's `terminal_title` for the mirror (and anything that names
+panes by it — `herdr pane list`, other herdr clients) reads what the remote
+says rather than the local `.mirror-pane` placeholder. Changes follow within a
+second or so; a remote too old to publish `pane.updated` catches up on each
+sync instead.
 
 ### Keybinds
 
@@ -285,6 +311,40 @@ an image off the clipboard needs `wl-paste` or `xclip` on Linux (macOS and
 dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 ~/.cache/herdr-mirror/pastes` is always safe.
 
+### Agent journals
+
+A transcript viewer on this machine (for example Collie's History) reads an
+agent's session journal from disk, but a mirrored agent's journal lives on the
+remote, often runs to hundreds of MB, and is named by a remote path. So for every
+mirrored pane whose remote pi or omp reports a session file, the daemon keeps a
+local tail copy:
+
+- `~/.local/state/herdr-mirror/journals/sessions/<id>.jsonl` holds the journal's
+  header (its rows through the `{"type":"session",...}` row) plus its last
+  `journal_tail_mb` (default 16) MB, starting on a row boundary. Appends are
+  followed by byte offset over the host's existing ssh connection: on the next
+  2 s status poll while the agent works or after any change of its state, every
+  30 s otherwise, and only the new bytes travel.
+  Past twice the tail the copy is rewritten (atomically) to header + tail. A
+  replaced or truncated journal, a new session (`/new`), or a gap longer than
+  the tail re-seeds it.
+- Images the copy references (`blob:sha256:<hash>`) are fetched into
+  `journals/blobs/<hash>`, the sibling `blobs/` pi/omp readers look in: at most
+  8 MB each, 8 per pass, and swept every 10 minutes once no copy references
+  them.
+- The copy's path is published on the mirror pane as the herdr metadata token
+  `mirror_session_path` (the default sidebar shows no custom tokens). It is not
+  a herdr agent session: herdr accepts a pi/omp session only for a pane running
+  that agent, and a persisted one would make a cold restore type
+  `omp --resume` into the mirror pane. Tokens are neither persisted nor read on
+  restore.
+- Copies are deleted 30 s after their pane stops reporting a session or stops
+  being mirrored, and at daemon start for hosts no longer configured. Files are
+  `0600`, directories `0700`.
+
+To serve them, point the viewer's pi/omp sessions root at
+`~/.local/state/herdr-mirror/journals/sessions` and have it read the token.
+
 ### Mouse
 
 - **Drag to select, release to copy** — The text reaches your own clipboard, even over ssh.
@@ -314,6 +374,13 @@ dropped files need nothing). Uploads aren't cleaned up; `rm -rf
 # max_cols / max_rows    # cap the size control asks the remote for, so a
                          # machine with its own display keeps its geometry.
                          # A ceiling only, and never applies to watch-only.
+# compression = true     # default. ssh Compression for every pane stream and
+                         # the daemon's connection. Set on the command line, so
+                         # it beats `Compression no` in ~/.ssh/config; set
+                         # false here (globally or per host) to turn it off.
+# journal_tail_mb = 16   # default. Hub-local tail of each mirrored pi/omp
+                         # session journal (see "Agent journals"); 0 turns it
+                         # off. Also settable per host.
 
 [hosts.work]
 target = "work"
@@ -331,6 +398,8 @@ target = "work"
                                      # "socket" = ssh -L forward, "exec" = relay
                                      # over ssh exec (needs socat or python3).
                                      # auto = socket, falling back to exec.
+# compression = false                # per-host override of the global default
+# journal_tail_mb = 0                # per-host override, e.g. no journal tails
 
 [hosts.vps]                          # add more hosts freely; each is independent
 target = "ssh://niko@203.0.113.7:2222"
@@ -420,6 +489,17 @@ identified as disposable merely because their directory matches.
 - **Latency** above raw ssh: keystroke echo is a rendered frame round-trip, so
   there's a small constant delay. For latency-critical work, plain `ssh <host>`
   is always one command away.
+- **Agent status lags by up to ~2 s** — it is polled (`agent.list`) rather than
+  subscribed per pane, because herdr serves per-pane status subscriptions by
+  polling its app thread 10×/s per pane. An agent appearing or leaving is
+  noticed at once (`pane.agent_detected`); its later state changes on the next
+  poll.
+- **While you hold control of a watch-only mirror, the remote can't resize that
+  pane** — herdr locks a terminal's size to its attached controller. Control
+  attaches at the pane's current size and releases after 30 s idle (or
+  `ctrl+\`), when the remote's own layout applies again. A remote whose pty
+  can't be measured (`herdr pane process-info` + `stty size`) falls back to
+  this pane's size and says so.
 - **No git status on mirror rows** — herdr derives the sidebar git branch and
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real
@@ -434,6 +514,15 @@ identified as disposable merely because their directory matches.
   never move a byte) fall back automatically to an exec relay — see
   `api_transport` above. The remote needs `socat` or `python3` for that path;
   almost everything has one or the other.
+- **Mirror panes report a placeholder cwd** — herdr takes a pane's directory
+  from its process, or from OSC 7 / OSC 1337 `CurrentDir`, but accepts only a
+  local host and a directory that exists locally, so a remote path can't be
+  handed to it. `cwd` for a mirror stays the `.mirror-pane` placeholder; publish
+  the remote directory as a [sidebar token](#sidebar-tokens) instead.
+- **No local scrollback on mirror panes** — the streamer draws on the alternate
+  screen, which herdr keeps no history for, so `herdr pane read` on a mirror
+  returns its visible rows only. Scroll with the wheel (it scrolls the remote),
+  or read the remote pane itself.
 
 ## License
 

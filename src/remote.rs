@@ -26,26 +26,59 @@ pub const DORMANT: &str = "dormant";
 const MIN_PREVIEW_BUILD: &str = "2026-06-30";
 
 /// Common ssh options, shared by the daemon's master and every pane stream.
-pub const SSH_COMMON_OPTS: [&str; 6] = [
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ServerAliveInterval=15",
-    "-o",
-    "ServerAliveCountMax=3",
-];
+///
+/// Compression is on by default: pane streams are base64 JSON frames of mostly
+/// repeated escape sequences, and the daemon's snapshots are JSON, both of which
+/// compress several-fold. ssh takes the FIRST value it sees for an option and
+/// the command line comes before every ssh_config file, so these beat a
+/// `Compression no` in `~/.ssh/config`; the per-host `compression = false`
+/// setting is the override (see `ssh_common_opts`).
+pub const SSH_COMMON_OPTS: [&str; 8] = ssh_common_opts(true);
+
+/// `SSH_COMMON_OPTS` with compression chosen explicitly.
+pub const fn ssh_common_opts(compression: bool) -> [&'static str; 8] {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        if compression { "Compression=yes" } else { "Compression=no" },
+    ]
+}
 
 #[derive(Debug)]
 pub struct RemoteStatus {
     pub socket: String,
+    /// the remote's `herdr status` says its server is up
+    pub running: bool,
     pub supported: bool,
     pub reason: Option<String>,
 }
 
+impl RemoteStatus {
+    /// The remote answered and nothing about its herdr is permanently wrong:
+    /// the server is up on a usable version, or simply not running (yet). A
+    /// running server on an unusable version is excluded — that is a config
+    /// problem no amount of fast redialling fixes.
+    pub fn worth_fast_retry(&self) -> bool {
+        self.supported || !self.running
+    }
+}
+
 struct SshOutput {
     code: i32,
-    out: String,
+    /// raw stdout: journal reads carry bytes that must not be re-encoded
+    out: Vec<u8>,
     err: String,
+}
+
+impl SshOutput {
+    fn out_text(&self) -> String {
+        String::from_utf8_lossy(&self.out).into_owned()
+    }
 }
 
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
@@ -61,7 +94,7 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
         Err(e) => {
             return SshOutput {
                 code: 1,
-                out: String::new(),
+                out: Vec::new(),
                 err: e.to_string(),
             }
         }
@@ -85,12 +118,12 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
     match timeout(Duration::from_millis(timeout_ms), collect).await {
         Ok(Ok(status)) => SshOutput {
             code: status.code().unwrap_or(1),
-            out: String::from_utf8_lossy(&out).into_owned(),
+            out,
             err: String::from_utf8_lossy(&err_output).into_owned(),
         },
         Ok(Err(e)) => SshOutput {
             code: 1,
-            out: String::new(),
+            out: Vec::new(),
             err: e.to_string(),
         },
         Err(_) => {
@@ -103,7 +136,7 @@ async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
             let _ = child.wait().await;
             SshOutput {
                 code: 1,
-                out: String::new(),
+                out: Vec::new(),
                 err: "ssh timeout".into(),
             }
         }
@@ -135,6 +168,56 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
     })
 }
 
+/// Byte-exact remote command runner, detached from the `RemoteHost` that owns
+/// the connection so a side task (journal tails) can share the transport.
+#[derive(Clone)]
+pub struct RemoteExec {
+    via: ExecVia,
+}
+
+#[derive(Clone)]
+enum ExecVia {
+    /// `-S <ctl> -o BatchMode=yes` + target: rides the host's ControlMaster
+    Ssh { base: Vec<String>, target: String },
+    Docker(crate::docker::Container),
+    /// the command run by a local `sh -c`, which is how the remote login
+    /// shell sees it: lets tests drive the real remote scripts
+    #[cfg(test)]
+    Local,
+}
+
+impl RemoteExec {
+    #[cfg(test)]
+    pub fn local() -> RemoteExec {
+        RemoteExec { via: ExecVia::Local }
+    }
+
+    /// Run `command` (already quoted for the remote login shell) and return
+    /// its stdout untouched. `what` names the operation in errors instead of
+    /// echoing a long script.
+    pub async fn run(&self, what: &str, command: &str, timeout_ms: u64) -> Result<Vec<u8>> {
+        let (base, target) = match &self.via {
+            ExecVia::Ssh { base, target } => (base, target),
+            ExecVia::Docker(c) => return c.exec_bytes(what, command, timeout_ms).await,
+            #[cfg(test)]
+            ExecVia::Local => {
+                let out = Command::new("sh").args(["-c", command]).stdin(Stdio::null()).output().await?;
+                if !out.status.success() {
+                    return Err(err(format!("{what} failed: {}", out.status)));
+                }
+                return Ok(out.stdout);
+            }
+        };
+        let mut args = base.clone();
+        args.extend([target.clone(), command.to_string()]);
+        let res = ssh(&args, timeout_ms).await;
+        if res.code != 0 {
+            return Err(err(format!("ssh {what} failed: {}", nonempty(&res.err, res.code))));
+        }
+        Ok(res.out)
+    }
+}
+
 pub struct RemoteHost {
     pub cfg: HostConfig,
     ctl_path: PathBuf,
@@ -164,6 +247,11 @@ pub struct RemoteHost {
     /// ssh hosts only: which transport this connection actually used, so the
     /// daemon can feed it back into the next `RemoteHost`'s `hint_transport`.
     pub last_api_transport: Option<ApiTransport>,
+    /// Set by `connect_api` once the remote's own `herdr status` answered and
+    /// `worth_fast_retry` holds: ssh (or `docker exec`) works, so whatever
+    /// fails after that is herdr not serving yet, not the machine being
+    /// unreachable. The daemon paces those two very differently.
+    pub reached: bool,
     log: Logger,
 }
 
@@ -257,6 +345,7 @@ impl RemoteHost {
             exec_relay: None,
             exec_sock: state_dir.join(format!("{stem}-api-exec.sock")),
             last_api_transport: None,
+            reached: false,
             log: Logger::new(state_dir, false),
         }
     }
@@ -328,7 +417,7 @@ impl RemoteHost {
             "-S".into(),
             self.ctl_path.display().to_string(),
         ];
-        start.extend(SSH_COMMON_OPTS.iter().map(|s| s.to_string()));
+        start.extend(ssh_common_opts(self.cfg.compression).iter().map(|s| s.to_string()));
         start.extend([
             "-o".into(),
             "ControlPersist=yes".into(),
@@ -368,7 +457,18 @@ impl RemoteHost {
                 nonempty(&res.err, res.code)
             )));
         }
-        Ok(res.out)
+        Ok(res.out_text())
+    }
+
+    /// A cheap, cloneable handle for byte-exact remote commands over this
+    /// connection's transport (the ControlMaster, or the resolved container).
+    /// Taken after `connect_api`, so a docker host's container is known.
+    pub fn executor(&self) -> RemoteExec {
+        let via = match &self.container {
+            Some(c) => ExecVia::Docker(c.clone()),
+            None => ExecVia::Ssh { base: self.base_args(), target: self.cfg.target.clone() },
+        };
+        RemoteExec { via }
     }
 
     pub async fn status(&self) -> Result<RemoteStatus> {
@@ -377,52 +477,7 @@ impl RemoteHost {
             self.cfg.session.as_deref(),
         );
         let out = self.exec(&format!("exec {} status --json", bin), 15000).await?;
-        #[derive(Deserialize)]
-        struct Client {
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Server {
-            running: Option<bool>,
-            socket: Option<String>,
-            version: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct StatusJson {
-            client: Option<Client>,
-            server: Option<Server>,
-        }
-        let parsed: StatusJson = serde_json::from_str(&out)?;
-        let version = parsed
-            .server
-            .as_ref()
-            .and_then(|s| s.version.clone())
-            .or(parsed.client.and_then(|c| c.version))
-            .unwrap_or_else(|| "unknown".into());
-        let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
-        let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
-        let mut status = RemoteStatus { socket, supported: false, reason: None };
-        if !running {
-            // Name the session, or this reads as "that machine's herdr is
-            // down" while the default session is running perfectly and only
-            // the configured one is stopped — which is the common way to get
-            // here once `session` is in play (a typo, or `herdr session stop`).
-            status.reason = Some(match &self.cfg.session {
-                Some(name) => format!("remote herdr session {name:?} is not running"),
-                None => "remote herdr server is not running".into(),
-            });
-            return Ok(status);
-        }
-        match version_supported(&version) {
-            Some(true) => status.supported = true,
-            Some(false) => {
-                status.reason = Some(format!(
-                    "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
-                ))
-            }
-            None => status.reason = Some(format!("cannot parse remote version {version}")),
-        }
-        Ok(status)
+        parse_status(&out, self.cfg.session.as_deref())
     }
 
     pub async fn forward_api(&mut self, remote_socket: &str) -> Result<PathBuf> {
@@ -568,6 +623,7 @@ impl RemoteHost {
                 self.status().await?
             }
         };
+        self.reached = status.worth_fast_retry();
         if !status.supported {
             return Err(err(status.reason.clone().unwrap_or_else(|| "remote unsupported".into())));
         }
@@ -615,6 +671,56 @@ fn nonempty(e: &str, code: i32) -> String {
     }
 }
 
+/// The remote's `herdr status --json`, reduced to what connecting needs.
+fn parse_status(out: &str, session: Option<&str>) -> Result<RemoteStatus> {
+    #[derive(Deserialize)]
+    struct Client {
+        version: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Server {
+        running: Option<bool>,
+        socket: Option<String>,
+        version: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct StatusJson {
+        client: Option<Client>,
+        server: Option<Server>,
+    }
+    let parsed: StatusJson = serde_json::from_str(out)?;
+    let version = parsed
+        .server
+        .as_ref()
+        .and_then(|s| s.version.clone())
+        .or(parsed.client.and_then(|c| c.version))
+        .unwrap_or_else(|| "unknown".into());
+    let running = parsed.server.as_ref().and_then(|s| s.running) == Some(true);
+    let socket = parsed.server.and_then(|s| s.socket).unwrap_or_default();
+    let mut status = RemoteStatus { socket, running, supported: false, reason: None };
+    if !running {
+        // Name the session, or this reads as "that machine's herdr is
+        // down" while the default session is running perfectly and only
+        // the configured one is stopped — which is the common way to get
+        // here once `session` is in play (a typo, or `herdr session stop`).
+        status.reason = Some(match session {
+            Some(name) => format!("remote herdr session {name:?} is not running"),
+            None => "remote herdr server is not running".into(),
+        });
+        return Ok(status);
+    }
+    match version_supported(&version) {
+        Some(true) => status.supported = true,
+        Some(false) => {
+            status.reason = Some(format!(
+                "remote herdr {version} lacks terminal session streams (need >= 0.7.2 or preview {MIN_PREVIEW_BUILD})"
+            ))
+        }
+        None => status.reason = Some(format!("cannot parse remote version {version}")),
+    }
+    Ok(status)
+}
+
 /// `Some(true)` = supported, `Some(false)` = too old, `None` = unparseable.
 pub(crate) fn version_supported(version: &str) -> Option<bool> {
     let core = version.split(['-', '+']).next()?;
@@ -657,6 +763,8 @@ mod tests {
             session: None,
             max_cols: None,
             max_rows: None,
+            compression: true,
+            journal_tail_bytes: 0,
             api_transport: ApiTransport::Auto,
             always_control: true,
         }
@@ -809,5 +917,41 @@ mod tests {
         assert_eq!(version_supported("0.7.1-preview.2026-07-04-aaaa"), Some(true));
         assert_eq!(version_supported("0.7.1-preview.2026-06-29-aaaa"), Some(false));
         assert_eq!(version_supported("garbage"), None);
+    }
+
+    /// `herdr status --json` as herdr 0.9.5 prints it with no server.
+    const STATUS_DOWN: &str = r#"{"client":{"version":"0.9.5","channel":"stable","protocol":22,"session":null},"server":{"status":"not_running","running":false,"version":null,"protocol":null,"socket":"/home/u/.config/herdr/herdr.sock","session":null,"restart_needed":false}}"#;
+
+    fn status_up(version: &str) -> String {
+        format!(
+            r#"{{"client":{{"version":"0.9.5"}},"server":{{"status":"running","running":true,"version":"{version}","socket":"/home/u/.config/herdr/herdr.sock"}}}}"#
+        )
+    }
+
+    /// A stopped or restarting herdr on a machine that answers is worth the
+    /// fast retry; an unusable version on a running server is not.
+    #[test]
+    fn herdr_status_decides_whether_fast_retry_can_help() {
+        let down = parse_status(STATUS_DOWN, None).unwrap();
+        assert!(!down.running && !down.supported);
+        assert_eq!(down.reason.as_deref(), Some("remote herdr server is not running"));
+        assert!(down.worth_fast_retry());
+
+        let session = parse_status(STATUS_DOWN, Some("work")).unwrap();
+        assert_eq!(session.reason.as_deref(), Some("remote herdr session \"work\" is not running"));
+        assert!(session.worth_fast_retry());
+
+        let up = parse_status(&status_up("0.9.5"), None).unwrap();
+        assert!(up.running && up.supported);
+        assert_eq!(up.socket, "/home/u/.config/herdr/herdr.sock");
+        assert!(up.worth_fast_retry());
+
+        let old = parse_status(&status_up("0.7.1"), None).unwrap();
+        assert!(old.running && !old.supported);
+        assert!(!old.worth_fast_retry());
+        let garbled = parse_status(&status_up("garbage"), None).unwrap();
+        assert!(!garbled.worth_fast_retry());
+
+        assert!(parse_status("not json", None).is_err());
     }
 }

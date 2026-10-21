@@ -425,14 +425,23 @@ pub fn poke_pane_streamer(state_dir: &Path, local_pane_id: &str) -> bool {
     else {
         return false;
     };
-    let ours = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("herdr-mirror"));
+    let ours = process_name(pid).is_some_and(|name| name.contains("herdr-mirror"));
     if !ours {
         return false;
     }
     unsafe { libc::kill(pid, libc::SIGUSR1) == 0 }
+}
+
+/// Name of a live process, for the ownership check above. `/proc` where it
+/// exists: the daemon now pokes a streamer whenever its remote title changes,
+/// about once a second per busy agent, and forking `ps` for each would stall
+/// the daemon's single-threaded runtime. `ps` everywhere else (macOS).
+fn process_name(pid: i32) -> Option<String> {
+    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return Some(comm.trim().to_string());
+    }
+    let out = std::process::Command::new("ps").args(["-o", "comm=", "-p", &pid.to_string()]).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Sleep until the earliest deadline; pend forever when none.

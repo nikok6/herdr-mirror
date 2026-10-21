@@ -202,6 +202,29 @@ impl Container {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
+    /// `exec`, but stdout comes back byte-exact (no lossy decode, no trim) and
+    /// errors name `what` rather than echoing the command.
+    pub async fn exec_bytes(&self, what: &str, command: &str, timeout_ms: u64) -> Result<Vec<u8>> {
+        let fut = Command::new(&self.docker_bin)
+            .args(["exec", &self.id, "sh", "-c", command])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = timeout(Duration::from_millis(timeout_ms), fut)
+            .await
+            .map_err(|_| err(format!("docker exec {what} timed out")))?
+            .map_err(|e| err(format!("cannot run {}: {e}", self.docker_bin)))?;
+        if !out.status.success() {
+            let e = String::from_utf8_lossy(&out.stderr);
+            let e = e.trim();
+            return Err(err(format!(
+                "docker exec {what} failed: {}",
+                if e.is_empty() { "non-zero exit" } else { e }
+            )));
+        }
+        Ok(out.stdout)
+    }
+
     /// One `docker exec` bridging a single connection to the container socket.
     fn relay_child(&self, remote_sock: &str) -> Result<tokio::process::Child> {
         let mut cmd = Command::new(&self.docker_bin);

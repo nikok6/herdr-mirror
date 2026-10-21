@@ -1,8 +1,8 @@
 // herdr-mirror pane wrapper (data plane).
 //
 // Runs inside a local herdr pane and shows a remote herdr pane's terminal,
-// live, over ssh. Read-only observe by default; escalates to a writable
-// control session when the user types and releases back to observe.
+// live, over ssh. Read-only observe by default; takes control when the user
+// types and releases back to observe — both on the same connection.
 //
 //   herdr-mirror pane <ssh-target> <pane-target> [options]
 //
@@ -12,22 +12,30 @@
 //                       remote PTY size or the server clips bottom rows away)
 //   --dump              headless mode: print plain-text screen per frame
 //   --session NAME      remote named session (passed as --session to herdr)
-//   --control-idle N    auto-release control after N seconds idle (default 3600)
+//   --control-idle N    auto-release control after N seconds idle (default 30)
 //   --always-control    start and stay in control: writable, no idle release,
 //                       and sized to the local pane so it fills
 //   --max-cols N        cap the size control asks the remote for (default:
 //   --max-rows N        uncapped — control fills the local pane). Set for a
 //                       remote with its own display: the remote keeps its own
 //                       geometry and the rest of the local pane stays blank.
+//   --no-compression    ssh without Compression=yes (the default)
 //
-// Every stream gets its own direct ssh connection (no shared ControlMaster):
-// isolated, and nothing persists to go stale on a flaky network.
+// Every pane gets one direct ssh connection (no shared ControlMaster):
+// isolated, and nothing persists to go stale on a flaky network. On it runs a
+// small remote script (`MUX_SCRIPT`) that keeps an observer streaming and, on
+// request, swaps it for a controller and back, so typing never costs a new
+// ssh handshake and the view never goes away.
 //
 // One owner of all state, message-driven: frames, keystrokes, timers, and
 // ssh-child exits arrive on one channel; a session generation number tags
-// every message so stale ones are dropped.
+// every message so stale ones are dropped. Nothing in that loop waits on the
+// pane pty or the ssh pipe: output goes through a writer thread (`Output`),
+// input through a bounded per-session writer task.
 
+use std::io::Write;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +46,7 @@ use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::Instant;
 
 use crate::util::{err, Result};
@@ -77,6 +85,8 @@ pub struct Args {
     pub ctl_path: Option<String>,
     /// container to exec into instead of ssh. `None` = ssh host.
     pub container: Option<ContainerArg>,
+    /// ssh `Compression` for the pane stream (`--no-compression` turns it off)
+    pub compression: bool,
 }
 
 /// How the pane process should reach its container. The daemon passes a *ref*,
@@ -97,12 +107,13 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         rows: 72,
         dump: false,
         session: None,
-        control_idle_secs: 3600,
+        control_idle_secs: 30,
         always_control: false,
         max_cols: None,
         max_rows: None,
         ctl_path: None,
         container: None,
+        compression: true,
     };
     let mut container_name: Option<String> = None;
     let mut container_folder: Option<String> = None;
@@ -143,6 +154,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--container" => container_name = Some(next("--container")?),
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
+            "--no-compression" => args.compression = false,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -169,7 +181,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
 }
 
 // ---------------------------------------------------------------------------
-// remote session: one ssh child running observe or control
+// remote session: one ssh child running the mux script
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -177,13 +189,20 @@ enum Mode {
     Control,
 }
 
-impl Mode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Mode::Observe => "observe",
-            Mode::Control => "control",
-        }
-    }
+/// Where the remote side of a session is, as its mux script reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// the observer is streaming; the view is read-only
+    Observe,
+    /// `control` was sent and the script has not switched yet. Input already
+    /// flows: it waits in the pipe for the controller.
+    Acquiring,
+    /// the controller is running; `acked` once its first frame proved the
+    /// attach succeeded
+    Control { acked: bool },
+    /// release sent; nothing more may be written until the controller exits,
+    /// because whatever it has read past the release is discarded with it
+    Releasing,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,11 +215,15 @@ struct Frame {
     height: Option<usize>,
     bytes: Option<String>,
     reason: Option<String>,
+    /// mux markers: a child's exit status, and whether the control size had
+    /// to fall back to this pane's (the remote's could not be measured)
+    code: Option<i64>,
+    fallback: Option<bool>,
 }
 
 enum Msg {
     Frame { gen: u64, frame: Frame },
-    SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
+    SessionExit { gen: u64, reason: String },
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
@@ -211,9 +234,12 @@ enum Msg {
 
 struct Session {
     gen: u64,
-    mode: Mode,
     process_group: i32,
-    stdin: ChildStdin,
+    /// lines for the remote script, written by the session's own task
+    input: mpsc::Sender<Vec<u8>>,
+    phase: Phase,
+    /// the reason from the last `terminal.closed` the remote sent
+    closed_reason: Option<String>,
 }
 
 /// Stop the transport and every local helper it spawned (notably an ssh
@@ -234,8 +260,8 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
-    let mut argv: Vec<String> = crate::remote::SSH_COMMON_OPTS
+fn ssh_stream_args(ssh_target: &str, cmd: &str, compression: bool) -> Vec<String> {
+    let mut argv: Vec<String> = crate::remote::ssh_common_opts(compression)
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
@@ -247,7 +273,55 @@ fn ssh_stream_args(ssh_target: &str, cmd: &str) -> Vec<String> {
     argv
 }
 
-fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
+/// The remote half of a session, run by `sh -c` with the pane target and the
+/// observe size as `$1 $2 $3`; `@BIN@` is the remote herdr command.
+///
+/// It keeps `herdr terminal session observe` streaming to stdout. A
+/// `control <cols> <rows> <fallback-cols> <fallback-rows>` line on stdin stops
+/// the observer and runs `herdr terminal session control` in the foreground on
+/// the same stdin/stdout: the JSON input lines that follow are the
+/// controller's, its frames are the view, and when it exits (a
+/// `terminal.release`, or the attach being refused or taken over) the observer
+/// starts again. `auto` sizes measure the remote pane's own pty — `pane
+/// process-info` for the pane's shell pid (herdr 0.9.0 reports no tty there),
+/// `ps -o tty=` for that process's terminal, then `stty size` on it — so
+/// control attaches at the size the pane already has and herdr's attach-time
+/// resize changes nothing.
+///
+/// Only one child streams at a time, so the remote renders one view per pane
+/// as before. Each switch is bracketed by marker lines (`mirror.*`), each
+/// preceded by a newline that ends any frame line the stopped observer was cut
+/// off in. One line on purpose: some login shells (csh) reject a newline
+/// inside quotes, and no `!` outside `$!`.
+const MUX_SCRIPT: &str = concat!(
+    "T=$1 OC=$2 OR=$3 s=; ",
+    "obs() { ( stop= c=; trap 'stop=1; [ -n \"$c\" ] && kill \"$c\" 2>/dev/null' TERM; ",
+    "@BIN@ terminal session observe \"$T\" --cols \"$OC\" --rows \"$OR\" </dev/null & c=$!; ",
+    "[ -n \"$stop\" ] && kill \"$c\" 2>/dev/null; wait \"$c\"; rc=$?; wait \"$c\" 2>/dev/null; ",
+    "printf '\\n{\"type\":\"mirror.observe_exited\",\"code\":%d}\\n' \"$rc\"; ) </dev/null & s=$!; }; ",
+    "trap '[ -n \"$s\" ] && kill \"$s\" 2>/dev/null' EXIT; ",
+    "obs; ",
+    "while IFS=' ' read -r cmd c r fc fr; do ",
+    "[ \"$cmd\" = control ] || continue; ",
+    "[ -n \"$s\" ] && { kill \"$s\" 2>/dev/null; wait \"$s\" 2>/dev/null; }; s=; fb=false; ",
+    "if [ \"$c\" = auto ]; then ",
+    "t=$(@BIN@ pane process-info --pane \"$T\" </dev/null 2>/dev/null | sed -n 's/.*\"shell_pid\" *: *\\([0-9][0-9]*\\).*/\\1/p'); ",
+    "[ -n \"$t\" ] && t=$(ps -o tty= -p \"$t\" 2>/dev/null | tr -d ' '); ",
+    "sz=; case \"$t\" in ''|'?'|'??') ;; *) sz=$(stty size </dev/\"$t\" 2>/dev/null) ;; esac; r=${sz% *} c=${sz#* }; ",
+    "if [ \"$c\" -gt 0 ] 2>/dev/null && [ \"$r\" -gt 0 ] 2>/dev/null; then :; else c=$fc r=$fr fb=true; fi; ",
+    "fi; ",
+    "printf '{\"type\":\"mirror.control\",\"cols\":%s,\"rows\":%s,\"fallback\":%s}\\n' \"$c\" \"$r\" \"$fb\"; ",
+    "@BIN@ terminal session control \"$T\" --cols \"$c\" --rows \"$r\"; ",
+    "printf '\\n{\"type\":\"mirror.control_exited\",\"code\":%d}\\n' \"$?\"; ",
+    "obs; ",
+    "done",
+);
+
+fn mux_script(bin: &str) -> String {
+    MUX_SCRIPT.replace("@BIN@", bin)
+}
+
+fn spawn_session(args: &Args, cols: usize, rows: usize, gen: u64, tx: mpsc::Sender<Msg>) -> Result<Session> {
     // Configured paths stay unquoted so remote-shell ~ expands; auto mode is an
     // `sh -c` resolver that takes the trailing words as "$@" (see
     // config::remote_herdr_expr).
@@ -255,20 +329,20 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         args.remote_bin.as_deref(),
         args.session.as_deref(),
     );
-    let cmd = format!(
-        "exec {} terminal session {} {} --cols {} --rows {}",
-        bin,
-        mode.as_str(),
-        sh_quote(&args.pane_target),
-        cols,
-        rows
-    );
+    let script = mux_script(&bin);
     // ssh and docker differ only in how the command is carried; the streaming
-    // contract (piped stdio, herdr's frames on stdout) is identical
-    let mut builder = match &args.container {
+    // contract (piped stdio, frames and markers on stdout) is identical
+    let builder = match &args.container {
         None => {
+            // the remote login shell (sh, zsh, fish, ...) parses only this
+            // line; everything POSIX lives inside the quoted `sh -c`
+            let cmd = format!(
+                "exec sh -c {} herdr-mirror {} {cols} {rows}",
+                sh_quote(&script),
+                sh_quote(&args.pane_target)
+            );
             let mut c = tokio::process::Command::new("ssh");
-            c.args(ssh_stream_args(&args.ssh_target, &cmd));
+            c.args(ssh_stream_args(&args.ssh_target, &cmd, args.compression));
             c
         }
         Some(ct) => {
@@ -283,10 +357,24 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
             )?;
             let mut c = tokio::process::Command::new(&ct.docker_bin);
             // `sh -c` not `-lc`: match ssh's non-login remote shell
-            c.args(["exec", "-i", &id, "sh", "-c", &cmd]);
+            c.args(["exec", "-i", &id, "sh", "-c", &script, "herdr-mirror", &args.pane_target])
+                .arg(cols.to_string())
+                .arg(rows.to_string());
             c
         }
     };
+    spawn_transport(builder, gen, tx, INPUT_WRITE_TIMEOUT)
+}
+
+/// Start a transport command and make it a session: its stdout lines are
+/// frames and markers (sent on as `Msg::Frame`), its stdin is fed by a task of
+/// its own, and its exit arrives as `Msg::SessionExit`.
+fn spawn_transport(
+    mut builder: tokio::process::Command,
+    gen: u64,
+    tx: mpsc::Sender<Msg>,
+    write_timeout: Duration,
+) -> Result<Session> {
     // Keep the transport and all of its local descendants in one independently
     // killable group. Killing only ssh can orphan a ProxyCommand and leave its
     // remote terminal controller attached after the mirror pane closes.
@@ -300,7 +388,6 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
     let stdin = child.stdin.take().ok_or_else(|| err("no child stdin"))?;
     let stdout = child.stdout.take().ok_or_else(|| err("no child stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| err("no child stderr"))?;
-    let started = Instant::now();
 
     tokio::spawn(async move {
         // ssh errors arrive on stderr; the server's failure reason arrives as
@@ -332,14 +419,44 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
                 break;
             }
         }
-        let _ = child.wait().await;
+        // stdout is gone, so nothing here can be shown any more. A remote
+        // straggler holding the channel open must not keep the session alive.
+        if tokio::time::timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+            kill_session_process_group(process_group);
+            let _ = child.wait().await;
+        }
         stderr_task.abort();
         let tail = err_tail.lock().unwrap().trim().to_string();
         let reason = if close_reason.is_empty() { tail } else { close_reason };
-        let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
+        let _ = tx.send(Msg::SessionExit { gen, reason }).await;
     });
 
-    Ok(Session { gen, mode, process_group, stdin })
+    let input = spawn_input_writer(stdin, process_group, write_timeout);
+    Ok(Session { gen, process_group, input, phase: Phase::Observe, closed_reason: None })
+}
+
+/// The only writer of a session's stdin. The event loop hands it lines with
+/// `try_send` and never waits; a write that stalls past `write_timeout` means
+/// the connection is wedged, so the session is killed (and reconnects) rather
+/// than letting input pile up behind it.
+fn spawn_input_writer(
+    mut stdin: ChildStdin,
+    process_group: i32,
+    write_timeout: Duration,
+) -> mpsc::Sender<Vec<u8>> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE);
+    tokio::spawn(async move {
+        while let Some(buf) = rx.recv().await {
+            match tokio::time::timeout(write_timeout, stdin.write_all(&buf)).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    kill_session_process_group(process_group);
+                    break;
+                }
+            }
+        }
+    });
+    tx
 }
 
 // ---------------------------------------------------------------------------
@@ -448,11 +565,139 @@ impl RawMode {
     }
 }
 
-fn write_stdout(s: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(s.as_bytes());
-    let _ = out.flush();
+/// Everything this process writes to its pane, written by a thread of its own.
+///
+/// The pane is a pty the hub herdr drains. When it stops draining (a stalled
+/// server, a full pty buffer) a write there blocks, and on the event loop that
+/// froze the whole streamer: no ssh reads, no input, no signals. Here the loop
+/// only hands bytes over. Paints are latest-wins: at most one is in flight;
+/// while it is, new frames only update the grid, and the next paint — a diff
+/// against what the renderer last emitted, so nothing it relies on is lost —
+/// goes out once the writer is free. Superseded intermediate screens are never
+/// painted; the last one always is.
+struct Output {
+    tx: std::sync::mpsc::Sender<(String, bool)>,
+    /// paints handed over and not yet fully written
+    paints: Arc<AtomicUsize>,
+    /// everything handed over and not yet fully written
+    queued: Arc<AtomicUsize>,
+    /// signalled each time the writer finishes a paint
+    drained: Arc<Notify>,
+}
+
+impl Output {
+    fn new(sink: impl Write + Send + 'static) -> Output {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        let paints = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::new(Notify::new());
+        let (p, q, d) = (paints.clone(), queued.clone(), drained.clone());
+        std::thread::Builder::new()
+            .name("pane-output".into())
+            .spawn(move || {
+                let mut sink = sink;
+                for (bytes, is_paint) in rx {
+                    let _ = sink.write_all(bytes.as_bytes());
+                    let _ = sink.flush();
+                    q.fetch_sub(1, Ordering::AcqRel);
+                    if is_paint {
+                        p.fetch_sub(1, Ordering::AcqRel);
+                        d.notify_one();
+                    }
+                }
+            })
+            .expect("spawn pane output thread");
+        Output { tx, paints, queued, drained }
+    }
+
+    /// Mode switches, titles, the clipboard: small, rare, ordered with paints.
+    fn control(&self, s: impl Into<String>) {
+        self.send(s.into(), false);
+    }
+
+    fn paint(&self, s: String) {
+        self.send(s, true);
+    }
+
+    fn send(&self, s: String, is_paint: bool) {
+        if s.is_empty() {
+            return;
+        }
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if is_paint {
+            self.paints.fetch_add(1, Ordering::AcqRel);
+        }
+        if self.tx.send((s, is_paint)).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            if is_paint {
+                self.paints.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// A paint is still being written: hold the next one.
+    fn busy(&self) -> bool {
+        self.paints.load(Ordering::Acquire) > 0
+    }
+
+    /// Give the writer up to `limit` to finish what is queued (the exit path:
+    /// restoring the pane's modes should land, but never hang the exit).
+    async fn settle(&self, limit: Duration) {
+        let end = Instant::now() + limit;
+        while self.queued.load(Ordering::Acquire) > 0 && Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// Longest remote title relayed, in chars. Titles are one-line labels (an
+/// agent's task summary); the bound only stops a hostile or broken remote from
+/// pushing an arbitrarily large string through every herdr client's pane list.
+const TITLE_MAX_CHARS: usize = 256;
+
+/// Make a remote title safe to re-emit inside OSC 2. It travels from another
+/// machine into the local terminal stream, where a control char ends the string
+/// early — BEL, ESC (the start of ST), a C1 ST — and runs whatever follows as
+/// terminal input. `is_control` covers all of C0, DEL and C1.
+fn sanitize_title(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).take(TITLE_MAX_CHARS).collect()
+}
+
+/// The OSC 2 that makes this pane's title the relayed one, or `None` when
+/// there is nothing to write: no relay for us, a relay addressed to a different
+/// remote pane (a previous holder of this reused local id), or no change.
+///
+/// A remote pane with no title is written as an empty OSC 2, which herdr reads
+/// as "no title" — rather than leaving the one the shell set before `exec`.
+fn title_update(
+    relayed: Option<crate::state::PaneTitle>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) -> Option<String> {
+    let relayed = relayed.filter(|t| t.remote == pane_target)?;
+    let clean = sanitize_title(relayed.title.as_deref().unwrap_or(""));
+    if shown.as_deref() == Some(clean.as_str()) {
+        return None;
+    }
+    let seq = format!("\x1b]2;{clean}\x07");
+    *shown = Some(clean);
+    Some(seq)
+}
+
+/// Show the remote pane's title as this pane's own, so herdr's `terminal_title`
+/// for the mirror is the remote's. Only a streamer drawing into a herdr pane
+/// (tty, `HERDR_PANE_ID` known) has a title to set.
+fn relay_title(
+    out: &Output,
+    state_dir: &std::path::Path,
+    local_pane_id: Option<&str>,
+    pane_target: &str,
+    shown: &mut Option<String>,
+) {
+    let Some(id) = local_pane_id else { return };
+    if let Some(seq) = title_update(crate::state::read_pane_title(state_dir, id), pane_target, shown) {
+        out.control(seq);
+    }
 }
 
 /// One SGR mouse event: ESC [ < btn ; col ; row (M|m). Returns (btn, col, row,
@@ -720,8 +965,29 @@ const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 /// restarting renumbers pane ids while session restore runs.
 const GONE_BACKOFF_MS: u64 = 60_000;
 
-const SWITCH_GAP: Duration = Duration::from_millis(200);
-const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+/// Paint at most this often (~20 fps). A burst of remote frames inside one
+/// interval is one paint of the latest screen; a lone frame — a keystroke's
+/// echo after a quiet spell — paints at once.
+const PAINT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Frames arriving this soon after a forwarded keystroke are taken to be its
+/// echo and paint without waiting for `PAINT_INTERVAL` (still latest-wins, and
+/// still never while the writer is busy). Sustained output outside it stays
+/// capped.
+const ECHO_WINDOW: Duration = Duration::from_millis(150);
+
+/// Input lines waiting for the ssh child. Bounded: past this the remote has
+/// not read input for a long while, and replaying a backlog late is worse than
+/// saying it was dropped.
+const INPUT_QUEUE: usize = 256;
+
+/// One write to the ssh child stalled this long means the connection is
+/// wedged: the session is dropped and reconnects.
+const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After a refused control attempt on an always-control pane, ask again after
+/// this long (a second refusal leaves it read-only until the user types).
+const CONTROL_RETRY: Duration = Duration::from_secs(2);
 
 /// Is this failure "the pane we stream is gone", as opposed to any other
 /// failure that happens to mention something missing?
@@ -765,23 +1031,33 @@ struct App {
     tty: bool,
     grid: Grid,
     renderer: Renderer,
+    out: Output,
     tx: mpsc::Sender<Msg>,
 
-    mode: Mode,
-    /// in-flight mode switch (guards fast re-entry)
-    switching_to: Option<Mode>,
-    switch_at: Option<Instant>,
     session: Option<Session>,
     next_gen: u64,
+    /// an always-control pane whose size is a real viewport: holds control
+    /// whenever connected
+    standing_control: bool,
 
     backoff_idx: usize,
-    reconnect_at: Option<(Instant, Mode)>,
-    /// consecutive quick control failures → fall back to observe
+    reconnect_at: Option<Instant>,
+    /// a refused standing control is asked for again at this time
+    control_retry_at: Option<Instant>,
+    /// consecutive refused control attempts → stay read-only
     control_failures: u32,
     control_sticky: bool,
     pending_input: Vec<Vec<u8>>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
+    /// a paint is owed: the grid or an overlay changed since the last one
+    paint_pending: bool,
+    /// the owed paint is held to this time by the frame-rate cap
+    paint_at: Option<Instant>,
+    last_paint: Option<Instant>,
+    /// until then, frames are a keystroke's echo: they paint at once instead
+    /// of waiting out `PAINT_INTERVAL` (see `send_input`)
+    echo_until: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
     /// remote pane foreground classification, None=unknown (fail safe to local).
@@ -828,10 +1104,78 @@ const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
+    fn new(args: Args, tty: bool, tx: mpsc::Sender<Msg>, out: Output) -> App {
+        App {
+            args,
+            tty,
+            grid: Grid::new(),
+            renderer: Renderer::new(),
+            out,
+            tx,
+            session: None,
+            next_gen: 0,
+            standing_control: false,
+            backoff_idx: 0,
+            reconnect_at: None,
+            control_retry_at: None,
+            control_failures: 0,
+            control_sticky: false,
+            pending_input: Vec::new(),
+            last_input: Instant::now(),
+            hint_clear_at: None,
+            paint_pending: false,
+            paint_at: None,
+            last_paint: None,
+            echo_until: None,
+            predict: Predictor::new(),
+            remote_fg: None,
+            select: Select::new(),
+            last_select_rows: None,
+            fg_poll_at: None,
+            settle_at: None,
+            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+            // startup leaves the pane in normal cursor mode; the first
+            // classification moves it if the remote turns out to be a TUI
+            app_cursor_keys: false,
+            paste_inflight: false,
+            paste_buf: Vec::new(),
+            mouse_buf: Vec::new(),
+            mouse_flush_at: None,
+            paste_queue: Vec::new(),
+            paste_original: None,
+        }
+    }
+
+    fn phase(&self) -> Option<Phase> {
+        self.session.as_ref().map(|s| s.phase)
+    }
+
+    /// Bring the pane up to date — or owe it: while the writer is still busy
+    /// with the last paint, or within `PAINT_INTERVAL` of it, only the debt is
+    /// recorded, and the run loop pays it when the writer drains or the
+    /// interval ends. Every caller can ask freely; the pane gets the latest
+    /// screen at most ~20 times a second and never blocks anything.
     fn paint(&mut self) {
         if !self.tty {
             return;
         }
+        self.paint_pending = true;
+        if self.out.busy() {
+            return;
+        }
+        let now = Instant::now();
+        let echoing = self.echo_until.is_some_and(|t| t > now);
+        if let Some(next) = self.last_paint.map(|t| t + PAINT_INTERVAL).filter(|&t| t > now && !echoing) {
+            self.paint_at.get_or_insert(next);
+            return;
+        }
+        self.paint_now(now);
+    }
+
+    fn paint_now(&mut self, now: Instant) {
+        self.paint_pending = false;
+        self.paint_at = None;
+        self.last_paint = Some(now);
         let (cols, rows) = term_size();
         // Overlays paint outside the renderer's per-row cache, so the rows they
         // covered must be repainted or the old drawing survives underneath.
@@ -871,7 +1215,7 @@ impl App {
                 out.push_str(&overlay);
             }
         }
-        write_stdout(&out);
+        self.out.paint(out);
     }
 
     fn hint(&mut self, text: &str) {
@@ -938,7 +1282,7 @@ impl App {
             return;
         }
         self.mouse_grabbed = true;
-        write_stdout("\x1b[?1002h\x1b[?1006h");
+        self.out.control("\x1b[?1002h\x1b[?1006h");
     }
 
     /// Match the local pane's cursor-key mode to the remote's, so the arrow bytes
@@ -965,14 +1309,15 @@ impl App {
             return;
         }
         self.app_cursor_keys = want;
-        write_stdout(if want { "\x1b[?1h" } else { "\x1b[?1l" });
+        self.out.control(if want { "\x1b[?1h" } else { "\x1b[?1l" });
     }
 
     fn observe_size(&self) -> (usize, usize) {
         observe_size_for(&self.args, if self.tty { term_size() } else { (0, 0) })
     }
 
-    /// Size to enter (and stay in) control at. Control is authoritative on the
+    /// Size for an always-control pane, and the fallback for a watch-only one
+    /// whose remote pty could not be measured. Control is authoritative on the
     /// remote — the server resizes the remote pty to whatever we ask for — so a
     /// host whose remote has its own display caps this and renders the remote at
     /// its own geometry, leaving the rest of the local pane blank rather than
@@ -982,69 +1327,44 @@ impl App {
         cap_size(term_size(), self.args.max_cols, self.args.max_rows)
     }
 
-    /// Stop the child (clean release first for control) — never leave an
-    /// orphan holding the remote attach lock.
-    fn stop_session(&mut self) {
-        if let Some(mut s) = self.session.take() {
-            tokio::spawn(async move {
-                if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-                }
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                kill_session_process_group(s.process_group);
-            });
-        }
-    }
-
-    async fn connect(&mut self, m: Mode) {
-        self.mode = m;
+    /// Open the transport: one ssh (or docker exec) running the remote mux
+    /// script, which starts in observe. Control comes and goes inside it.
+    fn connect(&mut self) {
         // re-earn prediction confidence against the new session's frames
         self.predict = Predictor::new();
         // the new session repaints from scratch, so a span from the old one
         // points at text that no longer exists
         self.select.clear();
-        let (cols, rows) = match m {
-            Mode::Observe => self.observe_size(),
-            Mode::Control => self.control_size(),
-        };
         if let Some(s) = self.session.take() {
             kill_session_process_group(s.process_group);
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
-            Ok(mut s) => {
-                if m == Mode::Control {
-                    self.last_input = Instant::now();
-                    // keystrokes typed while the control session was spinning up
-                    for buf in std::mem::take(&mut self.pending_input) {
-                        let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
-                    }
-                } else {
-                    self.pending_input.clear();
-                }
+        let (cols, rows) = self.observe_size();
+        match spawn_session(&self.args, cols, rows, self.next_gen, self.tx.clone()) {
+            Ok(s) => {
                 self.session = Some(s);
                 // warm the foreground classification before the user mouses
                 self.spawn_foreground_poll(false);
-                // always-control has no release, so no "ctrl+\ to release" hint
-                self.renderer.status(
-                    if m == Mode::Control && !self.args.always_control {
-                        "CONTROL — ctrl+\\ to release"
-                    } else {
-                        ""
-                    },
-                );
+                self.renderer.status("");
+                // typed while reconnecting, or a pane that holds control
+                if !self.pending_input.is_empty() || (self.standing_control && !self.control_sticky) {
+                    self.request_control();
+                }
             }
-            Err(e) => self.schedule_reconnect(m, &e.to_string()),
+            Err(e) => self.schedule_reconnect(&e.to_string()),
         }
     }
 
-    fn schedule_reconnect(&mut self, m: Mode, reason: &str) {
-        // Only slow down once we are back in observe. In control the existing
-        // quick-failure fallback needs its fast retries to reach two failures
-        // and drop the pane to observe within seconds; a 60s rung there would
-        // leave an always_control pane stuck in control for a minute.
-        let gone = m == Mode::Observe && target_gone(reason, &self.args.pane_target);
+    /// The transport is gone or unusable: stop it and retry with backoff.
+    fn drop_session(&mut self, reason: &str) {
+        if let Some(s) = self.session.take() {
+            kill_session_process_group(s.process_group);
+        }
+        self.schedule_reconnect(reason);
+    }
+
+    fn schedule_reconnect(&mut self, reason: &str) {
+        let gone = target_gone(reason, &self.args.pane_target);
         let (delay, idx) = reconnect_delay(gone, self.backoff_idx);
         self.backoff_idx = idx;
 
@@ -1055,55 +1375,215 @@ impl App {
             // the second cycle onward. The renderer diffs rows, so an
             // unchanged line costs one row write a minute.
             self.renderer.status(&format!("remote pane {} is gone", self.args.pane_target));
-            // and nothing may expire it out from under us: the control→observe
-            // fallback sets a 1.5s hint just before this path runs
+            // and nothing may expire it out from under us
             self.hint_clear_at = None;
         } else {
             let suffix = if reason.is_empty() { String::new() } else { format!(" — {reason}") };
-            self.renderer
-                .status(&format!("reconnecting in {}s ({}){suffix}", delay / 1000, m.as_str()));
+            self.renderer.status(&format!("reconnecting in {}s{suffix}", delay / 1000));
         }
         self.paint();
-        self.reconnect_at = Some((Instant::now() + Duration::from_millis(delay), m));
+        self.reconnect_at = Some(Instant::now() + Duration::from_millis(delay));
     }
 
+    /// Queue one line for the remote script. Never waits: the session's own
+    /// task does the writing. A full queue means the remote has not read input
+    /// for a long while; the line is dropped, and said so, rather than
+    /// replayed late.
+    fn send_line(&mut self, line: String) -> bool {
+        let Some(s) = self.session.as_ref() else { return false };
+        match s.input.try_send(line.into_bytes()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.hint("remote is not reading input — dropped");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
 
-    fn switch_mode(&mut self, m: Mode) {
-        // already settled or scheduled — don't restart. Without this guard,
-        // fast typing during the 200ms connect gap would spawn one control
-        // ssh per keystroke, all racing to attach the same terminal.
-        if self.switching_to == Some(m) || (self.switching_to.is_none() && self.mode == m) {
+    fn send(&mut self, msg: serde_json::Value) -> bool {
+        self.send_line(msg.to_string() + "\n")
+    }
+
+    /// Forward keystrokes. The frames that come back within `ECHO_WINDOW` are
+    /// their echo, and paint without waiting for the frame-rate cap: the cap is
+    /// for sustained output, and holding an echo for up to `PAINT_INTERVAL`
+    /// is latency the user feels on every key.
+    fn send_input(&mut self, bytes: &[u8]) -> bool {
+        let sent = self.send(json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }));
+        if sent {
+            self.echo_until = Some(Instant::now() + ECHO_WINDOW);
+        }
+        sent
+    }
+
+    /// Ask the remote script for control, on the connection that is already
+    /// up. Input typed so far follows straight behind the request: the
+    /// controller reads it from the same pipe once attached, so the first
+    /// keystroke costs a round trip and a remote process start, not an ssh
+    /// handshake, and the view keeps streaming throughout.
+    fn request_control(&mut self) {
+        if self.phase() != Some(Phase::Observe) {
             return;
         }
-        self.reconnect_at = None;
-        self.switching_to = Some(m);
-        self.stop_session();
-        // covers every route into a mode change that returns before the mouse
-        // loop: ctrl+\, the idle release, and taking control from Observe
+        let (cols, rows) = self.control_size();
+        // Watch-only: the remote measures its own pane and attaches at exactly
+        // that size, so herdr's attach-time resize changes nothing over there.
+        // This pane's size is only the fallback for a remote that cannot be
+        // measured. Always-control drives the remote's size on purpose.
+        let line = if self.args.always_control {
+            format!("control {cols} {rows} {cols} {rows}\n")
+        } else {
+            format!("control auto auto {cols} {rows}\n")
+        };
+        if !self.send_line(line) {
+            return;
+        }
+        if let Some(s) = self.session.as_mut() {
+            s.phase = Phase::Acquiring;
+            s.closed_reason = None;
+        }
+        self.last_input = Instant::now();
+        for buf in std::mem::take(&mut self.pending_input) {
+            self.send_input(&buf);
+        }
+    }
+
+    /// Hand control back. The controller exits on the release; the script then
+    /// restarts the observer on the same connection.
+    fn release_control(&mut self) {
+        if !matches!(self.phase(), Some(Phase::Acquiring | Phase::Control { .. })) {
+            return;
+        }
+        if self.send(json!({ "type": "terminal.release" })) {
+            if let Some(s) = self.session.as_mut() {
+                s.phase = Phase::Releasing;
+            }
+        }
+        // the view is about to be redrawn by a different stream
         self.select.clear();
         self.renderer.invalidate();
-        // immediate feedback for the mode-switch gap (stop + 200ms + reconnect)
-        self.renderer.status(if m == Mode::Control { "taking control…" } else { "releasing…" });
         self.paint();
-        self.switch_at = Some(Instant::now() + SWITCH_GAP);
+    }
+
+    /// The controller exited (`mirror.control_exited`): the script is
+    /// restarting the observer.
+    fn control_exited(&mut self) {
+        let Some(s) = self.session.as_mut() else { return };
+        let was = s.phase;
+        let reason = s.closed_reason.take();
+        s.phase = Phase::Observe;
+        match was {
+            Phase::Releasing => {}
+            Phase::Control { acked: true } => {
+                // ended without our release: taken over, or the pane went away
+                if let Some(r) = reason.filter(|r| r != "detached") {
+                    self.hint(&format!("control ended — {r}"));
+                }
+            }
+            // refused before a single frame: the attach failed, typically
+            // because another client holds this terminal. What was typed went
+            // to a controller that never attached.
+            Phase::Acquiring | Phase::Control { acked: false } | Phase::Observe => {
+                self.pending_input.clear();
+                self.control_failures += 1;
+                let suffix = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+                if self.control_failures >= 2 {
+                    self.control_failures = 0;
+                    self.control_sticky = true;
+                    self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
+                } else {
+                    self.hint(&format!("control refused{suffix}"));
+                    if self.standing_control {
+                        self.control_retry_at = Some(Instant::now() + CONTROL_RETRY);
+                    }
+                }
+                return;
+            }
+        }
+        // typed during the release, or a pane that holds control: take it again
+        if !self.pending_input.is_empty() || (self.standing_control && !self.control_sticky) {
+            self.request_control();
+        }
+    }
+
+    /// The local pane was resized. Watch-only never resizes the remote; an
+    /// always-control pane takes control once it has a real size, and drives
+    /// the remote's size while it holds control.
+    fn on_resize(&mut self) {
+        self.renderer.invalidate();
+        // control_sticky means control was refused twice in a row and we told
+        // the user "type to retry" — a window drag must not undo that
+        if self.args.always_control && !self.standing_control && !self.control_sticky {
+            // the request itself carries this size
+            self.standing_control = true;
+            self.request_control();
+        } else if self.args.always_control
+            && matches!(self.phase(), Some(Phase::Acquiring | Phase::Control { .. }))
+        {
+            // capped like the initial request: a local window drag must not
+            // push a capped host past its ceiling either
+            let (cols, rows) = self.control_size();
+            self.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows }));
+        }
+        self.paint();
     }
 
     fn handle_frame(&mut self, gen: u64, frame: Frame) {
-        if self.session.as_ref().map(|s| s.gen) != Some(gen) {
+        let Some(s) = self.session.as_mut().filter(|s| s.gen == gen) else {
             return; // stale frame from a replaced session
-        }
-        if frame.kind == "terminal.closed" {
-            let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
-            self.renderer.status(&format!("remote terminal closed{suffix}"));
-            self.paint();
-            return;
-        }
-        if frame.kind != "terminal.frame" {
-            return;
+        };
+        match frame.kind.as_str() {
+            "terminal.frame" => {
+                if s.phase == (Phase::Control { acked: false }) {
+                    s.phase = Phase::Control { acked: true };
+                    self.control_failures = 0;
+                }
+            }
+            "terminal.closed" => {
+                s.closed_reason = frame.reason.clone();
+                // a controller's close is handled when it exits; an observer's
+                // means the pane is going, and is worth showing
+                if s.phase == Phase::Observe {
+                    let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+                    self.renderer.status(&format!("remote terminal closed{suffix}"));
+                    self.paint();
+                }
+                return;
+            }
+            "mirror.observe_exited" => {
+                // expected right after a control request: the script stops the
+                // observer before starting the controller. Otherwise the
+                // observer died on its own and the session is over.
+                if s.phase == Phase::Observe {
+                    let reason = s
+                        .closed_reason
+                        .take()
+                        .unwrap_or_else(|| format!("remote observer exited ({})", frame.code.unwrap_or(-1)));
+                    self.drop_session(&reason);
+                }
+                return;
+            }
+            "mirror.control" => {
+                s.phase = Phase::Control { acked: false };
+                s.closed_reason = None;
+                if frame.fallback == Some(true) {
+                    self.hint("remote pane size unknown — control uses this pane's size");
+                }
+                return;
+            }
+            "mirror.control_exited" => {
+                self.control_exited();
+                return;
+            }
+            _ => return,
         }
         let Some(bytes) = &frame.bytes else { return };
         self.backoff_idx = 0;
-        self.renderer.status("");
+        // a frame supersedes a connection status, not a hint still on its timer
+        if self.hint_clear_at.is_none() {
+            self.renderer.status("");
+        }
         let (fw, fh) = (
             frame.width.unwrap_or(self.grid.width),
             frame.height.unwrap_or(self.grid.height),
@@ -1139,34 +1619,14 @@ impl App {
         }
     }
 
-    fn handle_exit(&mut self, gen: u64, exited_mode: Mode, reason: String, uptime: Duration) {
+    fn handle_exit(&mut self, gen: u64, reason: String) {
         if self.session.as_ref().map(|s| s.gen) != Some(gen) {
             return; // an old child we already replaced/killed
         }
         self.session = None;
         let reason_line =
             reason.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
-        // control that dies quickly twice is failing (refused/dropped): fall
-        // back to observe so the pane stays viewable; a keystroke retries
-        if exited_mode == Mode::Control {
-            self.control_failures = if uptime < QUICK_CONTROL_FAILURE { self.control_failures + 1 } else { 0 };
-            if self.control_failures >= 2 {
-                self.control_failures = 0;
-                self.control_sticky = true;
-                self.switch_mode(Mode::Observe);
-                let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
-                self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
-                return;
-            }
-        }
-        self.schedule_reconnect(exited_mode, &reason_line);
-    }
-
-    async fn send(&mut self, msg: serde_json::Value) {
-        if let Some(s) = self.session.as_mut() {
-            let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
-        }
+        self.schedule_reconnect(&reason_line);
     }
 
     /// Route ordinary input after preserving a partial SGR mouse sequence.
@@ -1320,26 +1780,45 @@ impl App {
             });
             return;
         }
-        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
-            // no quit key: the wrapper's lifecycle belongs to the hosting pane
-            if has_mouse_seq(&buf) {
-                // wheel escalates only after a soft release; a stray wheel
-                // while glancing shouldn't grab the remote's lock
-                if contains_wheel_press(&buf) {
-                    if self.control_sticky {
-                        self.control_sticky = false;
-                        self.switch_mode(Mode::Control);
-                    } else {
-                        self.hint("read-only — type to take control");
+        match self.phase() {
+            Some(Phase::Acquiring | Phase::Control { .. }) => {}
+            phase => {
+                // no quit key: the wrapper's lifecycle belongs to the hosting pane
+                if has_mouse_seq(&buf) {
+                    // wheel escalates only after a soft release; a stray wheel
+                    // while glancing shouldn't grab the remote's lock
+                    if phase == Some(Phase::Observe) && contains_wheel_press(&buf) {
+                        if self.control_sticky {
+                            self.control_sticky = false;
+                            self.request_control();
+                        } else {
+                            self.hint("read-only — type to take control");
+                        }
                     }
+                    return;
+                }
+                // ctrl+\ with no control held: nothing to release, and never
+                // forwarded (it is SIGQUIT over there)
+                if buf == [0x1c] {
+                    return;
+                }
+                // any keystroke takes control and is delivered right behind
+                // the request
+                self.control_sticky = false;
+                self.pending_input.push(buf);
+                match phase {
+                    Some(Phase::Observe) => self.request_control(),
+                    // reconnecting: deliver as soon as it is back
+                    None => {
+                        if let Some(t) = self.reconnect_at.as_mut() {
+                            *t = Instant::now();
+                        }
+                    }
+                    // releasing: taken again the moment the controller exits
+                    _ => {}
                 }
                 return;
             }
-            // any keystroke takes control and is delivered once the session is up
-            self.control_sticky = false;
-            self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
-            return;
         }
 
         // control mode
@@ -1349,16 +1828,7 @@ impl App {
             // release to, so swallow it (never forward it: ctrl+\ is SIGQUIT).
             if !self.args.always_control {
                 self.control_sticky = false;
-                self.switch_mode(Mode::Observe);
-            }
-            return;
-        }
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            // spinning up or awaiting reconnect: queue the keystroke (flushed
-            // on connect) and, if in backoff, reconnect now
-            self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
+                self.release_control();
             }
             return;
         }
@@ -1446,14 +1916,14 @@ impl App {
             }
         }
         for s in scrolls {
-            self.send(s).await;
+            self.send(s);
         }
         if let Some((start, end)) = copy_span {
             let text = self.grid.selection_text(start, end);
             match crate::select::osc52(&text) {
                 // no hint on success: herdr shows its own "copied to clipboard"
                 // toast when it takes the OSC 52, so ours would be a duplicate
-                Some(seq) => write_stdout(&seq),
+                Some(seq) => self.out.control(seq),
                 // too big for herdr to accept. Worth saying, because this is the
                 // one path where nothing else reports: we never emit, so there
                 // is no clipboard write for herdr to toast about.
@@ -1469,8 +1939,7 @@ impl App {
             // `dismiss`, not `clear`: a press may have been buffered earlier in
             // this very read, and cancelling it would eat the click.
             sel_changed |= self.select.dismiss();
-            let msg = json!({ "type": "terminal.input", "bytes": B64.encode(&rest) });
-            self.send(msg).await;
+            self.send_input(&rest);
             // optimistic local echo: draw the keystroke now, verify on frame
             if self.predict.on_input(&rest, &self.grid) {
                 self.paint();
@@ -1483,21 +1952,25 @@ impl App {
     }
 
     async fn deliver_input(&mut self, buf: Vec<u8>) {
-        if self.mode == Mode::Observe || self.switching_to == Some(Mode::Observe) {
-            self.control_sticky = false;
-            self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
-            return;
-        }
-        self.last_input = Instant::now();
-        if self.switching_to == Some(Mode::Control) || self.session.is_none() {
-            self.pending_input.push(buf);
-            if let Some((_, m)) = self.reconnect_at {
-                self.reconnect_at = Some((Instant::now(), m));
+        match self.phase() {
+            Some(Phase::Acquiring | Phase::Control { .. }) => {
+                self.last_input = Instant::now();
+                self.send_input(&buf);
             }
-            return;
+            Some(Phase::Observe) => {
+                self.control_sticky = false;
+                self.pending_input.push(buf);
+                self.request_control();
+            }
+            // taken again the moment the controller exits
+            Some(Phase::Releasing) => self.pending_input.push(buf),
+            None => {
+                self.pending_input.push(buf);
+                if let Some(t) = self.reconnect_at.as_mut() {
+                    *t = Instant::now();
+                }
+            }
         }
-        self.send(json!({ "type": "terminal.input", "bytes": B64.encode(&buf) })).await;
     }
 
     async fn handle_paste(&mut self, outcome: crate::paste::Outcome) {
@@ -1532,6 +2005,11 @@ pub async fn run(args: Args) -> Result<()> {
     let local_pane_id = tty.then(|| std::env::var("HERDR_PANE_ID").ok()).flatten();
     let state_dir = crate::util::home_dir().join(".local").join("state").join("herdr-mirror");
 
+    // Before either pidfile below exists: a pidfile is what tells the daemon
+    // and the hooks they may SIGUSR1 us, and that signal's default disposition
+    // is terminate. The daemon pokes a pane as soon as its first title lands,
+    // which is typically while this streamer is still starting up.
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     // announce ourselves so the daemon can tell its typed `exec` took
     // (see util::streamer_pid_path); --dump is a human diagnostic, not a
     // daemon-spawned streamer, so it must not claim the slot
@@ -1568,6 +2046,7 @@ pub async fn run(args: Args) -> Result<()> {
         let _ = crate::state::take_pane_hint(&state_dir, id);
         PidfileGuard(path)
     });
+    let out = Output::new(std::io::stdout());
     let raw = if tty {
         // 1002/1006: button-event mouse tracking with SGR encoding, so wheel and
         // clicks reach us instead of scrolling the hosting pane's scrollback
@@ -1582,7 +2061,7 @@ pub async fn run(args: Args) -> Result<()> {
         // no mouse reporting, 1007 on" and type an Up/Down arrow per wheel
         // notch into us, which we'd forward, and a shell would walk command
         // history instead of scrolling (#69).
-        write_stdout("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
+        out.control("\x1b[?1049h\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1007l");
         RawMode::enable()
     } else {
         None
@@ -1609,41 +2088,10 @@ pub async fn run(args: Args) -> Result<()> {
         });
     }
 
-    let mut app = App {
-        args,
-        tty,
-        grid: Grid::new(),
-        renderer: Renderer::new(),
-        tx,
-        mode: Mode::Observe,
-        switching_to: None,
-        switch_at: None,
-        session: None,
-        next_gen: 0,
-        backoff_idx: 0,
-        reconnect_at: None,
-        control_failures: 0,
-        control_sticky: false,
-        pending_input: Vec::new(),
-        last_input: Instant::now(),
-        hint_clear_at: None,
-        predict: Predictor::new(),
-        remote_fg: None,
-        select: Select::new(),
-        last_select_rows: None,
-        fg_poll_at: None,
-        settle_at: None,
-        mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-        // startup leaves the pane in normal cursor mode; the first classification
-        // moves it if the remote turns out to be a TUI
-        app_cursor_keys: false,
-        paste_inflight: false,
-        paste_buf: Vec::new(),
-        mouse_buf: Vec::new(),
-        mouse_flush_at: None,
-        paste_queue: Vec::new(),
-        paste_original: None,
-    };
+    let mut app = App::new(args, tty, tx, out);
+    // what this pane last wrote as its OSC 2 title, so repeats cost nothing
+    let mut shown_title: Option<String> = None;
+    relay_title(&app.out, &state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
     // Control is authoritative on the remote: the server resizes the remote pty
     // to whatever we ask for, beating even a larger live client over there. So
     // entering Control with a size we cannot vouch for is what let a local herdr
@@ -1658,37 +2106,38 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sighup = signal(SignalKind::hangup())?; // pane closed — don't orphan the ssh child
-    // someone left a notice for this pane and wants it seen now
-    let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let mut sigwinch = signal(SignalKind::window_change())?;
 
-    app.connect(initial_mode(app.args.always_control, term_size())).await;
+    // an always-control pane holds control once its size is a real viewport
+    app.standing_control = initial_mode(app.args.always_control, term_size()) == Mode::Control;
+    app.connect();
     // the pane may have been laid out while the session was spawning; the signal
     // for that is buffered above, but check directly too
-    if app.mode == Mode::Observe && initial_mode(app.args.always_control, term_size()) == Mode::Control
-    {
-        app.switch_mode(Mode::Control);
-    } else if app.args.always_control && app.mode == Mode::Observe {
+    if !app.standing_control && initial_mode(app.args.always_control, term_size()) == Mode::Control {
+        app.standing_control = true;
+        app.request_control();
+    } else if app.args.always_control && !app.standing_control {
         // F3: otherwise the pane is inert with no explanation
         app.hint("read-only until this pane is sized — type to take control");
     }
+    let drained = app.out.drained.clone();
 
     loop {
-        // earliest pending deadline: mode-switch gap, reconnect, hint clear, idle release
-        let idle_at = (app.mode == Mode::Control
-            && app.switching_to.is_none()
-            && app.session.is_some()
+        // earliest pending deadline: reconnect, control retry, hint clear, idle
+        // release, prediction expiry, foreground settle, mouse flush, paint
+        let idle_at = (matches!(app.phase(), Some(Phase::Control { .. }))
             && !app.args.always_control
             && app.args.control_idle_secs > 0)
             .then(|| app.last_input + Duration::from_secs(app.args.control_idle_secs));
         let sleep = crate::util::sleep_until_earliest([
-            app.switch_at,
-            app.reconnect_at.map(|(t, _)| t),
+            app.reconnect_at,
+            app.control_retry_at,
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
             app.settle_at,
             app.mouse_flush_at,
+            app.paint_at,
         ]);
 
         tokio::select! {
@@ -1696,7 +2145,7 @@ pub async fn run(args: Args) -> Result<()> {
                 match msg {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
-                    Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::SessionExit { gen, reason }) => app.handle_exit(gen, reason),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
@@ -1714,46 +2163,31 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Drop(result)) => app.handle_drop(result).await,
                 }
             }
-            _ = sigwinch.recv() => {
-                app.renderer.invalidate();
-                // a resize means a client is laying this pane out, so the size is
-                // now a real viewport: take control if that is what we're for.
-                // control_sticky means control was refused twice in a row and we
-                // told the user "type to retry" — a window drag must not turn
-                // that into a reconnect storm.
-                if app.args.always_control && app.mode == Mode::Observe && !app.control_sticky {
-                    app.switch_mode(Mode::Control);
-                }
-                if app.mode == Mode::Control {
-                    // capped like the initial connect: a local window drag must
-                    // not push a capped host past its ceiling either
-                    let (cols, rows) = app.control_size();
-                    app.send(json!({ "type": "terminal.resize", "cols": cols, "rows": rows })).await;
-                }
-                app.paint();
-            }
+            // the writer finished a paint: pay the one owed meanwhile
+            _ = drained.notified(), if app.paint_pending => app.paint(),
+            _ = sigwinch.recv() => app.on_resize(),
             _ = sigusr1.recv() => {
                 if let Some(id) = local_pane_id.as_deref() {
                     if let Some(msg) = crate::state::take_pane_hint(&state_dir, id) {
                         app.hint_for(&msg, Duration::from_secs(4));
                     }
                 }
+                // the daemon pokes the same way when the remote title changed
+                relay_title(&app.out, &state_dir, local_pane_id.as_deref(), &app.args.pane_target, &mut shown_title);
             }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             _ = sighup.recv() => break,
             _ = sleep => {
                 let now = Instant::now();
-                if app.switch_at.is_some_and(|t| t <= now) {
-                    app.switch_at = None;
-                    if let Some(m) = app.switching_to.take() {
-                        app.connect(m).await; // pending input from the gap flushes here
-                    }
+                if app.reconnect_at.is_some_and(|t| t <= now) {
+                    app.reconnect_at = None;
+                    app.connect();
                 }
-                if let Some((t, m)) = app.reconnect_at {
-                    if t <= now {
-                        app.reconnect_at = None;
-                        app.connect(m).await;
+                if app.control_retry_at.is_some_and(|t| t <= now) {
+                    app.control_retry_at = None;
+                    if app.standing_control && !app.control_sticky {
+                        app.request_control();
                     }
                 }
                 if app.hint_clear_at.is_some_and(|t| t <= now) {
@@ -1761,9 +2195,9 @@ pub async fn run(args: Args) -> Result<()> {
                     app.renderer.status("");
                     app.paint();
                 }
-                if idle_at.is_some_and(|t| t <= now) && app.mode == Mode::Control && app.switching_to.is_none() {
+                if idle_at.is_some_and(|t| t <= now) && matches!(app.phase(), Some(Phase::Control { .. })) {
                     app.control_sticky = true;
-                    app.switch_mode(Mode::Observe);
+                    app.release_control();
                     app.hint("control released (idle) — type to retake");
                 }
                 if app.settle_at.is_some_and(|t| t <= now) {
@@ -1777,16 +2211,22 @@ pub async fn run(args: Args) -> Result<()> {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
                 }
+                if app.paint_at.is_some_and(|t| t <= now) {
+                    app.paint_at = None;
+                    if app.paint_pending {
+                        app.paint();
+                    }
+                }
             }
         }
     }
 
     // clean shutdown: release control if held, kill the whole local transport
     // tree (including any ProxyCommand), restore tty
-    if let Some(mut s) = app.session.take() {
-        if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(s) = app.session.take() {
+        if matches!(s.phase, Phase::Acquiring | Phase::Control { .. }) {
+            let _ = s.input.try_send(b"{\"type\":\"terminal.release\"}\n".to_vec());
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
         kill_session_process_group(s.process_group);
     }
@@ -1796,7 +2236,8 @@ pub async fn run(args: Args) -> Result<()> {
         // 1007 back on: it is a default-on mode we turned off, so leaving it
         // clear would silently change the wheel for whatever runs in this pane
         // after the streamer exits
-        write_stdout("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
+        app.out.control("\x1b[?2004l\x1b[?1002l\x1b[?1006l\x1b[?1l\x1b[?1007h\x1b[?25h\x1b[?1049l");
+        app.out.settle(Duration::from_millis(500)).await;
     }
     if let Some(raw) = raw {
         raw.restore();
@@ -1874,7 +2315,7 @@ mod tests {
 
     #[test]
     fn pane_ssh_stream_disables_configured_control_sockets() {
-        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM");
+        let argv = ssh_stream_args("work", "exec herdr terminal session observe w5:pM", true);
 
         assert_eq!(
             &argv[crate::remote::SSH_COMMON_OPTS.len()..],
@@ -1885,6 +2326,21 @@ mod tests {
                 "exec herdr terminal session observe w5:pM",
             ]
         );
+    }
+
+    /// Compression is on unless a host turns it off, and the choice sits on the
+    /// command line, ahead of anything ~/.ssh/config could say: ssh keeps the
+    /// first value it sees for an option.
+    #[test]
+    fn pane_streams_compress_unless_told_not_to() {
+        let on = ssh_stream_args("work", "cmd", parse_args(&["work".into(), "w1:p1".into()]).unwrap().compression);
+        assert!(on.windows(2).any(|w| w == ["-o", "Compression=yes"]));
+        let off_args = parse_args(&["work".into(), "w1:p1".into(), "--no-compression".into()]).unwrap();
+        let off = ssh_stream_args("work", "cmd", off_args.compression);
+        assert!(off.windows(2).any(|w| w == ["-o", "Compression=no"]));
+        assert!(!off.iter().any(|a| a == "Compression=yes"));
+        let target = off.iter().position(|a| a == "work").unwrap();
+        assert!(off.iter().position(|a| a == "Compression=no").unwrap() < target);
     }
 
     /// Uncapped must stay byte-identical to the old `term_size()` call, or
@@ -2337,49 +2793,9 @@ mod tests {
         let args = parse_args(&["unused".into(), "p1".into()]).unwrap();
         let tty = true;
         let (tx, _rx) = mpsc::channel(256);
-        let mut app = App {
-            args,
-            tty,
-            grid: Grid::new(),
-            renderer: Renderer::new(),
-            tx,
-            mode: Mode::Observe,
-            switching_to: None,
-            switch_at: None,
-            session: None,
-            next_gen: 0,
-            backoff_idx: 0,
-            reconnect_at: None,
-            control_failures: 0,
-            control_sticky: false,
-            pending_input: Vec::new(),
-            last_input: Instant::now(),
-            hint_clear_at: None,
-            predict: Predictor::new(),
-            remote_fg: None,
-            select: Select::new(),
-            last_select_rows: None,
-            fg_poll_at: None,
-            settle_at: None,
-            mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
-            // startup leaves the pane in normal cursor mode; the first classification
-            // moves it if the remote turns out to be a TUI
-            app_cursor_keys: false,
-            paste_inflight: false,
-            paste_buf: Vec::new(),
-            mouse_buf: Vec::new(),
-            mouse_flush_at: None,
-            paste_queue: Vec::new(),
-            paste_original: None,
-        };
-        let mut child = tokio::process::Command::new("cat")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).kill_on_drop(true)
-            .spawn().unwrap();
-        app.session = Some(Session {
-            gen: 1, mode: Mode::Control, process_group: child.id().unwrap() as i32,
-            stdin: child.stdin.take().unwrap(),
-        });
-        app.mode = Mode::Control;
+        let mut app = App::new(args, tty, tx, Output::new(std::io::sink()));
+        let (session, _input) = test_session(1, Phase::Control { acked: true });
+        app.session = Some(session);
         app.remote_fg = Some(Fg::Mouse);
         // Keep foreground polling local to this fixture: suppress SSH probes.
         app.fg_poll_at = Some(Instant::now());
@@ -2392,8 +2808,6 @@ mod tests {
             if next_drag { (1, 3) } else { (1, 0) }, b"release",
         );
         drop(app);
-        child.kill().await.unwrap();
-        let _ = child.wait().await;
         if next_drag {
             assert_eq!(result, Released::Selection(((1, 0), (1, 3))));
         } else {
@@ -2411,4 +2825,435 @@ mod tests {
         selection_followed_by_press(true).await;
     }
 
+    fn relayed(remote: &str, title: Option<&str>) -> Option<crate::state::PaneTitle> {
+        Some(crate::state::PaneTitle {
+            host: "vibe1".into(),
+            remote: remote.into(),
+            title: title.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn a_remote_title_cannot_break_out_of_the_osc() {
+        // BEL and ESC \ end an OSC; C1 ST (U+009C) does too for a terminal
+        // that reads C1. Anything after them would run as local terminal input.
+        let hostile = "task\x07\x1b]0;owned\x1b\\\u{9c}\x1b[2J done";
+        assert_eq!(sanitize_title(hostile), "task]0;owned\\[2J done");
+        let mut shown = None;
+        let seq = title_update(relayed("wD:p3", Some(hostile)), "wD:p3", &mut shown).unwrap();
+        let body = seq.strip_prefix("\x1b]2;").and_then(|s| s.strip_suffix('\x07')).unwrap();
+        assert!(!body.chars().any(char::is_control), "{seq:?}");
+    }
+
+    #[test]
+    fn a_remote_title_is_bounded_on_a_char_boundary() {
+        let long = "π".repeat(TITLE_MAX_CHARS + 50);
+        let clean = sanitize_title(&long);
+        assert_eq!(clean.chars().count(), TITLE_MAX_CHARS);
+        assert!(clean.chars().all(|c| c == 'π'));
+    }
+
+    #[test]
+    fn the_remote_title_is_written_once_per_change() {
+        let mut shown = None;
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π ⠴ jev-game\x07")
+        );
+        // a poke for a hint, or a relay that repeats itself, writes nothing
+        assert_eq!(title_update(relayed("wD:p3", Some("π ⠴ jev-game")), "wD:p3", &mut shown), None);
+        assert_eq!(
+            title_update(relayed("wD:p3", Some("π > jev-game")), "wD:p3", &mut shown).as_deref(),
+            Some("\x1b]2;π > jev-game\x07")
+        );
+        // the remote dropping its title clears ours instead of keeping the last
+        assert_eq!(title_update(relayed("wD:p3", None), "wD:p3", &mut shown).as_deref(), Some("\x1b]2;\x07"));
+    }
+
+    #[test]
+    fn a_title_for_another_remote_pane_is_ignored() {
+        // herdr reuses local pane ids: a record left for the previous holder of
+        // this pane must not name the mirror now standing in it
+        let mut shown = None;
+        assert_eq!(title_update(relayed("wD:p1", Some("rpg designer")), "wD:p3", &mut shown), None);
+        assert_eq!(shown, None);
+        assert_eq!(title_update(None, "wD:p3", &mut shown), None);
+    }
+
+    // --- one connection: observe, control, release ---
+
+    /// A session whose remote end is a channel the test reads.
+    fn test_session(gen: u64, phase: Phase) -> (Session, mpsc::Receiver<Vec<u8>>) {
+        let (input, rx) = mpsc::channel(INPUT_QUEUE);
+        (Session { gen, process_group: 0, input, phase, closed_reason: None }, rx)
+    }
+
+    fn sent(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            out.push(String::from_utf8(line).unwrap().trim_end().to_string());
+        }
+        out
+    }
+
+    fn input_line(bytes: &[u8]) -> String {
+        json!({ "type": "terminal.input", "bytes": B64.encode(bytes) }).to_string()
+    }
+
+    fn marker(kind: &str) -> Frame {
+        serde_json::from_value(json!({ "type": kind })).unwrap()
+    }
+
+    fn closed(reason: &str) -> Frame {
+        serde_json::from_value(json!({ "type": "terminal.closed", "reason": reason })).unwrap()
+    }
+
+    fn screen(text: &str) -> Frame {
+        serde_json::from_value(json!({
+            "type": "terminal.frame", "full": true, "width": 80, "height": 24,
+            "bytes": B64.encode(format!("\x1b[H\x1b[2J{text}")),
+        }))
+        .unwrap()
+    }
+
+    fn watch_only_app(tty: bool, out: Output) -> (App, mpsc::Receiver<Vec<u8>>) {
+        let args = parse_args(&["work".into(), "w1:p1".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App::new(args, tty, tx, out);
+        let (session, input) = test_session(1, Phase::Observe);
+        app.session = Some(session);
+        app.next_gen = 1;
+        // no ssh foreground probes from a unit test
+        app.fg_poll_at = Some(Instant::now());
+        (app, input)
+    }
+
+    /// The first keystroke in a watch-only pane asks the open connection for
+    /// control and rides right behind the request — no ssh is killed or
+    /// started, and nothing asks the remote to resize. Releasing hands the same
+    /// connection back to the observer, and typing during the release takes
+    /// control again once it lands.
+    #[tokio::test]
+    async fn typing_takes_control_on_the_open_connection_and_releases_back() {
+        let (mut app, mut input) = watch_only_app(false, Output::new(std::io::sink()));
+
+        app.handle_stdin(b"l".to_vec()).await;
+        let lines = sent(&mut input);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("control auto auto "), "{lines:?}");
+        assert_eq!(lines[1], input_line(b"l"));
+        assert_eq!(app.phase(), Some(Phase::Acquiring));
+
+        // the script stops the observer (expected — not a lost session), starts
+        // the controller, and its first frame acknowledges the attach
+        app.handle_frame(1, marker("mirror.observe_exited"));
+        assert!(app.session.is_some() && app.reconnect_at.is_none());
+        app.handle_frame(1, marker("mirror.control"));
+        app.handle_frame(1, screen("$ l"));
+        assert_eq!(app.phase(), Some(Phase::Control { acked: true }));
+
+        app.handle_stdin(b"s".to_vec()).await;
+        assert_eq!(sent(&mut input), [input_line(b"s")]);
+
+        // a resize of the local pane changes nothing over there
+        app.on_resize();
+        assert!(sent(&mut input).is_empty());
+
+        // ctrl+\ releases; what is typed meanwhile waits for the controller to
+        // exit, because it discards whatever it read past the release
+        app.handle_stdin(vec![0x1c]).await;
+        assert_eq!(sent(&mut input), [json!({ "type": "terminal.release" }).to_string()]);
+        assert_eq!(app.phase(), Some(Phase::Releasing));
+        app.handle_stdin(b"x".to_vec()).await;
+        assert!(sent(&mut input).is_empty());
+        app.handle_frame(1, closed("detached"));
+        app.handle_frame(1, marker("mirror.control_exited"));
+        let lines = sent(&mut input);
+        assert!(lines[0].starts_with("control auto auto "), "{lines:?}");
+        assert_eq!(lines[1..], [input_line(b"x")]);
+
+        // one connection throughout
+        assert_eq!((app.session.as_ref().unwrap().gen, app.next_gen), (1, 1));
+        assert!(app.reconnect_at.is_none());
+    }
+
+    /// A controller refused before its first frame (another client holds the
+    /// terminal) leaves the view streaming on the same connection; a second
+    /// refusal turns the pane read-only until the user types again.
+    #[tokio::test]
+    async fn a_refused_control_keeps_the_view_and_turns_read_only_after_two() {
+        let (mut app, mut input) = watch_only_app(false, Output::new(std::io::sink()));
+        let refuse = |app: &mut App| {
+            app.handle_frame(1, marker("mirror.observe_exited"));
+            app.handle_frame(1, marker("mirror.control"));
+            app.handle_frame(1, closed("terminal attach failed: terminal 7 already has an attached client"));
+            app.handle_frame(1, marker("mirror.control_exited"));
+        };
+        app.handle_stdin(b"a".to_vec()).await;
+        refuse(&mut app);
+        assert_eq!(app.phase(), Some(Phase::Observe));
+        assert!(!app.control_sticky);
+        app.handle_stdin(b"b".to_vec()).await;
+        refuse(&mut app);
+        assert!(app.control_sticky);
+        assert!(app.pending_input.is_empty());
+        assert_eq!(app.session.as_ref().unwrap().gen, 1);
+        // each attempt was a line on the open connection, never a new one
+        let requests = sent(&mut input).into_iter().filter(|l| l.starts_with("control ")).count();
+        assert_eq!(requests, 2);
+    }
+
+    /// The observer ending on its own (not because control was asked for) is
+    /// the end of the session: reconnect, slowly if the pane is gone.
+    #[tokio::test]
+    async fn an_observer_that_dies_by_itself_ends_the_session() {
+        let (mut app, _input) = watch_only_app(false, Output::new(std::io::sink()));
+        app.handle_frame(1, closed("terminal attach failed: terminal target w1:p1 not found"));
+        app.handle_frame(1, marker("mirror.observe_exited"));
+        assert!(app.session.is_none());
+        let wait = app.reconnect_at.unwrap() - Instant::now();
+        assert!(wait > Duration::from_secs(50), "{wait:?}");
+    }
+
+    /// Always-control drives the remote's size: an explicit size in the
+    /// request, and a resize line on every local resize.
+    #[tokio::test]
+    async fn always_control_sizes_the_remote_to_this_pane() {
+        let args = parse_args(&["work".into(), "w1:p1".into(), "--always-control".into()]).unwrap();
+        let (tx, _rx) = mpsc::channel(256);
+        let mut app = App::new(args, false, tx, Output::new(std::io::sink()));
+        let (session, mut input) = test_session(1, Phase::Observe);
+        app.session = Some(session);
+        app.fg_poll_at = Some(Instant::now());
+        app.on_resize();
+        let (cols, rows) = app.control_size();
+        assert_eq!(sent(&mut input), [format!("control {cols} {rows} {cols} {rows}")]);
+        app.handle_frame(1, marker("mirror.observe_exited"));
+        app.handle_frame(1, marker("mirror.control"));
+        app.handle_frame(1, screen("$"));
+        app.on_resize();
+        assert_eq!(
+            sent(&mut input),
+            [json!({ "type": "terminal.resize", "cols": cols, "rows": rows }).to_string()]
+        );
+    }
+
+    async fn next_msg(rx: &mut mpsc::Receiver<Msg>) -> Msg {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("transport went quiet").unwrap()
+    }
+
+    async fn next_kind(rx: &mut mpsc::Receiver<Msg>) -> (String, Frame) {
+        loop {
+            match next_msg(rx).await {
+                Msg::Frame { frame, .. } => return (frame.kind.clone(), frame),
+                Msg::SessionExit { reason, .. } => panic!("session ended: {reason}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// The real remote script, driven through a stand-in `herdr`: control and
+    /// observe alternate as children of ONE transport process, the
+    /// controller reads the input that follows the request, the unmeasurable
+    /// size falls back to the requested one, and a release restarts the
+    /// observer with the old one gone.
+    #[tokio::test]
+    async fn the_mux_script_swaps_observer_and_controller_on_one_transport() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("hm-mux-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log");
+        let fake = dir.join("herdr");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nlog={}\ncase \"$1 $2 $3\" in\n\
+                 'terminal session observe') echo \"observe $$ $4 $6 $8\" >>\"$log\"; \
+                 echo '{{\"type\":\"terminal.frame\",\"bytes\":\"\",\"full\":true,\"width\":1,\"height\":1}}'; exec sleep 600;;\n\
+                 'terminal session control') echo \"control $$ $4 $6 $8\" >>\"$log\"; \
+                 echo '{{\"type\":\"terminal.frame\",\"bytes\":\"\",\"full\":true,\"width\":1,\"height\":1}}'; \
+                 while IFS= read -r l; do echo \"input $l\" >>\"$log\"; case \"$l\" in *terminal.release*) \
+                 echo '{{\"type\":\"terminal.closed\",\"reason\":\"detached\"}}'; exit 0;; esac; done;;\n\
+                 'pane process-info --pane') echo '{{\"result\":{{\"process_info\":{{\"shell_pid\":999999999}}}}}}';;\n\
+                 esac\n",
+                sh_quote(&log.display().to_string())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(mux_script(&sh_quote(&fake.display().to_string())))
+            .args(["herdr-mirror", "w1:p1", "100", "40"]);
+        let session = spawn_transport(cmd, 1, tx, Duration::from_secs(5)).unwrap();
+        let transport = session.process_group;
+
+        assert_eq!(next_kind(&mut rx).await.0, "terminal.frame");
+        session.input.send(b"control auto auto 90 30\n".to_vec()).await.unwrap();
+        session.input.send((input_line(b"hi") + "\n").into_bytes()).await.unwrap();
+        assert_eq!(next_kind(&mut rx).await.0, "mirror.observe_exited");
+        let (kind, control) = next_kind(&mut rx).await;
+        assert_eq!(kind, "mirror.control");
+        assert_eq!(control.fallback, Some(true));
+        assert_eq!(next_kind(&mut rx).await.0, "terminal.frame");
+
+        session.input.send(b"{\"type\":\"terminal.release\"}\n".to_vec()).await.unwrap();
+        let (kind, closing) = next_kind(&mut rx).await;
+        assert_eq!((kind.as_str(), closing.reason.as_deref()), ("terminal.closed", Some("detached")));
+        let (kind, exited) = next_kind(&mut rx).await;
+        assert_eq!((kind.as_str(), exited.code), ("mirror.control_exited", Some(0)));
+        assert_eq!(next_kind(&mut rx).await.0, "terminal.frame");
+
+        // the same transport, still alive
+        assert_eq!(unsafe { libc::kill(transport, 0) }, 0);
+        let lines: Vec<String> = std::fs::read_to_string(&log).unwrap().lines().map(str::to_string).collect();
+        let observers: Vec<&String> = lines.iter().filter(|l| l.starts_with("observe ")).collect();
+        assert_eq!(observers.len(), 2, "{lines:?}");
+        assert!(observers.iter().all(|l| l.ends_with(" w1:p1 100 40")));
+        // the first observer is gone, not left streaming beside the second
+        let first: i32 = observers[0].split(' ').nth(1).unwrap().parse().unwrap();
+        assert_ne!(unsafe { libc::kill(first, 0) }, 0);
+        assert!(lines.iter().any(|l| l.starts_with("control ") && l.ends_with(" w1:p1 90 30")), "{lines:?}");
+        assert!(lines.contains(&format!("input {}", input_line(b"hi"))), "{lines:?}");
+
+        kill_session_process_group(transport);
+        loop {
+            if let Msg::SessionExit { .. } = next_msg(&mut rx).await {
+                break;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transport that stops reading its stdin cannot stall the event loop:
+    /// lines queue without waiting, and the stalled write ends the session
+    /// after the timeout instead of hanging it.
+    #[tokio::test]
+    async fn a_wedged_transport_never_stalls_input_and_is_dropped() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let session = spawn_transport(cmd, 1, tx, Duration::from_millis(300)).unwrap();
+        let started = Instant::now();
+        // far more than a pipe holds
+        let line = vec![b'x'; 4096];
+        let mut queued = 0;
+        for _ in 0..INPUT_QUEUE {
+            if session.input.try_send(line.clone()).is_ok() {
+                queued += 1;
+            }
+        }
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        assert!(queued * line.len() > 64 * 1024);
+        let exit = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(Msg::SessionExit { .. }) = rx.recv().await {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(exit.is_ok(), "a wedged transport was never dropped");
+    }
+
+    // --- output: never blocking, latest wins ---
+
+    async fn writer_idle(app: &App) {
+        for _ in 0..200 {
+            if !app.out.busy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("writer never drained");
+    }
+
+    /// Sustained output is capped: a frame right behind a paint waits for the
+    /// interval. A keystroke's echo is not: a frame right behind a paint, but
+    /// right after forwarded input, paints at once. Once the echo window has
+    /// passed, the cap applies again.
+    #[tokio::test]
+    async fn an_echo_frame_is_not_held_by_the_frame_rate_cap() {
+        let (mut app, mut input) = watch_only_app(true, Output::new(std::io::sink()));
+        app.session.as_mut().unwrap().phase = Phase::Control { acked: true };
+
+        app.handle_frame(1, screen("$ "));
+        assert!(!app.paint_pending, "a frame after a quiet spell paints at once");
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ output"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "sustained output waits for the cap");
+
+        app.paint_at = None;
+        app.paint_pending = false;
+        app.last_paint = Some(Instant::now());
+        app.handle_stdin(b"x".to_vec()).await;
+        assert_eq!(sent(&mut input), [input_line(b"x")]);
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x"));
+        assert!(!app.paint_pending, "the echo was held by the cap");
+        assert!(app.paint_at.is_none());
+
+        tokio::time::sleep(ECHO_WINDOW + Duration::from_millis(20)).await;
+        app.handle_frame(1, screen("$ x"));
+        writer_idle(&app).await;
+        app.handle_frame(1, screen("$ x more"));
+        assert!(app.paint_pending && app.paint_at.is_some(), "the cap is back after the echo window");
+    }
+
+    /// The hub stops draining the pane while a remote scrolls 2000 frames. The
+    /// event loop never waits on the pane, paints at most one screen while the
+    /// writer is stuck, and once the pane drains it ends on the LAST frame,
+    /// not an intermediate one.
+    #[tokio::test]
+    async fn a_stalled_pane_never_blocks_and_ends_on_the_last_frame() {
+        use std::io::Read;
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let out = Output::new(writer);
+        // wedge the writer: far more than the socket buffer, nobody reading
+        let junk = "j".repeat(4 << 20);
+        out.control(junk.clone());
+        let (mut app, _input) = watch_only_app(true, out);
+
+        let started = Instant::now();
+        for i in 0..2000 {
+            app.handle_frame(1, screen(&format!("frame {i:04}")));
+        }
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // the first paint is queued behind the junk; every later frame only
+        // updated the grid
+        assert_eq!(app.out.paints.load(Ordering::Acquire), 1);
+        assert!(app.paint_pending);
+
+        let drain = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let _ = reader.read_to_end(&mut all);
+            all
+        });
+        let drained = app.out.drained.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (app.paint_pending || app.out.busy()) && Instant::now() < deadline {
+            if app.out.busy() {
+                let _ = tokio::time::timeout(Duration::from_millis(100), drained.notified()).await;
+            } else if let Some(at) = app.paint_at {
+                tokio::time::sleep_until(at).await;
+                app.paint_at = None;
+            }
+            if app.paint_pending && !app.out.busy() {
+                app.paint();
+            }
+        }
+        assert!(!app.paint_pending && !app.out.busy());
+        drop(app);
+        let bytes = drain.join().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let painted = text.strip_prefix(&junk).expect("output order");
+        // two paints for two thousand frames: the stuck one, then the latest
+        assert!(painted.matches("\x1b[?2026h").count() <= 3, "{}", painted.matches("\x1b[?2026h").count());
+        let mut pane = Grid::new();
+        pane.resize(80, 24);
+        pane.apply(painted);
+        assert_eq!(pane.text_lines().first().map(|l| l.trim_end()), Some("frame 1999"));
+    }
 }

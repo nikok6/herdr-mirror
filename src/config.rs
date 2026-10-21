@@ -115,6 +115,14 @@ pub struct HostConfig {
     /// of the local pane blank instead. Observe is unaffected either way.
     pub max_cols: Option<usize>,
     pub max_rows: Option<usize>,
+    /// ssh `Compression` for this host's daemon traffic and pane streams.
+    /// Default on; set false for a host on a fast LAN where the CPU matters
+    /// more than the bytes. On the command line, so it beats ssh_config.
+    pub compression: bool,
+    /// How much of each mirrored pi/omp session journal to keep as a hub-local
+    /// tail copy (see journal.rs), in bytes. 0 disables journal tails for the
+    /// host. `journal_tail_mb` in hosts.toml, global or per host; default 16.
+    pub journal_tail_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +168,8 @@ struct RawConfig {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    compression: Option<bool>,
+    journal_tail_mb: Option<u64>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -181,6 +191,8 @@ struct RawHost {
     always_control: Option<bool>,
     max_cols: Option<usize>,
     max_rows: Option<usize>,
+    compression: Option<bool>,
+    journal_tail_mb: Option<u64>,
     api_transport: Option<String>,
 }
 
@@ -320,6 +332,12 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
             always_control: h.always_control.unwrap_or(global_always_control),
             max_cols: size_cap(h.max_cols).or(global_max_cols),
             max_rows: size_cap(h.max_rows).or(global_max_rows),
+            compression: h.compression.or(raw.compression).unwrap_or(true),
+            journal_tail_bytes: h
+                .journal_tail_mb
+                .or(raw.journal_tail_mb)
+                .unwrap_or(crate::journal::DEFAULT_TAIL_MB)
+                .saturating_mul(1024 * 1024),
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             api_transport,
             kind,
@@ -474,6 +492,34 @@ mod tests {
         assert_eq!(c.hosts[0].target, "work");
         assert_eq!(c.hosts[0].remote_bin, None);
         assert_eq!(c.hosts[0].session, None);
+    }
+
+    #[test]
+    fn journal_tail_defaults_to_16_mib_with_global_and_per_host_override() {
+        let c = parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap();
+        assert_eq!(c.hosts[0].journal_tail_bytes, 16 * 1024 * 1024);
+        let c = parse_config(
+            "journal_tail_mb = 4\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\njournal_tail_mb = 0\n\
+             [hosts.c]\ntarget = \"c\"\njournal_tail_mb = 32\n",
+        )
+        .unwrap();
+        let tail = |n: &str| c.hosts.iter().find(|h| h.name == n).unwrap().journal_tail_bytes;
+        assert_eq!(tail("a"), 4 * 1024 * 1024); // inherits the global
+        assert_eq!(tail("b"), 0); // 0 turns journal tails off for this host
+        assert_eq!(tail("c"), 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn compression_defaults_on_with_global_and_per_host_override() {
+        let c = parse_config(
+            "compression = false\n[hosts.a]\ntarget = \"a\"\n[hosts.b]\ntarget = \"b\"\ncompression = true\n",
+        )
+        .unwrap();
+        assert!(!c.hosts[0].compression);
+        assert!(c.hosts[1].compression);
+        assert!(parse_config("[hosts.a]\ntarget = \"a\"\n").unwrap().hosts[0].compression);
     }
 
     #[test]
